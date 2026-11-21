@@ -1,7 +1,9 @@
 """Unit tests for configuration and safety invariants."""
 
 import unittest
+
 from pydantic import ValidationError
+
 from hybrid_agent.config.settings import AppSettings, ExecutionMode
 
 
@@ -13,7 +15,9 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(settings.enable_live_trading)
         self.assertEqual(settings.max_daily_loss_pct, 0.02)
         self.assertEqual(settings.max_drawdown_limit_pct, 0.05)
-        self.assertEqual(settings.max_position_size_pct, 0.01)
+        self.assertEqual(settings.max_risk_per_trade_pct, 0.01)
+        self.assertEqual(settings.max_position_size_pct, 0.10)
+        self.assertEqual(settings.account_currency, "USD")
 
     def test_live_trading_prohibition_rejected(self) -> None:
         """Asserts that attempting to enable live trading raises a ValidationError."""

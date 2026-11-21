@@ -1,6 +1,7 @@
 """Execution broker interface definition."""
 
 from abc import ABC, abstractmethod
+
 from hybrid_agent.core.models import Order, Position
 
 

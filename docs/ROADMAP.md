@@ -1,68 +1,88 @@
 # Quantitative System Development Roadmap
 
-## Phase Overview
+## Phase & Milestone Overview
 
 ```
 +---------------------------------------------------------------------------------+
-| Phase 1: Foundation, Architecture & Research Register (CURRENT)                 |
+| Milestone 1: Foundation, Architecture, Core Domain & Governance (COMPLETED)     |
+| - Repository, CI workflow, research register, defensive safety invariants.      |
+| - Domain model validation: UTC enforcement, OHLC invariants, instrument specs.  |
+| - Monetary risk vs notional separation, order lifecycle state transitions.      |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Phase 2: Core Domain Entities, Event Engine & Robust Configuration               |
+| Milestone 2: Data Ingestion Pipeline, Parquet Store & Feature Engineering       |
+| - Deterministic multi-source loaders (CSV/Parquet) with time-index validation.  |
+| - Real-time and batch technical feature extractors without lookahead leakage.   |
+| - Stationarity checks, volatility indicators, and pipeline integrity tests.     |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Phase 3: Data Ingestion, Storage (Parquet) & Lookahead-Free Feature Pipelines   |
+| Milestone 3: Machine Learning Signal Synthesis & Hyperparameter Optimization    |
+| - LightGBM probabilistic classification and regression modeling.                |
+| - Combinatorial Purged Cross-Validation (CPCV) and embargo schemes.             |
+| - Optuna study orchestration for Bayesian parameter search.                     |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Phase 4: Machine Learning Signal Generation (LightGBM) & Optuna Tuning          |
+| Milestone 4: Advanced Risk Management & Capital Allocation                      |
+| - Multi-currency monetary risk conversion and real-time tick value valuation.   |
+| - Dynamic volatility-adjusted position sizing (fractional Kelly / ATR scaling). |
+| - Portfolio correlation caps, multi-tier circuit breakers, and drawdowns.       |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Phase 5: Defensive Risk Engine, Circuit Breakers & Portfolio Sizing             |
+| Milestone 5: Event-Driven Microstructure Backtesting Harness                    |
+| - Deterministic synchronous event bus simulating clock and market ticks.        |
+| - Realistic execution friction: dynamic spreads, volume slippage, and delays.   |
+| - Quantitative performance analytics: Sharpe, Sortino, Calmar, Max Drawdown.    |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Phase 6: Simulated Paper Execution, Microstructure Backtest & Analytics         |
+| Milestone 6: Simulated Paper Execution & Audit Telemetry                        |
+| - Safe PaperSimulatedBroker execution engine.                                   |
+| - Structured immutable JSONL event logs and trade journal auditability.         |
+| - Real-time metrics streaming and invariant verification monitors.              |
 +---------------------------------------------------------------------------------+
 ```
 
 ---
 
-## Milestone Breakdown
+## Detailed Milestone Specifications
 
-### Milestone 1: Foundation & Governance (Completed)
-- GitHub repository established: `Yokaham/hybrid-ai-trading-agent`.
-- Comprehensive comparative research register covering 8 core frameworks.
-- Complete architectural specification and defensive risk governance docs.
-- CI pipeline, licensing, and clean directory structure.
+### Milestone 1: Foundation, Core Domain, & Governance (Current Status: Verified)
+- GitHub repository established: `Yokaham/hybrid-ai-trading-agent` with Apache-2.0 license.
+- Comparative research register evaluating 8 major quant engines against our architecture.
+- Domain model validation: Timezone-aware UTC enforcement, strict OHLC invariants, bid/ask spread checks.
+- Explicit instrument specifications: Tick size, contract size, volume steps, price precision, and profit currency.
+- Explicit order lifecycle state transitions: `PENDING_RISK -> APPROVED/REJECTED -> SUBMITTED -> FILLED/CANCELLED`.
+- Separation of gross position notional from monetary downside risk at stop-loss.
+- Zero-tolerance regulatory enforcement regarding unauthorized offshore platforms (FEMA / RBI Alert List).
 
-### Milestone 2: Core Domain & Event Backbone
-- Implementation of immutable data primitives (`Tick`, `Bar`, `Order`, `Position`).
-- Type-safe event dispatcher and clock synchronization.
-- Pydantic Settings implementation with strict environment safety enforcement.
+### Milestone 2: Data Ingestion & Feature Engineering
+- Ingestion pipelines for historical bar and tick feeds.
+- Parquet columnar storage partitioned by date and symbol.
+- Streaming feature calculators with strictly sealed bar boundaries to prevent lookahead bias.
 
-### Milestone 3: Data Pipelines & Feature Store
-- Multi-source historical data loaders (CSV / Parquet).
-- Streaming and batch technical feature extractors.
-- Time-travel and lookahead verification tests.
+### Milestone 3: Machine Learning Modeling & Tuning
+- Feature transformations and stationary representation.
+- LightGBM training pipelines with combinatorial purged cross-validation.
+- Optuna Bayesian optimization studies for hyperparameter tuning.
 
-### Milestone 4: Modeling & Hyperparameter Search
-- LightGBM probabilistic classification/regression pipeline.
-- Purged cross-validation and feature importance analysis.
-- Optuna study integration for hyperparameter discovery.
+### Milestone 4: Advanced Risk Management & Sizing
+- Full dynamic position sizer incorporating ATR volatility and stop-loss distance.
+- Multi-currency live currency conversion for account currency harmonization.
+- Real-time portfolio exposure and correlation matrix monitoring.
 
-### Milestone 5: Risk Engine & Safety Circuit Breakers
-- Realized/unrealized loss calculations.
-- Hard circuit breakers and maximum drawdown monitors.
-- Dynamic volatility-adjusted position sizer.
+### Milestone 5: Microstructure Backtesting
+- Event-driven deterministic backtest runner.
+- Order fill simulation with bid-ask spread models and volume-weighted slippage.
 
-### Milestone 6: Execution Engine & Research Reporting
-- High-fidelity paper broker with simulated fill latency, slippage, and spread.
-- Performance reporting: Sharpe, Sortino, Calmar, Maximum Drawdown, Value at Risk.
+### Milestone 6: Paper Execution & Observability
+- Isolated paper trading broker adapter.
+- Audit logging, telemetry, and live paper execution safety reporting.

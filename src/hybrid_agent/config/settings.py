@@ -2,12 +2,14 @@
 
 from enum import Enum
 from functools import lru_cache
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class ExecutionMode(str, Enum):
     """Allowed operating modes for the trading agent."""
+
     RESEARCH = "RESEARCH"
     BACKTEST = "BACKTEST"
     PAPER = "PAPER"
@@ -25,13 +27,15 @@ class AppSettings(BaseSettings):
 
     app_env: ExecutionMode = Field(default=ExecutionMode.RESEARCH)
     log_level: str = Field(default="INFO")
+    account_currency: str = Field(default="USD", min_length=3, max_length=5)
 
     # Safety and risk overrides
     enable_live_trading: bool = Field(default=False)
     require_paper_confirmation: bool = Field(default=True)
     max_daily_loss_pct: float = Field(default=0.02, gt=0.0, le=0.10)
     max_drawdown_limit_pct: float = Field(default=0.05, gt=0.0, le=0.20)
-    max_position_size_pct: float = Field(default=0.01, gt=0.0, le=0.05)
+    max_risk_per_trade_pct: float = Field(default=0.01, gt=0.0, le=0.05)
+    max_position_size_pct: float = Field(default=0.10, gt=0.0, le=1.0)
 
     # Data paths
     historical_data_dir: str = Field(default="./data/processed")

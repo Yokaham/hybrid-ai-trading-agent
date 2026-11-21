@@ -26,3 +26,15 @@
 - **Status**: Accepted
 - **Context**: For deterministic backtesting, event ordering must be 100% reproducible without non-deterministic thread race conditions.
 - **Decision**: Implement a synchronous, deterministic priority-driven event dispatcher for backtesting and paper simulation.
+
+### ADR-006: Domain Entity Immutability & UTC Timestamp Integrity
+- **Status**: Accepted
+- **Context**: Subtle lookahead bugs and timezone alignment mismatches frequently compromise backtesting validity.
+- **Decision**: Enforce timezone-aware UTC timestamps across all domain models (`Tick`, `Bar`, `Order`, `BaseEvent`) via strict Pydantic validators. Enforce frozen immutability on telemetry and event objects (`Tick`, `Bar`, `BaseEvent` subclasses). Enforce mathematical OHLC relationships ($high \ge \max(open, close)$, $low \le \min(open, close)$, $high \ge low$, $volume \ge 0$).
+
+### ADR-007: Risk Model Separation of Gross Notional Exposure from Monetary Downside Risk
+- **Status**: Accepted
+- **Context**: Comparing order gross notional directly to portfolio equity percentage conflates leverage with risk. A tight stop loss on a large position can present significantly lower actual capital risk than a wide stop loss on a smaller position.
+- **Decision**: Implement dual-tier risk evaluation:
+  1. **Monetary Risk per Trade**: Computed as $\Delta P \times Quantity \times ContractSize$ (or via tick value and tick count), converted to account currency and bounded by `max_risk_per_trade_pct` (default: 1.0%).
+  2. **Gross Notional Exposure**: Bounded by `max_position_size_pct` (default: 10.0%) to prevent over-leveraging.
