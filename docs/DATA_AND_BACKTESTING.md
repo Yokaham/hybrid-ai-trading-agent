@@ -42,7 +42,7 @@ Market data ingestion is fully decoupled through abstract interfaces:
 The `HistoricalDataPipeline` enforces multi-point validation before any data reaches disk:
 - **Pre-Storage Validation & Fail-Closed Behavior**: The entire provider response is validated before write. If `report.is_valid` is `False`, the dataset is strictly rejected and never written to persistent storage.
 - **Instrument & Timeframe Verification**: Validates that all returned bars match the requested symbol and timeframe. Mismatched bars are flagged as hard integrity violations.
-- **Date-Range Compliance**: Verifies that returned bars fall strictly within the requested `[start, end]` window.
+- **Date-Range Compliance & Half-Open Intervals**: Verifies that returned bars fall strictly within the requested half-open interval `[start, end)`. Any bar starting at or after `end` is strictly excluded.
 - **Empty Response Handling**: Empty provider responses are explicitly flagged (`is_empty=True`, `success=False`, `bars_stored=0`), distinguishing zero-data periods from ordinary successful ingestion.
 - **Market Closure Gap Classification**: Distinguishes between hard integrity violations (non-positive prices, inverted OHLC, negative volume, duplicate timestamps, out-of-order bars) and suspected gaps. Missing calendar intervals (e.g. weekends, overnight sessions, exchange holidays) are recorded as suspected gaps and warnings rather than corrupt data, preventing valid multi-day datasets from being falsely rejected.
 

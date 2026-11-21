@@ -14,7 +14,15 @@ from hybrid_agent.core.constants import (
     ValuationModel,
 )
 from hybrid_agent.core.events import MarketTickEvent
-from hybrid_agent.core.models import Bar, InstrumentSpecification, Order, Position, Tick
+from hybrid_agent.core.models import (
+    Bar,
+    DataProvenance,
+    DataSourceType,
+    InstrumentSpecification,
+    Order,
+    Position,
+    Tick,
+)
 
 
 class TestCoreModels(unittest.TestCase):
@@ -357,6 +365,115 @@ class TestCoreModels(unittest.TestCase):
         self.assertAlmostEqual(pos.notional_value, 109000.0)
         # Monetary risk = |1.0850 - 1.0800| * 1.0 * 100000 = 500 USD
         self.assertAlmostEqual(pos.monetary_risk, 500.0)
+
+    # 8. Synthetic Provenance Synchronization & Contradiction Protection
+    def test_bar_synthetic_flag_synchronized_from_provenance(self) -> None:
+        """Proves that Bar.is_synthetic synchronizes with provenance when provenance specifies is_synthetic=True."""
+        prov = DataProvenance(
+            source_name="sim_engine",
+            source_type=DataSourceType.SIMULATED,
+            retrieved_at=self.now_utc,
+            is_synthetic=True,
+        )
+        bar = Bar(
+            symbol="EURUSD",
+            start_time=self.now_utc,
+            end_time=self.now_utc + timedelta(minutes=1),
+            open=1.085,
+            high=1.086,
+            low=1.084,
+            close=1.0855,
+            volume=100.0,
+            provenance=prov,
+        )
+        self.assertTrue(bar.is_synthetic)
+        self.assertTrue(bar.provenance.is_synthetic)  # type: ignore[union-attr]
+
+    def test_bar_synthetic_flag_contradiction_rejected(self) -> None:
+        """Proves that contradictory synthetic flags between Bar and DataProvenance fail closed."""
+        prov_synth = DataProvenance(
+            source_name="sim_engine",
+            source_type=DataSourceType.SIMULATED,
+            retrieved_at=self.now_utc,
+            is_synthetic=True,
+        )
+        with self.assertRaises(ValidationError) as ctx1:
+            Bar(
+                symbol="EURUSD",
+                start_time=self.now_utc,
+                end_time=self.now_utc + timedelta(minutes=1),
+                open=1.085,
+                high=1.086,
+                low=1.084,
+                close=1.0855,
+                volume=100.0,
+                is_synthetic=False,  # Contradicts provenance.is_synthetic=True
+                provenance=prov_synth,
+            )
+        self.assertIn("Contradictory synthetic flags", str(ctx1.exception))
+
+        prov_real = DataProvenance(
+            source_name="real_feed",
+            source_type=DataSourceType.HISTORICAL,
+            retrieved_at=self.now_utc,
+            is_synthetic=False,
+        )
+        with self.assertRaises(ValidationError) as ctx2:
+            Bar(
+                symbol="EURUSD",
+                start_time=self.now_utc,
+                end_time=self.now_utc + timedelta(minutes=1),
+                open=1.085,
+                high=1.086,
+                low=1.084,
+                close=1.0855,
+                volume=100.0,
+                is_synthetic=True,  # Contradicts provenance.is_synthetic=False
+                provenance=prov_real,
+            )
+        self.assertIn("Contradictory synthetic flags", str(ctx2.exception))
+
+    def test_bar_synthetic_flag_matching_accepted(self) -> None:
+        """Proves that matching synthetic flags are accepted cleanly."""
+        prov_synth = DataProvenance(
+            source_name="sim_engine",
+            source_type=DataSourceType.SIMULATED,
+            retrieved_at=self.now_utc,
+            is_synthetic=True,
+        )
+        bar_synth = Bar(
+            symbol="EURUSD",
+            start_time=self.now_utc,
+            end_time=self.now_utc + timedelta(minutes=1),
+            open=1.085,
+            high=1.086,
+            low=1.084,
+            close=1.0855,
+            volume=100.0,
+            is_synthetic=True,
+            provenance=prov_synth,
+        )
+        self.assertTrue(bar_synth.is_synthetic)
+
+        prov_real = DataProvenance(
+            source_name="real_feed",
+            source_type=DataSourceType.HISTORICAL,
+            retrieved_at=self.now_utc,
+            is_synthetic=False,
+        )
+        bar_real = Bar(
+            symbol="EURUSD",
+            start_time=self.now_utc,
+            end_time=self.now_utc + timedelta(minutes=1),
+            open=1.085,
+            high=1.086,
+            low=1.084,
+            close=1.0855,
+            volume=100.0,
+            is_synthetic=False,
+            provenance=prov_real,
+        )
+        self.assertFalse(bar_real.is_synthetic)
 
 
 if __name__ == "__main__":

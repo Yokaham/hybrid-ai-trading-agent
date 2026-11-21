@@ -34,7 +34,11 @@ class StatefulIncrementalFeatureEngine:
     Supports state invalidation and rebuilding when historical bars are revised.
     """
 
-    def __init__(self, annualization_factor: float = 252.0) -> None:
+    def __init__(self, annualization_factor: float | None = 252.0) -> None:
+        if annualization_factor is not None and annualization_factor < 0:
+            raise ValueError(
+                f"annualization_factor must be non-negative, got {annualization_factor}"
+            )
         self.annualization_factor = annualization_factor
         self.reset()
 
@@ -80,7 +84,7 @@ class StatefulIncrementalFeatureEngine:
         self._hv_returns: collections.deque[float] = collections.deque(maxlen=20)
 
         # Volume SMA & RVOL (20)
-        self._vol_window: collections.deque[float] = collections.deque(maxlen=20)
+        self._vol_window: collections.deque[float | None] = collections.deque(maxlen=20)
 
     def rebuild(self, bars: list[Bar]) -> None:
         """Rebuilds state from a historical sequence of bars (e.g. after bar revisions)."""
@@ -198,7 +202,12 @@ class StatefulIncrementalFeatureEngine:
             features["atr_14"] = self._atr_avg_tr
 
         # 7. ADX (14)
-        if self._prev_high is not None and self._prev_low is not None:
+        if self._prev_high is None or self._prev_low is None:
+            # First bar (count=1): initialize smoothers
+            self._adx_tr_smooth = tr
+            self._adx_plus_dm_smooth = 0.0
+            self._adx_minus_dm_smooth = 0.0
+        else:
             up_move = high - self._prev_high
             down_move = self._prev_low - low
             plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
@@ -221,22 +230,22 @@ class StatefulIncrementalFeatureEngine:
                     alpha_wilder * minus_dm + (1.0 - alpha_wilder) * self._adx_minus_dm_smooth
                 )
 
-            if self._count >= 14 and self._adx_tr_smooth > 0:
-                p_di = 100.0 * (self._adx_plus_dm_smooth / self._adx_tr_smooth)
-                m_di = 100.0 * (self._adx_minus_dm_smooth / self._adx_tr_smooth)
-                features["plus_di_14"] = p_di
-                features["minus_di_14"] = m_di
+        if self._count >= 14 and self._adx_tr_smooth is not None and self._adx_tr_smooth > 0:
+            p_di = 100.0 * (self._adx_plus_dm_smooth / self._adx_tr_smooth)
+            m_di = 100.0 * (self._adx_minus_dm_smooth / self._adx_tr_smooth)
+            features["plus_di_14"] = p_di
+            features["minus_di_14"] = m_di
 
-                di_sum = p_di + m_di
-                dx = 100.0 * (abs(p_di - m_di) / di_sum) if di_sum > 0 else 0.0
+            di_sum = p_di + m_di
+            dx = 100.0 * (abs(p_di - m_di) / di_sum) if di_sum > 0 else 0.0
 
-                if self._adx_value is None:
-                    self._adx_value = dx
-                else:
-                    self._adx_value = alpha_wilder * dx + (1.0 - alpha_wilder) * self._adx_value
+            if self._adx_value is None:
+                self._adx_value = dx
+            else:
+                self._adx_value = alpha_wilder * dx + (1.0 - alpha_wilder) * self._adx_value
 
-                if self._count >= 27:
-                    features["adx_14"] = self._adx_value
+            if self._count >= 27:
+                features["adx_14"] = self._adx_value
 
         # 8. Bollinger Bands (20, 2.0)
         self._bb_window.append(close)
@@ -262,19 +271,30 @@ class StatefulIncrementalFeatureEngine:
                 mean_ret = sum(self._hv_returns) / 20.0
                 var_ret = sum((r - mean_ret) ** 2 for r in self._hv_returns) / 19.0
                 hv_std = math.sqrt(var_ret)
-                ann = math.sqrt(self.annualization_factor) if self.annualization_factor else 1.0
+                ann = (
+                    math.sqrt(self.annualization_factor)
+                    if (self.annualization_factor is not None and self.annualization_factor > 0)
+                    else 1.0
+                )
                 features["hv_20"] = hv_std * ann
 
-        # 10. Volume SMA & RVOL (20)
+        # 10. Volume SMA & RVOL (20) - per-observation availability
         is_vol_unavailable = (
-            hasattr(bar, "volume_type") and bar.volume_type == VolumeType.UNAVAILABLE
+            (hasattr(bar, "volume_type") and bar.volume_type == VolumeType.UNAVAILABLE)
+            or (bar.volume is None)
+            or math.isnan(bar.volume)
         )
-        if not is_vol_unavailable:
+        if is_vol_unavailable:
+            self._vol_window.append(None)
+        else:
             self._vol_window.append(vol)
-            if len(self._vol_window) == 20:
-                v_mean = sum(self._vol_window) / 20.0
-                if v_mean > 0:
-                    features["vol_sma_20"] = v_mean
+
+        if len(self._vol_window) == 20 and None not in self._vol_window:
+            valid_sum = sum(v for v in self._vol_window if v is not None)
+            v_mean = valid_sum / 20.0
+            if v_mean > 0:
+                features["vol_sma_20"] = v_mean
+                if not is_vol_unavailable:
                     features["rvol_20"] = vol / v_mean
 
         self._prev_close = close
@@ -290,7 +310,16 @@ class FeaturePipeline:
     Guarantees deterministic output, 100% feature registry coverage, and strict lookahead-free calculations.
     """
 
-    def __init__(self, registry: FeatureRegistry | None = None) -> None:
+    def __init__(
+        self,
+        registry: FeatureRegistry | None = None,
+        annualization_factor: float | None = 252.0,
+    ) -> None:
+        if annualization_factor is not None and annualization_factor < 0:
+            raise ValueError(
+                f"annualization_factor must be non-negative, got {annualization_factor}"
+            )
+        self.annualization_factor = annualization_factor
         self.registry = registry or default_feature_registry
         self._register_default_features()
         self._default_engine: StatefulIncrementalFeatureEngine | None = None
@@ -390,7 +419,7 @@ class FeaturePipeline:
                 description="Annualized historical volatility based on log returns",
                 category="VOLATILITY",
                 required_inputs=["close"],
-                parameters={"period": 20, "annualization_factor": 252.0},
+                parameters={"period": 20, "annualization_factor": self.annualization_factor},
                 warmup_period=21,
                 output_columns=["hv_20"],
             ),
@@ -420,10 +449,11 @@ class FeaturePipeline:
                 pass  # Already registered
 
     def create_incremental_engine(
-        self, annualization_factor: float = 252.0
+        self, annualization_factor: float | None = None
     ) -> StatefulIncrementalFeatureEngine:
         """Instantiates a dedicated stateful incremental calculation engine."""
-        return StatefulIncrementalFeatureEngine(annualization_factor=annualization_factor)
+        factor = self.annualization_factor if annualization_factor is None else annualization_factor
+        return StatefulIncrementalFeatureEngine(annualization_factor=factor)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -466,20 +496,24 @@ class FeaturePipeline:
         res["bb_pct_b_20"] = pct_b
         res["bb_bandwidth_20"] = bandwidth
         res["hv_20"] = compute_historical_volatility(
-            res["close"], period=20, annualization_factor=252.0
+            res["close"], period=20, annualization_factor=self.annualization_factor
         )
 
-        # Volume (Checks whether volume is unavailable or all 0)
-        vol_unavailable = False
+        # Volume (Per-observation availability handling)
+        vol_series = res["volume"].astype(float).copy()
         if "volume_type" in res.columns:
-            vol_unavailable = (res["volume_type"] == VolumeType.UNAVAILABLE.value).any()
+            unavail_mask = (res["volume_type"] == VolumeType.UNAVAILABLE.value) | (
+                res["volume_type"] == VolumeType.UNAVAILABLE
+            )
+            vol_series[unavail_mask] = np.nan
 
-        if vol_unavailable or (res["volume"] == 0.0).all():
+        valid_vol = vol_series.dropna()
+        if valid_vol.empty or (valid_vol == 0.0).all():
             res["vol_sma_20"] = np.nan
             res["rvol_20"] = np.nan
         else:
-            res["vol_sma_20"] = compute_volume_sma(res["volume"], period=20)
-            res["rvol_20"] = compute_relative_volume(res["volume"], period=20)
+            res["vol_sma_20"] = compute_volume_sma(vol_series, period=20)
+            res["rvol_20"] = compute_relative_volume(vol_series, period=20)
 
         return res
 

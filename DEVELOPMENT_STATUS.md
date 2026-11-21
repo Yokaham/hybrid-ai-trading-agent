@@ -1,8 +1,36 @@
 # Development Status & Technical Review Log
 
-## 1. Current State: Milestone 2A Corrections Complete (Market Data Infrastructure & Feature Engineering)
+## 1. Current State: Milestone 2B Complete (Final Market Data & Feature Engineering Corrections)
 
-### Milestone 2A Corrections Delivered
+### Milestone 2B Corrections Delivered
+- **Complete Batch vs. Incremental Feature Parity (`src/hybrid_agent/features/indicators.py`, `pipeline.py`)**:
+  - Achieved exact mathematical parity ($\Delta \le 10^{-12}$, well below $10^{-4}$ tolerance) across all 20 indicator columns:
+    `sma_20`, `sma_50`, `ema_20`, `adx_14`, `plus_di_14`, `minus_di_14`, `rsi_14`, `macd_line`, `macd_signal`, `macd_hist`, `roc_12`, `atr_14`, `bb_upper_20`, `bb_middle_20`, `bb_lower_20`, `bb_pct_b_20`, `bb_bandwidth_20`, `hv_20`, `vol_sma_20`, `rvol_20`.
+  - Harmonized Wilder smoothing initialization and warm-up dynamics between Pandas vectorised calculations and `StatefulIncrementalFeatureEngine`:
+    - Eliminated premature `.fillna(0.0)` in `compute_adx` which previously masked warmup NaNs into zeros and corrupted `dx` and `adx` recursion.
+    - Synchronized bar-0 smoother initialization in `StatefulIncrementalFeatureEngine` for `_adx_tr_smooth`, `_adx_plus_dm_smooth`, and `_adx_minus_dm_smooth`.
+    - Aligned warm-up index thresholds ($N \ge 14$ for $\pm$DI, $N \ge 27$ for ADX, $N \ge 26$ for MACD line, $N \ge 34$ for MACD signal).
+- **Per-Observation Volume Availability Handling (`src/hybrid_agent/features/indicators.py`, `pipeline.py`)**:
+  - Replaced global dataset-wide volume masking with per-observation availability tracking.
+  - In batch mode: masked unavailable rows (`VolumeType.UNAVAILABLE` or NaN) to `np.nan` before computing rolling volume indicators, ensuring that rolling windows with missing observations naturally return NaN.
+  - In incremental mode: tracked volume observations via `deque[float | None]`. When an unavailable bar arrives, `None` is appended. Rolling calculations require a full window of 20 consecutive valid volume observations.
+  - Once 20 consecutive valid volume bars accumulate after an unavailable period, valid `vol_sma_20` and `rvol_20` resume, with exact batch/incremental parity.
+- **Configurable Historical Volatility Annualization (`src/hybrid_agent/features/indicators.py`, `pipeline.py`)**:
+  - Added `annualization_factor: float | None = 252.0` parameter to `FeaturePipeline` constructor.
+  - Passed the configured factor to `compute_historical_volatility`, `create_incremental_engine()`, and dynamically recorded in `FeatureRegistry` metadata.
+  - Fully supports unannualized volatility (`None` or `0.0`), Equities (`252.0`), Forex (`260.0`), and Crypto (`365.0`). Rejects negative annualization factors with `ValueError`.
+- **Synthetic Provenance Source-of-Truth Enforcement (`src/hybrid_agent/core/models.py`, `src/hybrid_agent/data/storage.py`)**:
+  - Added Pydantic model validators to `Bar`:
+    - Synchronizes `is_synthetic = True` when `provenance.is_synthetic = True` and `is_synthetic` was omitted.
+    - Fails closed with `ValueError` if explicit contradictory flags are supplied (e.g. `is_synthetic=False` with `provenance.is_synthetic=True` or vice-versa).
+  - Ensured Parquet write and read operations strictly preserve matching synthetic classifications on both `Bar` and `DataProvenance`.
+- **Standardized Half-Open Temporal Intervals `[start, end)`**:
+  - Enforced exclusive end convention across `HistoricalDataPipeline`, `DataQualityValidator`, `YahooFinanceHistoricalProvider`, `ParquetStorageEngine`, and `DuckDBAnalyticalEngine`.
+  - Filter rule: `start_time >= start and start_time < end`. Bar starting at exactly `end` is strictly excluded.
+
+---
+
+## 2. Milestone 2A Corrections Delivered (Historical Summary)
 - **Fail-Closed Historical Ingestion Pipeline (`src/hybrid_agent/data/pipeline.py`, `quality.py`)**:
   - Implemented mandatory pre-storage validation. Datasets with hard integrity violations are strictly rejected (`report.is_valid is False`) and NEVER written to persistent storage (`bars_stored = 0`).
   - Added strict instrument symbol, timeframe, and date-range compliance checks (`expected_symbol`, `expected_timeframe`, `expected_start`, `expected_end`).
@@ -70,21 +98,21 @@ platform win32 -- Python 3.12.6, pytest-9.2.0, pluggy-1.7.0
 rootdir: D:\Trade\hybrid-ai-trading-agent
 configfile: pyproject.toml
 testpaths: tests
-collected 100 items
+collected 107 items
 
-tests/data/test_data_validation.py (6 passed)
+tests/data/test_data_validation.py (7 passed)
 tests/data/test_feed.py (5 passed)
 tests/data/test_ingestion_pipeline.py (8 passed)
 tests/data/test_live_infrastructure.py (6 passed)
-tests/data/test_storage.py (8 passed)
+tests/data/test_storage.py (9 passed)
 tests/data/test_yahoo_adapter.py (5 passed)
-tests/features/test_feature_pipeline.py (8 passed)
+tests/features/test_feature_pipeline.py (10 passed)
 tests/features/test_indicators.py (14 passed)
 tests/test_config.py (3 passed)
-tests/test_core_models.py (20 passed)
+tests/test_core_models.py (23 passed)
 tests/test_risk_policy.py (17 passed)
 
-============================ 100 passed in 2.32s ============================
+============================ 107 passed in 2.44s ============================
 ```
 
 ### Static Analysis & Linter Verification

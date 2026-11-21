@@ -204,6 +204,27 @@ class Bar(BaseModel, frozen=True):
     is_synthetic: bool = Field(default=False)
     provenance: DataProvenance | None = Field(default=None)
 
+    @model_validator(mode="before")
+    @classmethod
+    def harmonize_synthetic_flags(cls, data: Any) -> Any:
+        """Harmonizes and enforces source-of-truth consistency between Bar.is_synthetic and DataProvenance.is_synthetic."""
+        if isinstance(data, dict):
+            prov = data.get("provenance")
+            if prov is not None:
+                prov_synth = getattr(prov, "is_synthetic", None)
+                if prov_synth is None and isinstance(prov, dict):
+                    prov_synth = prov.get("is_synthetic", False)
+                if prov_synth is not None:
+                    if "is_synthetic" in data and data["is_synthetic"] is not None:
+                        if bool(data["is_synthetic"]) != bool(prov_synth):
+                            raise ValueError(
+                                f"Contradictory synthetic flags: Bar.is_synthetic={data['is_synthetic']} "
+                                f"but DataProvenance.is_synthetic={prov_synth}"
+                            )
+                    else:
+                        data["is_synthetic"] = bool(prov_synth)
+        return data
+
     @field_validator("start_time", "end_time")
     @classmethod
     def check_utc(cls, v: datetime) -> datetime:
@@ -211,6 +232,13 @@ class Bar(BaseModel, frozen=True):
 
     @model_validator(mode="after")
     def validate_bar_invariants(self) -> "Bar":
+        # Provenance synchronization verification
+        if self.provenance is not None and self.is_synthetic != self.provenance.is_synthetic:
+            raise ValueError(
+                f"Contradictory synthetic flags: Bar.is_synthetic={self.is_synthetic} "
+                f"but DataProvenance.is_synthetic={self.provenance.is_synthetic}"
+            )
+
         # Temporal ordering
         if self.end_time <= self.start_time:
             raise ValueError(

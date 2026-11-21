@@ -53,7 +53,7 @@ class HistoricalDataPipeline:
     ) -> IngestionResult:
         """
         Executes fail-closed idempotent data ingestion for an instrument and timeframe:
-        1. Queries the historical data provider.
+        1. Queries the historical data provider for the half-open interval [start, end).
         2. Validates domain constraints (OHLC bounds, monotonic timestamps, symbol, timeframe, date range).
         3. Identifies missing interval gaps without falsely rejecting market closures.
         4. Rejects datasets failing validation and refuses to persist corrupt records.

@@ -19,20 +19,24 @@ class TestYahooFinanceHistoricalProvider(unittest.TestCase):
 
     @patch("yfinance.Ticker")
     def test_preserves_exact_start_and_end_boundaries(self, mock_ticker_cls: MagicMock) -> None:
-        """Proves that returned bars strictly fall within the requested [start, end] interval."""
+        """Proves that returned bars strictly fall within the requested [start, end) half-open interval."""
         dates = [
             datetime(2024, 12, 31, 0, 0, 0, tzinfo=UTC),  # Before start (should be filtered out)
-            datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),  # In range
-            datetime(2025, 1, 2, 0, 0, 0, tzinfo=UTC),  # In range
-            datetime(2025, 1, 6, 0, 0, 0, tzinfo=UTC),  # After end (should be filtered out)
+            datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),  # Exactly at start (included)
+            datetime(2025, 1, 2, 0, 0, 0, tzinfo=UTC),  # In range (included)
+            datetime(2025, 1, 4, 23, 59, 0, tzinfo=UTC),  # Just before end (included)
+            datetime(
+                2025, 1, 5, 0, 0, 0, tzinfo=UTC
+            ),  # Exactly at end (filtered out under [start, end))
+            datetime(2025, 1, 6, 0, 0, 0, tzinfo=UTC),  # After end (filtered out)
         ]
         mock_df = pd.DataFrame(
             {
-                "Open": [100.0, 101.0, 102.0, 103.0],
-                "High": [105.0, 106.0, 107.0, 108.0],
-                "Low": [99.0, 100.0, 101.0, 102.0],
-                "Close": [104.0, 105.0, 106.0, 107.0],
-                "Volume": [1000.0, 1200.0, 1300.0, 1400.0],
+                "Open": [100.0, 101.0, 102.0, 102.5, 103.0, 104.0],
+                "High": [105.0, 106.0, 107.0, 107.5, 108.0, 109.0],
+                "Low": [99.0, 100.0, 101.0, 101.5, 102.0, 103.0],
+                "Close": [104.0, 105.0, 106.0, 106.5, 107.0, 108.0],
+                "Volume": [1000.0, 1200.0, 1300.0, 1350.0, 1400.0, 1500.0],
             },
             index=pd.DatetimeIndex(dates),
         )
@@ -42,9 +46,12 @@ class TestYahooFinanceHistoricalProvider(unittest.TestCase):
 
         bars = self.provider.get_historical_bars("AAPL", Timeframe.D1, self.start, self.end)
 
-        self.assertEqual(len(bars), 2)
+        self.assertEqual(len(bars), 3)
         self.assertEqual(bars[0].start_time, datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC))
         self.assertEqual(bars[1].start_time, datetime(2025, 1, 2, 0, 0, 0, tzinfo=UTC))
+        self.assertEqual(bars[2].start_time, datetime(2025, 1, 4, 23, 59, 0, tzinfo=UTC))
+        # Ensure bar exactly at end (2025-01-05 00:00:00) is strictly excluded
+        self.assertTrue(all(b.start_time < self.end for b in bars))
 
     @patch("yfinance.Ticker")
     def test_preserves_original_ohlcv_without_manufacturing_prices(

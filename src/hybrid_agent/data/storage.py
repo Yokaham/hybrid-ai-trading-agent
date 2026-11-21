@@ -78,11 +78,7 @@ class ParquetStorageEngine:
             vol_type_val = (
                 b.volume_type.value if hasattr(b, "volume_type") else VolumeType.REAL_TRADED.value
             )
-            is_synth = (
-                b.is_synthetic
-                if b.is_synthetic is not None
-                else (prov.is_synthetic if prov else False)
-            )
+            is_synth = b.is_synthetic or (b.provenance is not None and b.provenance.is_synthetic)
 
             new_records.append(
                 {
@@ -167,7 +163,7 @@ class ParquetStorageEngine:
             df = df[df["start_time"] >= start_utc]
         if end is not None:
             end_utc = validate_utc_timestamp(end)
-            df = df[df["start_time"] <= end_utc]
+            df = df[df["start_time"] < end_utc]
 
         bars: list[Bar] = []
         for _, row in df.iterrows():
@@ -252,7 +248,7 @@ class ParquetStorageEngine:
             df = df[df["start_time"] >= start_utc]
         if end is not None:
             end_utc = validate_utc_timestamp(end)
-            df = df[df["start_time"] <= end_utc]
+            df = df[df["start_time"] < end_utc]
 
         return df.reset_index(drop=True)
 
@@ -288,7 +284,7 @@ class DuckDBAnalyticalEngine:
             conditions.append("start_time >= ?")
             params.append(validate_utc_timestamp(start))
         if end is not None:
-            conditions.append("start_time <= ?")
+            conditions.append("start_time < ?")
             params.append(validate_utc_timestamp(end))
 
         if conditions:

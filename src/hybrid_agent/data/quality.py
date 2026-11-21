@@ -49,7 +49,7 @@ class DataQualityValidator:
         - OHLC relationship boundaries
         - Non-negative volume & positive prices
         - Instrument and timeframe alignment
-        - Date-range boundary compliance
+        - Date-range boundary compliance using half-open interval [start, end)
         """
         if not bars:
             return DataQualityReport(
@@ -79,14 +79,14 @@ class DataQualityValidator:
                     f"Bar {idx} timeframe mismatch: expected {expected_timeframe.value}, got {bar.timeframe.value}"
                 )
 
-            # 2. Date-range adherence
+            # 2. Date-range adherence (enforcing [start, end) half-open interval)
             if expected_start and bar.start_time < expected_start:
                 violations.append(
                     f"Bar {idx} start_time ({bar.start_time}) is earlier than requested start ({expected_start})"
                 )
-            if expected_end and bar.start_time > expected_end:
+            if expected_end and bar.start_time >= expected_end:
                 violations.append(
-                    f"Bar {idx} start_time ({bar.start_time}) is later than requested end ({expected_end})"
+                    f"Bar {idx} start_time ({bar.start_time}) is at or later than requested exclusive end ({expected_end})"
                 )
 
             # 3. Price boundary checks

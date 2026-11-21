@@ -60,6 +60,7 @@ class MockHistoricalDataProvider(HistoricalMarketDataProvider):
             source_name=self.name,
             source_type=DataSourceType.SIMULATED,
             retrieved_at=datetime.now(UTC),
+            is_synthetic=True,
             metadata={"seed": self._seed, "synthetic": True},
         )
 

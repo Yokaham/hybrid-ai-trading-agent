@@ -66,14 +66,14 @@ def compute_adx(
     plus_dm_smooth = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     minus_dm_smooth = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
-    plus_di = 100.0 * (plus_dm_smooth / tr_smooth.replace(0, np.nan)).fillna(0.0)
-    minus_di = 100.0 * (minus_dm_smooth / tr_smooth.replace(0, np.nan)).fillna(0.0)
+    plus_di = 100.0 * (plus_dm_smooth / tr_smooth.replace(0, np.nan))
+    minus_di = 100.0 * (minus_dm_smooth / tr_smooth.replace(0, np.nan))
 
     di_sum = plus_di + minus_di
     di_diff = (plus_di - minus_di).abs()
-    dx = (100.0 * (di_diff / di_sum.replace(0, np.nan))).fillna(0.0)
+    dx = 100.0 * (di_diff / di_sum.replace(0, np.nan))
 
-    adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().fillna(0.0)
+    adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
     return adx, plus_di, minus_di
 
@@ -224,7 +224,7 @@ def compute_historical_volatility(
     shifted = close.shift(1)
     ratio = close / shifted.replace(0, np.nan)
     ratio = ratio.where(ratio > 0, np.nan)
-    log_returns = np.log(ratio).fillna(0.0)
+    log_returns = np.log(ratio)
 
     rolling_std = log_returns.rolling(window=period, min_periods=period).std()
     if factor is None or factor == 0.0:
@@ -241,7 +241,8 @@ def compute_volume_sma(volume: pd.Series, period: int = 20) -> pd.Series:
     """Computes Volume Simple Moving Average. Returns NaN series if volume is all zero or unavailable."""
     if period <= 0:
         raise ValueError(f"period must be strictly positive, got {period}")
-    if (volume == 0.0).all():
+    valid_vol = volume.dropna()
+    if valid_vol.empty or (valid_vol == 0.0).all():
         return pd.Series(np.nan, index=volume.index)
     return volume.rolling(window=period, min_periods=period).mean()
 

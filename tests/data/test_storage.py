@@ -71,8 +71,9 @@ class TestStorageAndAnalytics(unittest.TestCase):
             start=filter_start,
             end=filter_end,
         )
-        self.assertEqual(len(filtered), 4)  # days 3, 4, 5, 6
+        self.assertEqual(len(filtered), 3)  # days 3, 4, 5 under exclusive end [start, end)
         self.assertEqual(filtered[0].start_time, filter_start)
+        self.assertTrue(all(b.start_time < filter_end for b in filtered))
 
     def test_repeated_write_idempotency_and_deduplication(self) -> None:
         bars = create_bars_sequence("AAPL", 5, self.base_time)
@@ -136,10 +137,25 @@ class TestStorageAndAnalytics(unittest.TestCase):
 
         # Provenance source_type must remain strictly SIMULATED, NOT HISTORICAL
         self.assertEqual(loaded.provenance.source_type, DataSourceType.SIMULATED)
+        self.assertTrue(loaded.provenance.is_synthetic)
         self.assertEqual(loaded.provenance.source_name, "sim_engine")
         self.assertEqual(loaded.provenance.retrieved_at, retrieval_timestamp)
         self.assertEqual(loaded.provenance.metadata.get("seed"), 42)
         self.assertEqual(loaded.provenance.metadata.get("generator"), "gbm")
+
+    def test_duckdb_parquet_query_with_exclusive_end(self) -> None:
+        """Proves DuckDB query_bars_from_parquet enforces the half-open interval [start, end)."""
+        bars = create_bars_sequence("MSFT", 10, self.base_time)
+        file_path = self.storage.write_bars(bars, source_name="test_source")
+
+        filter_start = self.base_time + timedelta(days=2)
+        filter_end = self.base_time + timedelta(days=5)
+        df = self.analytics.query_bars_from_parquet(file_path, start=filter_start, end=filter_end)
+
+        # Days 2, 3, 4 -> Exactly 3 bars (Day 5 is strictly excluded)
+        self.assertEqual(len(df), 3)
+        self.assertTrue((df["start_time"] >= filter_start).all())
+        self.assertTrue((df["start_time"] < filter_end).all())
 
     def test_mixed_symbol_write_rejected(self) -> None:
         """Proves that attempting to write bars of different symbols in one batch raises ValueError."""

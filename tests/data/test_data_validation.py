@@ -91,6 +91,51 @@ class TestDataQualityValidator(unittest.TestCase):
         self.assertTrue(report.is_valid)
         self.assertEqual(report.total_bars, 0)
 
+    def test_half_open_interval_boundary_compliance(self) -> None:
+        """
+        Proves strict [start, end) boundary compliance:
+        - Bar at start is valid.
+        - Bar just before end is valid.
+        - Bar at exactly end is rejected with a hard violation.
+        - Bar after end is rejected with a hard violation.
+        """
+        start = self.base_time
+        end = self.base_time + timedelta(days=5)
+
+        # 1. Bar exactly at start
+        bar_at_start = create_test_bar(start)
+        rep1 = DataQualityValidator.validate_bars(
+            [bar_at_start], expected_start=start, expected_end=end
+        )
+        self.assertTrue(rep1.is_valid)
+
+        # 2. Bar just before end
+        bar_before_end = create_test_bar(end - timedelta(seconds=1))
+        rep2 = DataQualityValidator.validate_bars(
+            [bar_before_end], expected_start=start, expected_end=end
+        )
+        self.assertTrue(rep2.is_valid)
+
+        # 3. Bar exactly at end -> Must produce violation
+        bar_at_end = create_test_bar(end)
+        rep3 = DataQualityValidator.validate_bars(
+            [bar_at_end], expected_start=start, expected_end=end
+        )
+        self.assertFalse(rep3.is_valid)
+        self.assertTrue(
+            any("at or later than requested exclusive end" in v for v in rep3.violations)
+        )
+
+        # 4. Bar after end -> Must produce violation
+        bar_after_end = create_test_bar(end + timedelta(days=1))
+        rep4 = DataQualityValidator.validate_bars(
+            [bar_after_end], expected_start=start, expected_end=end
+        )
+        self.assertFalse(rep4.is_valid)
+        self.assertTrue(
+            any("at or later than requested exclusive end" in v for v in rep4.violations)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

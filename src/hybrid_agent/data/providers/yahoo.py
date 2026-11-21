@@ -87,6 +87,7 @@ class YahooFinanceHistoricalProvider(HistoricalMarketDataProvider):
         Fetches and normalizes historical bars from Yahoo Finance.
         Preserves original provider OHLCV values without inventing or clamping numbers.
         Propagates provider failures through ProviderConnectionError.
+        Enforces half-open interval [start, end) where end boundary is strictly exclusive.
         """
         start_utc = validate_utc_timestamp(start)
         end_utc = validate_utc_timestamp(end)
@@ -147,8 +148,8 @@ class YahooFinanceHistoricalProvider(HistoricalMarketDataProvider):
             bar_start = ts.to_pydatetime()
             bar_end = bar_start + step_delta
 
-            # Strictly filter to requested time interval
-            if bar_start < start_utc or bar_start > end_utc:
+            # Strictly filter to requested half-open time interval [start, end)
+            if bar_start < start_utc or bar_start >= end_utc:
                 continue
 
             open_p = float(row["Open"])

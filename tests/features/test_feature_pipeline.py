@@ -163,7 +163,7 @@ class TestFeaturePipeline(unittest.TestCase):
         )
 
     def test_stateful_incremental_engine_parity(self) -> None:
-        """Proves that streaming bars through StatefulIncrementalFeatureEngine matches batch transform."""
+        """Proves that streaming bars through StatefulIncrementalFeatureEngine matches batch transform across all 20 indicator columns."""
         engine = StatefulIncrementalFeatureEngine()
         latest_inc: dict[str, float] = {}
 
@@ -179,18 +179,38 @@ class TestFeaturePipeline(unittest.TestCase):
         batch_df = self.pipeline.transform(df)
         batch_latest = batch_df.iloc[-1]
 
-        # Verify exact parity
-        for col in [
+        # Verify exact parity across ALL 20 indicator columns
+        all_indicators = [
             "sma_20",
             "sma_50",
             "ema_20",
+            "adx_14",
+            "plus_di_14",
+            "minus_di_14",
             "rsi_14",
-            "atr_14",
+            "macd_line",
+            "macd_signal",
+            "macd_hist",
             "roc_12",
+            "atr_14",
+            "bb_upper_20",
             "bb_middle_20",
+            "bb_lower_20",
+            "bb_pct_b_20",
+            "bb_bandwidth_20",
+            "hv_20",
             "vol_sma_20",
-        ]:
-            self.assertAlmostEqual(latest_inc[col], batch_latest[col], places=4)
+            "rvol_20",
+        ]
+        for col in all_indicators:
+            self.assertIn(col, latest_inc, f"Missing {col} in incremental features")
+            self.assertIn(col, batch_latest, f"Missing {col} in batch features")
+            self.assertAlmostEqual(
+                latest_inc[col],
+                float(batch_latest[col]),
+                places=4,
+                msg=f"Discrepancy in indicator {col}: inc={latest_inc[col]}, batch={batch_latest[col]}",
+            )
 
     def test_stateful_incremental_engine_rebuild_on_revision(self) -> None:
         """Proves that an incremental engine can safely rebuild its state when historical bars are revised."""
@@ -236,6 +256,128 @@ class TestFeaturePipeline(unittest.TestCase):
 
         self.assertTrue(transformed["vol_sma_20"].isna().all())
         self.assertTrue(transformed["rvol_20"].isna().all())
+
+    def test_per_observation_mixed_volume_handling_and_parity(self) -> None:
+        """
+        Proves per-observation volume availability:
+        - Windows containing unavailable observations yield NaN.
+        - Windows with 20 consecutive valid volume observations yield valid VolumeSMA and RVOL.
+        - Exact parity between batch and incremental transformations.
+        """
+        base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+        mixed_bars: list[Bar] = []
+        # Construct 52 bars: 25 valid, 2 unavailable, 25 valid
+        for i in range(52):
+            t0 = base_time + timedelta(minutes=i)
+            t1 = t0 + timedelta(minutes=1)
+            is_unavail = 25 <= i < 27
+            vt = VolumeType.UNAVAILABLE if is_unavail else VolumeType.REAL_TRADED
+            v = 0.0 if is_unavail else float(1000 + i * 20)
+            mixed_bars.append(
+                Bar(
+                    symbol="MIXED",
+                    start_time=t0,
+                    end_time=t1,
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=v,
+                    volume_type=vt,
+                    timeframe=Timeframe.M1,
+                )
+            )
+
+        records = [
+            {
+                "open": b.open,
+                "high": b.high,
+                "low": b.low,
+                "close": b.close,
+                "volume": b.volume,
+                "volume_type": b.volume_type.value,
+            }
+            for b in mixed_bars
+        ]
+        df = pd.DataFrame(records)
+        batch_df = self.pipeline.transform(df)
+
+        engine = self.pipeline.create_incremental_engine()
+        inc_outputs = [engine.update(b) for b in mixed_bars]
+
+        # Bar 24: 25 consecutive valid bars (window 5..24 is 20 bars) -> valid Volume SMA
+        self.assertFalse(np.isnan(batch_df["vol_sma_20"].iloc[24]))
+        self.assertIn("vol_sma_20", inc_outputs[24])
+        self.assertAlmostEqual(
+            inc_outputs[24]["vol_sma_20"], batch_df["vol_sma_20"].iloc[24], places=4
+        )
+
+        # Bar 25 & 26: unavailable volume bars -> NaN for rolling window in batch and incremental
+        self.assertTrue(np.isnan(batch_df["vol_sma_20"].iloc[25]))
+        self.assertNotIn("vol_sma_20", inc_outputs[25])
+        self.assertTrue(np.isnan(batch_df["vol_sma_20"].iloc[26]))
+        self.assertNotIn("vol_sma_20", inc_outputs[26])
+
+        # Bar 35: only 9 valid bars since unavailable period -> still NaN
+        self.assertTrue(np.isnan(batch_df["vol_sma_20"].iloc[35]))
+        self.assertNotIn("vol_sma_20", inc_outputs[35])
+
+        # Bar 46: 20 consecutive valid bars (indices 27..46) -> valid Volume SMA resumes
+        self.assertFalse(np.isnan(batch_df["vol_sma_20"].iloc[46]))
+        self.assertIn("vol_sma_20", inc_outputs[46])
+        self.assertAlmostEqual(
+            inc_outputs[46]["vol_sma_20"], batch_df["vol_sma_20"].iloc[46], places=4
+        )
+        self.assertAlmostEqual(inc_outputs[46]["rvol_20"], batch_df["rvol_20"].iloc[46], places=4)
+
+    def test_configurable_historical_volatility_annualization(self) -> None:
+        """Verifies configurable annualization factors on FeaturePipeline and parity with incremental engine."""
+        # Equities (252)
+        pipe_eq = FeaturePipeline(annualization_factor=252.0)
+        # Forex (260)
+        pipe_fx = FeaturePipeline(annualization_factor=260.0)
+        # Crypto (365)
+        pipe_crypto = FeaturePipeline(annualization_factor=365.0)
+        # Unannualized (None)
+        pipe_raw = FeaturePipeline(annualization_factor=None)
+
+        # Negative factor validation
+        with self.assertRaises(ValueError):
+            FeaturePipeline(annualization_factor=-10.0)
+
+        records = [
+            {"open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume}
+            for b in self.bars
+        ]
+        df = pd.DataFrame(records)
+
+        df_eq = pipe_eq.transform(df)
+        df_fx = pipe_fx.transform(df)
+        df_crypto = pipe_crypto.transform(df)
+        df_raw = pipe_raw.transform(df)
+
+        # HV should scale with sqrt(annualization_factor)
+        val_eq = df_eq["hv_20"].iloc[-1]
+        val_fx = df_fx["hv_20"].iloc[-1]
+        val_crypto = df_crypto["hv_20"].iloc[-1]
+        val_raw = df_raw["hv_20"].iloc[-1]
+
+        self.assertAlmostEqual(val_eq, val_raw * np.sqrt(252.0), places=5)
+        self.assertAlmostEqual(val_fx, val_raw * np.sqrt(260.0), places=5)
+        self.assertAlmostEqual(val_crypto, val_raw * np.sqrt(365.0), places=5)
+
+        # Incremental parity for unannualized and custom factor
+        eng_raw = pipe_raw.create_incremental_engine()
+        inc_raw = {}
+        for b in self.bars:
+            inc_raw = eng_raw.update(b)
+        self.assertAlmostEqual(inc_raw["hv_20"], val_raw, places=5)
+
+        eng_crypto = pipe_crypto.create_incremental_engine()
+        inc_crypto = {}
+        for b in self.bars:
+            inc_crypto = eng_crypto.update(b)
+        self.assertAlmostEqual(inc_crypto["hv_20"], val_crypto, places=5)
 
 
 if __name__ == "__main__":
