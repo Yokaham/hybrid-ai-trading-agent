@@ -1,7 +1,8 @@
-"""Immutable domain models for financial telemetry and trading objects."""
+"""Immutable domain models for financial telemetry, market data, and trading objects."""
 
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -30,6 +31,129 @@ def validate_utc_timestamp(dt: datetime) -> datetime:
     return dt
 
 
+class Timeframe(str, Enum):
+    """Standardized market data aggregation intervals."""
+
+    M1 = "1m"
+    M5 = "5m"
+    M15 = "15m"
+    H1 = "1h"
+    H4 = "4h"
+    D1 = "1d"
+    W1 = "1w"
+
+    @property
+    def seconds(self) -> int:
+        """Returns interval duration in seconds."""
+        lookup = {
+            Timeframe.M1: 60,
+            Timeframe.M5: 300,
+            Timeframe.M15: 900,
+            Timeframe.H1: 3600,
+            Timeframe.H4: 14400,
+            Timeframe.D1: 86400,
+            Timeframe.W1: 604800,
+        }
+        return lookup[self]
+
+    @property
+    def timedelta(self) -> timedelta:
+        """Returns interval duration as a timedelta."""
+        return timedelta(seconds=self.seconds)
+
+    @property
+    def pandas_freq(self) -> str:
+        """Returns standard pandas resample frequency string."""
+        lookup = {
+            Timeframe.M1: "1min",
+            Timeframe.M5: "5min",
+            Timeframe.M15: "15min",
+            Timeframe.H1: "1h",
+            Timeframe.H4: "4h",
+            Timeframe.D1: "1D",
+            Timeframe.W1: "1W",
+        }
+        return lookup[self]
+
+    @classmethod
+    def from_string(cls, val: str) -> "Timeframe":
+        """Parses common string representations into a Timeframe enum."""
+        cleaned = val.strip().lower()
+        mapping = {
+            "1m": cls.M1,
+            "m1": cls.M1,
+            "1min": cls.M1,
+            "5m": cls.M5,
+            "m5": cls.M5,
+            "5min": cls.M5,
+            "15m": cls.M15,
+            "m15": cls.M15,
+            "15min": cls.M15,
+            "1h": cls.H1,
+            "h1": cls.H1,
+            "60m": cls.H1,
+            "4h": cls.H4,
+            "h4": cls.H4,
+            "1d": cls.D1,
+            "d1": cls.D1,
+            "daily": cls.D1,
+            "1w": cls.W1,
+            "w1": cls.W1,
+            "weekly": cls.W1,
+        }
+        if cleaned not in mapping:
+            raise ValueError(f"Unsupported timeframe identifier: '{val}'")
+        return mapping[cleaned]
+
+
+class DataSourceType(str, Enum):
+    """Classification of market data origin."""
+
+    REAL_LIVE = "REAL_LIVE"
+    DELAYED = "DELAYED"
+    HISTORICAL = "HISTORICAL"
+    SIMULATED = "SIMULATED"
+
+
+class DataProvenance(BaseModel, frozen=True):
+    """Metadata detailing data origin, provider, and ingestion audit trail."""
+
+    source_name: str
+    source_type: DataSourceType
+    retrieved_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def check_utc(cls, v: datetime) -> datetime:
+        return validate_utc_timestamp(v)
+
+
+class Quote(BaseModel, frozen=True):
+    """Real-time bid/ask quote snapshot with market depth and provenance."""
+
+    symbol: str
+    timestamp: datetime
+    bid: float = Field(gt=0.0)
+    ask: float = Field(gt=0.0)
+    bid_size: float = Field(default=0.0, ge=0.0)
+    ask_size: float = Field(default=0.0, ge=0.0)
+    provenance: DataProvenance | None = Field(default=None)
+
+    @field_validator("timestamp")
+    @classmethod
+    def check_utc(cls, v: datetime) -> datetime:
+        return validate_utc_timestamp(v)
+
+    @model_validator(mode="after")
+    def validate_bid_ask(self) -> "Quote":
+        if self.bid > self.ask:
+            raise ValueError(
+                f"Invalid Quote: bid price ({self.bid}) cannot exceed ask price ({self.ask})"
+            )
+        return self
+
+
 class Tick(BaseModel, frozen=True):
     """High-resolution market quote snapshot with bid/ask validation."""
 
@@ -39,6 +163,7 @@ class Tick(BaseModel, frozen=True):
     ask: float = Field(gt=0.0)
     bid_volume: float = Field(default=0.0, ge=0.0)
     ask_volume: float = Field(default=0.0, ge=0.0)
+    provenance: DataProvenance | None = Field(default=None)
 
     @field_validator("timestamp")
     @classmethod
@@ -65,6 +190,9 @@ class Bar(BaseModel, frozen=True):
     low: float = Field(gt=0.0)
     close: float = Field(gt=0.0)
     volume: float = Field(ge=0.0)
+    timeframe: Timeframe = Field(default=Timeframe.D1)
+    is_synthetic: bool = Field(default=False)
+    provenance: DataProvenance | None = Field(default=None)
 
     @field_validator("start_time", "end_time")
     @classmethod

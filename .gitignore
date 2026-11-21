@@ -57,6 +57,10 @@ htmlcov/
 # Data & Model artifacts
 data/raw/
 data/processed/
+data/market_data/
+*.parquet
+*.duckdb
+*.duckdb.wal
 models/checkpoints/
 models/saved/
 logs/*.log

@@ -38,3 +38,18 @@
 - **Decision**: Implement dual-tier risk evaluation:
   1. **Monetary Risk per Trade**: Computed as $\Delta P \times Quantity \times ContractSize$ (or via tick value and tick count), converted to account currency and bounded by `max_risk_per_trade_pct` (default: 1.0%).
   2. **Gross Notional Exposure**: Bounded by `max_position_size_pct` (default: 10.0%) to prevent over-leveraging.
+
+### ADR-008: Partitioned Columnar Storage (Parquet) and In-Process DuckDB Analytical Engine
+- **Status**: Accepted
+- **Context**: Quantitative research requires high-throughput storage, fast date-range filtering, and efficient columnar analytical queries across millions of historical bars without managing external database server infrastructure (PostgreSQL, ClickHouse).
+- **Decision**: Standardize on Apache Parquet via PyArrow, organized by the deterministic partition schema `data/market_data/{source}/{symbol}/{timeframe}/bars.parquet`. Writes are strictly idempotent: updates merge with existing records, deduplicate on `start_time` (keeping latest), and enforce ascending sort. DuckDB is embedded for instant zero-copy analytical SQL queries directly over partitioned Parquet files.
+
+### ADR-009: Dual Batch and Incremental Feature Engineering with Zero Lookahead
+- **Status**: Accepted
+- **Context**: Machine learning research demands fast vectorised batch calculations over multi-year DataFrames, while live paper monitoring and trade execution require incremental per-bar updates. Discrepancies between batch and incremental pipelines cause catastrophic feature drift between training and inference.
+- **Decision**: Author technical indicators using pure NumPy and Pandas vectorisation. Implement `FeaturePipeline` supporting both batch `transform(df)` and rolling `transform_incremental(bar, window)`. Strictly enforce zero lookahead leakage: bar $T$ indicators are computed exclusively using data with timestamps $\le T$, verified by automated future-data mutation tests.
+
+### ADR-010: Decoupled Market Data Interfaces and Normalized Provenance Models
+- **Status**: Accepted
+- **Context**: Relying directly on proprietary broker data feeds creates severe vendor lock-in and impedes offline research. Data from disparate providers (e.g. Yahoo Finance, MetaTrader, synthetic generators) exhibits inconsistent field naming, missing timestamps, and disparate timezones.
+- **Decision**: Define provider-agnostic interfaces (`MarketDataProvider`, `HistoricalMarketDataProvider`, `LiveMarketDataProvider`). Normalize all ingestion into immutable domain models (`Tick`, `Quote`, `Bar`) with explicit `DataProvenance` tracking the data source, retrieval timestamp, and synthetic status. Provide an offline `MockHistoricalDataProvider` and `MockLiveMarketDataProvider` for deterministic CI/CD, alongside an initial research adapter for Yahoo Finance.

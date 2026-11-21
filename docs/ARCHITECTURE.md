@@ -98,6 +98,80 @@ Trading logic and order verification validate parameters against explicit contra
 - `tick_size`: Minimum price increment ($> 0$).
 - `contract_size`: Deliverable units per contract/lot ($> 0$).
 - `min_volume`: Minimum allowed order size.
+
+---
+
+## 4. Market Data & Feature Pipeline Architecture (Milestone 2)
+
+```
+  +---------------------------------------------------------------------------------+
+  |                          Market Data Ingestion Layer                            |
+  |  +-----------------------------+               +-----------------------------+  |
+  |  | HistoricalMarketDataProvider|               |    LiveMarketDataProvider   |  |
+  |  | (Yahoo / Synthetic GBM Mock)|               |  (Mock Live Stream Adapter) |  |
+  |  +--------------+--------------+               +--------------+--------------+  |
+  |                 |                                             |                 |
+  |                 v                                             v                 |
+  |  +-----------------------------+               +-----------------------------+  |
+  |  |    DataQualityValidator     |               |    TickDeduplicator &       |  |
+  |  |  - Timestamp monotonicity   |               |    LiveFreshnessTracker     |  |
+  |  |  - OHLC & spread sanity     |               +--------------+--------------+  |
+  |  |  - Gap & duplicate detection|                              |                 |
+  |  +--------------+--------------+                              v                 |
+  |                 |                              +-----------------------------+  |
+  |                 v                              |    LiveCandleAggregator     |  |
+  |  +-----------------------------+               | (Rolling tick-to-bar rollup)|  |
+  |  |    ParquetStorageEngine     |               +--------------+--------------+  |
+  |  | (Partitioned & Idempotent)  |                              |                 |
+  |  +--------------+--------------+                              |                 |
+  |                 |                                             |                 |
+  |                 v                                             v                 |
+  |  +-----------------------------+               +-----------------------------+  |
+  |  |   DuckDBAnalyticalEngine    |               |       MarketDataFeed        |  |
+  |  |  (Direct SQL over Parquet)  |               |  (Unified Downstream Buffer)|  |
+  |  +--------------+--------------+               +--------------+--------------+  |
+  +-----------------|---------------------------------------------|-----------------+
+                    |                                             |
+                    +----------------------+----------------------+
+                                           |
+                                           v
+  +---------------------------------------------------------------------------------+
+  |                         Feature Engineering Engine                              |
+  |  +---------------------------------------------------------------------------+  |
+  |  |                              FeatureRegistry                              |  |
+  |  |  Catalogues indicators with metadata: input columns, warmups, descriptions|  |
+  |  +-------------------------------------+-------------------------------------+  |
+  |                                        |                                        |
+  |                                        v                                        |
+  |  +---------------------------------------------------------------------------+  |
+  |  |                              FeaturePipeline                              |  |
+  |  | - Batch Mode: High-throughput vectorised DataFrame transformation         |  |
+  |  | - Incremental Mode: Rolling bar-by-bar transformation with zero drift     |  |
+  |  | - Lookahead Guard: Proven strict causality ($T_i$ depends only on $T\le i$)|  |
+  |  +---------------------------------------------------------------------------+  |
+  +---------------------------------------------------------------------------------+
+```
+
+### 4.1 Data Normalization and Provenance
+Every incoming quote, tick, and bar is stamped with `DataProvenance`, recording:
+- `source_type`: `DataSourceType` (`HISTORICAL_DOWNLOAD`, `REALTIME_STREAM`, `SYNTHETIC_GENERATOR`, `PROPRIETARY_ARCHIVE`).
+- `provider_name`: Identifier string of the data origin.
+- `retrieval_time`: UTC timestamp of acquisition.
+- `is_synthetic`: Boolean flag to ensure synthetic simulation data is never confused with empirical historical feeds.
+
+### 4.2 Storage Layout and Partitioning
+Bars are persisted via PyArrow into a deterministic directory hierarchy:
+```
+data/market_data/
+  └── {source_name}/
+        └── {symbol}/
+              └── {timeframe}/
+                    └── bars.parquet
+```
+All writes are idempotent: existing bars are combined with incoming bars, deduplicated by `start_time`, sorted chronologically, and written as compressed Parquet tables.
+
+### 4.3 Feature Calculation Engine
+Technical features (Trend, Momentum, Volatility, Volume) are computed using pure NumPy and Pandas routines. The `FeaturePipeline` guarantees exact equivalence between batch vectorized execution on historical data and incremental streaming execution during live monitoring. Automated tests guarantee zero lookahead bias by mutating future bars and verifying that past feature values remain invariant.
 - `volume_step`: Sizing increments ($min\_volume$ must be a multiple of $volume\_step$).
 - `price_precision`: Maximum allowed price decimal places.
 - `profit_currency` / `quote_currency` / `base_currency`: Currency designations for PnL and conversion.

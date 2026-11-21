@@ -12,10 +12,11 @@
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Milestone 2: Data Ingestion Pipeline, Parquet Store & Feature Engineering       |
-| - Deterministic multi-source loaders (CSV/Parquet) with time-index validation.  |
-| - Real-time and batch technical feature extractors without lookahead leakage.   |
-| - Stationarity checks, volatility indicators, and pipeline integrity tests.     |
+| Milestone 2: Market Data Infrastructure & Feature Engineering (COMPLETED)       |
+| - Abstract provider interfaces (Historical, Live) & synthetic GBM mock.         |
+| - Partitioned Parquet storage, idempotent upserts & DuckDB analytical engine.   |
+| - Live candle aggregator, freshness tracker, tick deduplicator, data feed buffer|
+| - Technical feature pipeline (dual batch & streaming) with zero lookahead.      |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
@@ -64,10 +65,16 @@
 - Separation of gross position notional from monetary downside risk at stop-loss.
 - Zero-tolerance regulatory enforcement regarding unauthorized offshore platforms (FEMA / RBI Alert List).
 
-### Milestone 2: Data Ingestion & Feature Engineering
-- Ingestion pipelines for historical bar and tick feeds.
-- Parquet columnar storage partitioned by date and symbol.
-- Streaming feature calculators with strictly sealed bar boundaries to prevent lookahead bias.
+### Milestone 2: Market Data Infrastructure & Feature Engineering (Current Status: Verified)
+- Abstract provider interfaces: `MarketDataProvider`, `HistoricalMarketDataProvider`, `LiveMarketDataProvider`.
+- Deterministic offline mock provider with Geometric Brownian Motion (`MockHistoricalDataProvider`, `MockLiveMarketDataProvider`).
+- Real-world historical data adapter for exploratory research using Yahoo Finance (`YahooFinanceHistoricalProvider`).
+- Data quality validation: Strict monotonic UTC timestamps, duplicate detection, missing interval identification, OHLC boundary enforcement, and spread checks.
+- Columnar partitioned Parquet storage engine (`data/market_data/{source}/{symbol}/{timeframe}/bars.parquet`) with idempotent upserts.
+- Embedded DuckDB analytical engine for zero-copy SQL analysis over Parquet files.
+- Live market data infrastructure: LRU tick deduplication (`TickDeduplicator`), staleness tracking (`LiveFreshnessTracker`), real-time tick-to-bar aggregation (`LiveCandleAggregator`), and downstream buffering (`MarketDataFeed`).
+- Vectorised indicator library (SMA, EMA, ADX, RSI, MACD, ROC, ATR, Bollinger Bands, HV, Volume SMA, RVOL) with metadata registry (`FeatureRegistry`).
+- Dual-mode `FeaturePipeline` with proven bit-level parity between historical batch and streaming incremental calculation, and automated verification of zero lookahead bias.
 
 ### Milestone 3: Machine Learning Modeling & Tuning
 - Feature transformations and stationary representation.

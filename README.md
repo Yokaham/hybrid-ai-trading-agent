@@ -54,6 +54,46 @@ copy .env.example .env
 pytest tests/
 ```
 
+### Market Data Ingestion & Feature Engineering (Python API)
+```python
+from datetime import datetime, timezone
+from hybrid_agent.core import Timeframe
+from hybrid_agent.data import (
+    DuckDBAnalyticalEngine,
+    HistoricalDataPipeline,
+    MockHistoricalDataProvider,
+    ParquetStorageEngine,
+)
+from hybrid_agent.features import FeaturePipeline
+
+# 1. Fetch & Store historical data idempotently into Parquet
+provider = MockHistoricalDataProvider(seed=42)
+storage = ParquetStorageEngine(base_dir="data/market_data")
+pipeline = HistoricalDataPipeline(provider=provider, storage=storage)
+
+result = pipeline.ingest_symbol(
+    symbol="EURUSD",
+    timeframe=Timeframe.H1,
+    start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    end=datetime(2025, 2, 1, tzinfo=timezone.utc),
+)
+print(f"Ingested {result.bars_stored} bars to {result.storage_path}")
+
+# 2. Query stored Parquet partitions directly via DuckDB
+duckdb_engine = DuckDBAnalyticalEngine(storage_engine=storage)
+df = duckdb_engine.query(
+    "SELECT date_trunc('day', start_time) as day, avg(close) as avg_close "
+    "FROM bars WHERE symbol = 'EURUSD' GROUP BY 1 ORDER BY 1"
+)
+
+# 3. Calculate technical indicators with dual batch/streaming consistency
+feature_pipeline = FeaturePipeline()
+feature_df = feature_pipeline.transform(
+    df=storage.read_bars_to_dataframe("mock", "EURUSD", Timeframe.H1)
+)
+print(feature_df[["close", "rsi_14", "macd_line", "atr_14"]].tail())
+```
+
 ---
 
 ## License

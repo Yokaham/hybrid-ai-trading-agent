@@ -37,9 +37,18 @@ class AppSettings(BaseSettings):
     max_risk_per_trade_pct: float = Field(default=0.01, gt=0.0, le=0.05)
     max_position_size_pct: float = Field(default=0.10, gt=0.0, le=1.0)
 
-    # Data paths
+    # Data paths & market data infrastructure
     historical_data_dir: str = Field(default="./data/processed")
+    market_data_dir: str = Field(default="./data/market_data")
+    duckdb_path: str = Field(default="./data/market_data/analytics.duckdb")
     database_url: str = Field(default="sqlite:///./hybrid_agent.db")
+
+    # Market data provider settings
+    default_historical_provider: str = Field(default="mock")
+    default_symbols: list[str] = Field(default_factory=lambda: ["EURUSD", "AAPL", "MSFT"])
+    default_timeframe: str = Field(default="1d")
+    max_quote_staleness_seconds: float = Field(default=30.0, gt=0.0)
+    yahoo_finance_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
     @field_validator("enable_live_trading")
     @classmethod

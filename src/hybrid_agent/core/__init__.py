@@ -1,4 +1,4 @@
-"""Domain entities, specifications, and event primitives."""
+"""Domain entities, specifications, market data models, and event primitives."""
 
 from hybrid_agent.core.constants import (
     ALLOWED_ORDER_TRANSITIONS,
@@ -13,10 +13,14 @@ from hybrid_agent.core.constants import (
 )
 from hybrid_agent.core.models import (
     Bar,
+    DataProvenance,
+    DataSourceType,
     InstrumentSpecification,
     Order,
     Position,
+    Quote,
     Tick,
+    Timeframe,
     validate_utc_timestamp,
 )
 
@@ -24,6 +28,8 @@ __all__ = [
     "ALLOWED_ORDER_TRANSITIONS",
     "Bar",
     "CurrencyConversionError",
+    "DataProvenance",
+    "DataSourceType",
     "InstrumentSpecification",
     "InvalidOrderStateTransitionError",
     "Order",
@@ -32,7 +38,9 @@ __all__ = [
     "OrderType",
     "OrderValidationError",
     "Position",
+    "Quote",
     "Tick",
+    "Timeframe",
     "UnsupportedValuationModelError",
     "ValuationModel",
     "validate_utc_timestamp",
