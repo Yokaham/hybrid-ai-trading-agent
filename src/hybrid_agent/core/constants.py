@@ -62,3 +62,8 @@ class CurrencyConversionError(ValueError):
 
 class UnsupportedValuationModelError(ValueError):
     """Raised when an instrument requires a non-linear or unsupported valuation model."""
+
+
+class TemporalOrderViolationError(ValueError):
+    """Raised when an event or clock movement violates chronological causality."""
+

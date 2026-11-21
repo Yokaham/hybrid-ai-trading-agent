@@ -111,19 +111,30 @@ Event-driven backtesting enforces strict chronological execution: signals genera
 - Per-observation volume availability handling across batch and incremental engines.
 - Dual-mode `FeaturePipeline`: Complete mathematical parity across all 20 indicator columns between batch vectorised transform and `StatefulIncrementalFeatureEngine` ($O(1)$ updates and state rebuilding on revisions). Proven zero lookahead bias verified through future-mutation unit tests. Configurable HV annualization factor dynamically tracked in registry.
 
-### Milestone 3: Event-Driven Backtesting Engine & Microstructure Simulation (Status: Active — Milestone 3A Completed)
+### Milestone 3: Event-Driven Backtesting Engine & Microstructure Simulation (Status: Active — Milestone 3B.2 Completed)
 - **Milestone 3A (Framework Evaluation & Prototype)**:
   - Isolated evaluation of `ml4t-backtest` and `QuantConnect/LEAN`.
   - Comprehensive empirical execution harness testing 8 mandatory vectors (Cases A through H).
   - Pre-trade `RiskEngine` enforcement prototype.
   - Framework selection decision: Option B (Native event-driven engine).
-- **Milestone 3B (Native Event-Driven Engine Implementation)**:
-  - Pure Python deterministic event engine operating on domain `Bar`, `Tick`, `Order`, `InstrumentSpecification`.
-  - Chronological execution queue enforcing next-bar open execution (`ExecutionMode.NEXT_BAR`) with zero look-ahead bias.
-  - Realistic fill models: Bid/ask quote routing (Buy on Ask, Sell on Bid), volume participation limits, gap-open stop execution.
-  - Conservative stop-first order matching for bracket and simultaneous stop/take-profit triggers.
-  - Multi-currency CashBook with fail-closed currency conversion.
-  - Position mark-to-market and accounting reconciliation without artificial end-of-data liquidation.
+- **Milestone 3B.1 (Architecture Planning & Technical Review — Accepted)**:
+  - Authoritative event-time semantics (distinguishing 10 explicit temporal milestones).
+  - Rigorous execution price constraints (strict limit price protection, bar-only vs quote execution paths).
+  - Conservative stop-first policy and ambiguous intra-bar path resolution.
+  - Instrument-specific accounting models (cash equities fully funded vs linear CFDs margined).
+  - Timestamped currency conversion with staleness thresholds and explicit ledger transactions.
+  - Separation of CFD free margin, cash equity buying power, and portfolio risk budget capacity.
+  - Decoupled `OrderExecutionState` and `InstrumentBacktestProfile` wrappers preserving domain models.
+- **Milestone 3B.2 (Foundational Deterministic Event Infrastructure — Completed)**:
+  - `SimulationClock`: Strictly monotonic, deterministic UTC simulation clock prohibiting backward time movement and independent of machine wall clock.
+  - `EventQueue`: Deterministic priority queue ordered by `(timestamp, priority, sequence_id)` with stable FIFO tie-breaking and non-retroactive dispatch constraints.
+  - Backtesting Event DTOs: `MarketBarClosedEvent`, `MarketBarOpenedEvent`, `OrderSubmittedEvent`, `OrderPartiallyFilledEvent`, `OrderFilledEvent`, `OrderCancelledEvent`, `PositionUpdatedEvent`, `PortfolioMarkedEvent`, `BacktestCompletedEvent`.
+  - Critical zero-latency boundary ordering verification and non-retroactive fill protection.
+- **Milestone 3B.3 to 3B.6 (Upcoming)**:
+  - 3B.3: Multi-Currency CashBook, Timestamped FX Converter, Position Tracker, and Accounting Ledger.
+  - 3B.4: Microstructure Cost & Liquidity Models, FillEngine, and OrderManager.
+  - 3B.5: Pre-Trade Risk Engine Wiring and BacktestEngine Coordinator.
+  - 3B.6: Performance Analytics Engine, Report Generator, and Mutation Verification Suite.
 
 ### Milestone 4: Baseline Rule-Based Strategies & Performance Benchmarking
 - Implementation of transparent, classical quantitative strategies:
