@@ -98,6 +98,119 @@ class TestStorageAndAnalytics(unittest.TestCase):
         self.assertEqual(stats["bar_count"].iloc[0], 10)
         self.assertEqual(stats["lowest_price"].iloc[0], 95.0)
 
+    def test_provenance_preservation_across_all_source_types(self) -> None:
+        """Proves that simulated data remains simulated, original timestamps and metadata are preserved."""
+        retrieval_timestamp = datetime(2025, 6, 15, 14, 30, 0, tzinfo=UTC)
+        prov = DataProvenance(
+            source_name="sim_engine",
+            source_type=DataSourceType.SIMULATED,
+            retrieved_at=retrieval_timestamp,
+            is_synthetic=True,
+            metadata={"seed": 42, "generator": "gbm"},
+        )
+        bar = Bar(
+            symbol="BTCUSD",
+            start_time=self.base_time,
+            end_time=self.base_time + timedelta(days=1),
+            open=50000.0,
+            high=51000.0,
+            low=49000.0,
+            close=50500.0,
+            volume=10.0,
+            timeframe=Timeframe.D1,
+            is_synthetic=True,
+            provenance=prov,
+        )
+
+        file_path = self.storage.write_bars([bar], source_name="sim_engine")
+        self.assertTrue(file_path.exists())
+
+        # Read back and inspect provenance
+        loaded_bars = self.storage.read_bars("BTCUSD", Timeframe.D1, source_name="sim_engine")
+        self.assertEqual(len(loaded_bars), 1)
+        loaded = loaded_bars[0]
+
+        self.assertTrue(loaded.is_synthetic)
+        self.assertIsNotNone(loaded.provenance)
+        assert loaded.provenance is not None
+
+        # Provenance source_type must remain strictly SIMULATED, NOT HISTORICAL
+        self.assertEqual(loaded.provenance.source_type, DataSourceType.SIMULATED)
+        self.assertEqual(loaded.provenance.source_name, "sim_engine")
+        self.assertEqual(loaded.provenance.retrieved_at, retrieval_timestamp)
+        self.assertEqual(loaded.provenance.metadata.get("seed"), 42)
+        self.assertEqual(loaded.provenance.metadata.get("generator"), "gbm")
+
+    def test_mixed_symbol_write_rejected(self) -> None:
+        """Proves that attempting to write bars of different symbols in one batch raises ValueError."""
+        bar1 = Bar(
+            symbol="AAPL",
+            start_time=self.base_time,
+            end_time=self.base_time + timedelta(days=1),
+            open=150.0,
+            high=155.0,
+            low=149.0,
+            close=152.0,
+            volume=100.0,
+            timeframe=Timeframe.D1,
+        )
+        bar2 = Bar(
+            symbol="MSFT",
+            start_time=self.base_time,
+            end_time=self.base_time + timedelta(days=1),
+            open=300.0,
+            high=305.0,
+            low=298.0,
+            close=302.0,
+            volume=100.0,
+            timeframe=Timeframe.D1,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self.storage.write_bars([bar1, bar2], source_name="test_source")
+        self.assertIn("Mixed-symbol batch rejected", str(ctx.exception))
+
+    def test_mixed_timeframe_write_rejected(self) -> None:
+        """Proves that attempting to write bars of different timeframes in one batch raises ValueError."""
+        bar1 = Bar(
+            symbol="AAPL",
+            start_time=self.base_time,
+            end_time=self.base_time + timedelta(days=1),
+            open=150.0,
+            high=155.0,
+            low=149.0,
+            close=152.0,
+            volume=100.0,
+            timeframe=Timeframe.D1,
+        )
+        bar2 = Bar(
+            symbol="AAPL",
+            start_time=self.base_time,
+            end_time=self.base_time + timedelta(hours=1),
+            open=150.0,
+            high=151.0,
+            low=149.5,
+            close=150.5,
+            volume=100.0,
+            timeframe=Timeframe.H1,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self.storage.write_bars([bar1, bar2], source_name="test_source")
+        self.assertIn("Mixed-timeframe batch rejected", str(ctx.exception))
+
+    def test_duckdb_path_with_spaces_and_quotes_handled_safely(self) -> None:
+        """Proves that file paths with spaces are queried safely without SQL syntax errors."""
+        special_dir = tempfile.mkdtemp(prefix="market data space ")
+        try:
+            special_storage = ParquetStorageEngine(base_dir=special_dir)
+            bars = create_bars_sequence("GOOG", 3, self.base_time)
+            file_path = special_storage.write_bars(bars, source_name="test_source")
+
+            df = self.analytics.query_bars_from_parquet(file_path)
+            self.assertEqual(len(df), 3)
+            self.assertEqual(df["symbol"].iloc[0], "GOOG")
+        finally:
+            shutil.rmtree(special_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

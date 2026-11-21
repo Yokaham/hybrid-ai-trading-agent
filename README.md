@@ -71,7 +71,7 @@ provider = MockHistoricalDataProvider(seed=42)
 storage = ParquetStorageEngine(base_dir="data/market_data")
 pipeline = HistoricalDataPipeline(provider=provider, storage=storage)
 
-result = pipeline.ingest_symbol(
+result = pipeline.ingest(
     symbol="EURUSD",
     timeframe=Timeframe.H1,
     start=datetime(2025, 1, 1, tzinfo=timezone.utc),
@@ -80,11 +80,8 @@ result = pipeline.ingest_symbol(
 print(f"Ingested {result.bars_stored} bars to {result.storage_path}")
 
 # 2. Query stored Parquet partitions directly via DuckDB
-duckdb_engine = DuckDBAnalyticalEngine(storage_engine=storage)
-df = duckdb_engine.query(
-    "SELECT date_trunc('day', start_time) as day, avg(close) as avg_close "
-    "FROM bars WHERE symbol = 'EURUSD' GROUP BY 1 ORDER BY 1"
-)
+duckdb_engine = DuckDBAnalyticalEngine()
+df = duckdb_engine.query_bars_from_parquet(result.storage_path)
 
 # 3. Calculate technical indicators with dual batch/streaming consistency
 feature_pipeline = FeaturePipeline()

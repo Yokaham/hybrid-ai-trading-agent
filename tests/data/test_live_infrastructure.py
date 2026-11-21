@@ -7,6 +7,7 @@ from hybrid_agent.core.models import (
     DataSourceType,
     Tick,
     Timeframe,
+    VolumeType,
 )
 from hybrid_agent.data.live import (
     ConnectionState,
@@ -123,6 +124,39 @@ class TestLiveInfrastructure(unittest.TestCase):
         self.assertAlmostEqual(bar.high, 1.0861)  # Mid price of tick2
         self.assertAlmostEqual(bar.low, 1.0841)  # Mid price of tick3
         self.assertAlmostEqual(bar.close, 1.0841)  # Mid price of tick3
+        # Volume must NOT average quote sizes; must be marked unavailable
+        self.assertEqual(bar.volume, 0.0)
+        self.assertEqual(bar.volume_type, VolumeType.UNAVAILABLE)
+
+    def test_tick_deduplicator_same_timestamp_different_quote_accepted(self) -> None:
+        """Proves that multiple legitimate quote updates sharing the same timestamp are accepted."""
+        dedup = TickDeduplicator()
+        t0 = self.base_time
+
+        tick1 = Tick(symbol="EURUSD", timestamp=t0, bid=1.0850, ask=1.0852)
+        tick2 = Tick(
+            symbol="EURUSD", timestamp=t0, bid=1.0851, ask=1.0853
+        )  # Same ms, price changed
+        tick1_dup = Tick(symbol="EURUSD", timestamp=t0, bid=1.0850, ask=1.0852)  # Exact duplicate
+
+        self.assertTrue(dedup.is_valid_sequence(tick1))
+        self.assertTrue(
+            dedup.is_valid_sequence(tick2)
+        )  # Distinct quote at same timestamp accepted!
+        self.assertFalse(dedup.is_valid_sequence(tick1_dup))  # Exact duplicate rejected
+
+    def test_tick_deduplicator_bounded_cache(self) -> None:
+        """Proves that the deduplication cache evicts oldest entries and does not grow unbounded."""
+        dedup = TickDeduplicator(max_cache_size=100)
+        for i in range(150):
+            t = self.base_time + timedelta(milliseconds=i)
+            tick = Tick(
+                symbol="EURUSD", timestamp=t, bid=1.0850 + (i * 0.0001), ask=1.0852 + (i * 0.0001)
+            )
+            self.assertTrue(dedup.is_valid_sequence(tick))
+
+        self.assertLessEqual(len(dedup._seen_fingerprints), 100)
+        self.assertLessEqual(len(dedup._fingerprint_order), 100)
 
 
 if __name__ == "__main__":

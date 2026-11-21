@@ -115,12 +115,21 @@ class DataSourceType(str, Enum):
     SIMULATED = "SIMULATED"
 
 
+class VolumeType(str, Enum):
+    """Classification of volume telemetry semantics."""
+
+    REAL_TRADED = "REAL_TRADED"
+    TICK_COUNT = "TICK_COUNT"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class DataProvenance(BaseModel, frozen=True):
     """Metadata detailing data origin, provider, and ingestion audit trail."""
 
     source_name: str
     source_type: DataSourceType
     retrieved_at: datetime
+    is_synthetic: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("retrieved_at")
@@ -190,6 +199,7 @@ class Bar(BaseModel, frozen=True):
     low: float = Field(gt=0.0)
     close: float = Field(gt=0.0)
     volume: float = Field(ge=0.0)
+    volume_type: VolumeType = Field(default=VolumeType.REAL_TRADED)
     timeframe: Timeframe = Field(default=Timeframe.D1)
     is_synthetic: bool = Field(default=False)
     provenance: DataProvenance | None = Field(default=None)

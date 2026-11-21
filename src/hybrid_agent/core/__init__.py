@@ -21,6 +21,7 @@ from hybrid_agent.core.models import (
     Quote,
     Tick,
     Timeframe,
+    VolumeType,
     validate_utc_timestamp,
 )
 
@@ -43,5 +44,6 @@ __all__ = [
     "Timeframe",
     "UnsupportedValuationModelError",
     "ValuationModel",
+    "VolumeType",
     "validate_utc_timestamp",
 ]

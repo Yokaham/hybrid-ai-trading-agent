@@ -1,36 +1,44 @@
 # Development Status & Technical Review Log
 
-## 1. Current State: Milestone 2 Complete (Market Data Infrastructure & Feature Engineering)
+## 1. Current State: Milestone 2A Corrections Complete (Market Data Infrastructure & Feature Engineering)
 
-### Milestone 2 Completed Deliverables
-- **Abstract Market Data Interfaces (`src/hybrid_agent/data/base.py`)**:
-  - Implemented `MarketDataProvider`, `HistoricalMarketDataProvider`, and `LiveMarketDataProvider` interfaces.
-  - Decoupled data ingestion from broker/exchange dependencies.
-- **Normalized Telemetry & Provenance Models (`src/hybrid_agent/core/models.py`)**:
-  - Added `Timeframe` enum (M1, M5, M15, H1, D1, W1) with seconds, timedelta, pandas frequency, and string parser.
-  - Added `DataSourceType` and `DataProvenance` tracking provider origin, acquisition timestamp, and synthetic status.
-  - Added `Quote` model with $bid \le ask$ validation.
-  - Extended `Tick` and `Bar` models with provenance, timeframe, and synthetic flags.
-- **Data Quality & Ingestion Pipeline (`src/hybrid_agent/data/quality.py`, `pipeline.py`)**:
-  - Built `DataQualityValidator` validating strict monotonic timestamps, duplicate detection, gap detection, OHLC geometric boundaries, non-negative volume, and positive prices.
-  - Built `HistoricalDataPipeline` orchestrating retrieval, validation, gap logging, and storage persistence.
-- **Partitioned Parquet Storage & DuckDB Analytics (`src/hybrid_agent/data/storage.py`)**:
-  - Built `ParquetStorageEngine` storing bars in `data/market_data/{source}/{symbol}/{timeframe}/bars.parquet`.
-  - Guaranteed idempotent upserts: merges with existing records, deduplicates on `start_time` (keeping latest), and sorts chronologically.
-  - Integrated `DuckDBAnalyticalEngine` querying Parquet partitions directly via SQL with zero-copy efficiency.
-- **Providers (`src/hybrid_agent/data/providers/`)**:
-  - `MockHistoricalDataProvider` and `MockLiveMarketDataProvider`: Offline, deterministic Geometric Brownian Motion for 100% reproducible tests.
-  - `YahooFinanceHistoricalProvider`: Real-world adapter with symbol translation, timeframe mapping, and rate-limiting resilience.
-- **Live Market Telemetry Infrastructure (`src/hybrid_agent/data/live.py`, `feed.py`)**:
-  - `TickDeduplicator`: LRU-cached sliding window filtering identical tick sequences.
-  - `LiveFreshnessTracker`: Real-time monitoring of quote latency and staleness threshold breaches.
-  - `LiveCandleAggregator`: Rolling tick-to-bar rollup with explicit candle closure events.
-  - `MarketDataFeed`: Downstream ring buffer decoupling historical backfills from live tick processing.
-- **Feature Engineering Pipeline (`src/hybrid_agent/features/`)**:
-  - Pure vectorised indicators: SMA, EMA, ADX (+DI/-DI), RSI, MACD (Signal/Hist), ROC, ATR, Bollinger Bands (%B, Bandwidth), Historical Volatility, Volume SMA, RVOL.
-  - `FeatureRegistry`: Extensible metadata registry cataloguing indicator warmups, inputs, and descriptions.
-  - `FeaturePipeline`: Dual batch (`transform`) and incremental (`transform_incremental`) execution with exact mathematical parity.
-  - Proven zero lookahead bias verified through future-mutation unit tests.
+### Milestone 2A Corrections Delivered
+- **Fail-Closed Historical Ingestion Pipeline (`src/hybrid_agent/data/pipeline.py`, `quality.py`)**:
+  - Implemented mandatory pre-storage validation. Datasets with hard integrity violations are strictly rejected (`report.is_valid is False`) and NEVER written to persistent storage (`bars_stored = 0`).
+  - Added strict instrument symbol, timeframe, and date-range compliance checks (`expected_symbol`, `expected_timeframe`, `expected_start`, `expected_end`).
+  - Distinguishes between hard integrity violations (non-positive prices, $H < L$, negative volume, duplicates, out-of-order bars) and suspected gaps (weekends, exchange holidays). Missing calendar intervals are logged as suspected gaps without falsely rejecting valid datasets.
+  - Handled empty provider responses explicitly (`is_empty=True`, `success=False`, `bars_stored=0`), distinguishing zero-data periods from ordinary successful ingestion.
+  - Returned detailed diagnostics in `IngestionResult.diagnostics`.
+- **Yahoo Finance Adapter Corrections (`src/hybrid_agent/data/providers/yahoo.py`)**:
+  - Preserved exact requested start and end boundaries with intraday and daily/weekly interval filtering.
+  - Documented Yahoo Finance exclusive end date semantics for daily/weekly intervals.
+  - Preserved original provider OHLCV values without inventing, clamping, or manufacturing prices or volumes. Corrupt rows (non-positive prices, negative volumes, High < Low) are rejected with diagnostic warnings rather than altered.
+  - Propagated provider errors through `ProviderConnectionError`, distinguishing network/connectivity failures from genuine empty market closures.
+  - Documented operational limitations (exploratory research designation, rate limits, 7/60 day intraday retention).
+- **Data Provenance Preservation & Storage Safety (`src/hybrid_agent/core/models.py`, `src/hybrid_agent/data/storage.py`)**:
+  - Parquet storage engine now stores and restores full provenance metadata under `schema_version = 2` (`source`, `source_type`, `retrieved_at`, `is_synthetic`, `provenance_metadata`, `volume_type`).
+  - Guarantees that simulated data remains `SIMULATED`, historical data remains `HISTORICAL`, and original retrieval timestamps are preserved without modification.
+  - Enforced batch homogeneity validation in `ParquetStorageEngine.write_bars`: strictly rejects mixed-symbol and mixed-timeframe batches with `ValueError`.
+  - Implemented atomic writes: writes to a temporary file (`bars_{uuid}.tmp`) and atomically replaces it via `os.replace`.
+  - Ensured DuckDB analytical engine safely handles file paths with spaces and special characters.
+- **Tick Deduplication & Temporal Ordering Separation (`src/hybrid_agent/data/live.py`)**:
+  - Separated duplicate detection from temporal ordering. Deduplication uses an event fingerprint `(symbol, timestamp, bid, ask, bid_volume, ask_volume)` stored in a bounded LRU cache (default 10,000 entries).
+  - Preserves legitimate quote updates sharing identical timestamps (e.g. quote movements within the same millisecond) while rejecting exact duplicates and out-of-order ticks.
+- **Quote Size vs Traded Volume Distinction (`src/hybrid_agent/core/models.py`, `src/hybrid_agent/data/live.py`, `features/`)**:
+  - Added `VolumeType` enum (`REAL_TRADED`, `TICK_COUNT`, `UNAVAILABLE`) to `Bar`.
+  - Documented that quote bid/ask quantities represent displayed depth sizes, not executed trading volume.
+  - In `LiveCandleAggregator`, candle prices are derived from the bid-ask midpoint (`(bid + ask) / 2.0`). Quote sizes are never averaged or substituted for executed volume; live candles created from quotes are explicitly marked with `volume = 0.0` and `volume_type = VolumeType.UNAVAILABLE`.
+  - Volume-dependent features (RVOL, Volume SMA) return `NaN` when volume is marked `UNAVAILABLE` or is all zeros, preventing unavailable volume from being misinterpreted as zero-volume market activity.
+- **Unified Market Data Feed Concurrency & Ordering (`src/hybrid_agent/data/feed.py`)**:
+  - Buffers are strictly partitioned by both `(symbol, timeframe)`.
+  - Implemented thread-safe read/write operations using an internal `RLock`.
+  - Out-of-order bars are placed into sorted chronological sequence using binary search (`bisect`), duplicate timestamps are revised in-place, and buffer lengths are strictly bounded by `max_buffer_size`.
+- **Stateful Incremental Feature Engine & Registry Consistency (`src/hybrid_agent/features/`)**:
+  - Built `StatefulIncrementalFeatureEngine` maintaining running rolling deques and recursive indicator smoothing states in memory. Updates newly completed bars in $O(1)$ time per bar without recalculating full historical DataFrames.
+  - Added `rebuild()` to safely reconstruct state when historical bars are revised.
+  - Established 100% catalog coverage in `FeatureRegistry` for all calculated columns (including `SMA_50`).
+  - Added mathematical degenerate handling: flat price series (RSI = 50.0, BB width = 0.0, %B = 0.5, ADX = 0.0, ROC = 0.0, ATR = 0.0, HV = 0.0).
+  - Configurable HV annualization supporting `annualization_factor` (Equities = 252.0, Forex = 260.0, Crypto = 365.0, unannualized = None).
 
 ---
 
@@ -62,20 +70,36 @@ platform win32 -- Python 3.12.6, pytest-9.2.0, pluggy-1.7.0
 rootdir: D:\Trade\hybrid-ai-trading-agent
 configfile: pyproject.toml
 testpaths: tests
-collected 72 items
+collected 100 items
 
 tests/data/test_data_validation.py (6 passed)
-tests/data/test_ingestion_pipeline.py (3 passed)
-tests/data/test_live_infrastructure.py (4 passed)
-tests/data/test_storage.py (4 passed)
-tests/features/test_feature_pipeline.py (4 passed)
-tests/features/test_indicators.py (11 passed)
+tests/data/test_feed.py (5 passed)
+tests/data/test_ingestion_pipeline.py (8 passed)
+tests/data/test_live_infrastructure.py (6 passed)
+tests/data/test_storage.py (8 passed)
+tests/data/test_yahoo_adapter.py (5 passed)
+tests/features/test_feature_pipeline.py (8 passed)
+tests/features/test_indicators.py (14 passed)
 tests/test_config.py (3 passed)
 tests/test_core_models.py (20 passed)
 tests/test_risk_policy.py (17 passed)
 
-============================= 72 passed in 1.91s ==============================
+============================ 100 passed in 2.32s ============================
 ```
+
+### Static Analysis & Linter Verification
+- `ruff check .`: All checks passed! 0 warnings, 0 errors.
+- `ruff format --check .`: 49 files already formatted.
+- `mypy src`: Success: no issues found in 27 source files.
+
+---
+
+## 4. Current Scope Boundaries & Deferred Items
+
+- **NO Trading Strategies**: No strategy signals or alphas are implemented.
+- **NO ML Model Training / Inference**: No LightGBM or scikit-learn models are trained.
+- **NO Backtesting Engine**: Backtesting event bus and friction modeling deferred to Milestone 5.
+- **NO Live Execution**: Real-money and automated broker routing remain strictly prohibited.
 
 ### Static Analysis & Linter Verification
 - `ruff check .`: All checks passed! 0 warnings, 0 errors.

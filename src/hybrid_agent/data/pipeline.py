@@ -1,9 +1,10 @@
 """Historical market data ingestion pipeline with validation and idempotent storage."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from hybrid_agent.core.models import Timeframe, validate_utc_timestamp
 from hybrid_agent.data.base import HistoricalMarketDataProvider
@@ -24,7 +25,9 @@ class IngestionResult:
     missing_intervals: list[tuple[datetime, datetime]]
     storage_path: Path | None
     success: bool
+    is_empty: bool = False
     error_message: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class HistoricalDataPipeline:
@@ -49,14 +52,17 @@ class HistoricalDataPipeline:
         source_name: str | None = None,
     ) -> IngestionResult:
         """
-        Executes idempotent data ingestion for an instrument and timeframe:
+        Executes fail-closed idempotent data ingestion for an instrument and timeframe:
         1. Queries the historical data provider.
-        2. Validates domain constraints (OHLC bounds, monotonic timestamps).
-        3. Identifies missing interval gaps.
-        4. Writes deduplicated bars to partitioned Parquet storage.
+        2. Validates domain constraints (OHLC bounds, monotonic timestamps, symbol, timeframe, date range).
+        3. Identifies missing interval gaps without falsely rejecting market closures.
+        4. Rejects datasets failing validation and refuses to persist corrupt records.
+        5. Writes deduplicated bars to partitioned Parquet storage if and only if valid.
         """
         start_utc = validate_utc_timestamp(start)
         end_utc = validate_utc_timestamp(end)
+        if end_utc <= start_utc:
+            raise ValueError(f"end ({end_utc}) must be later than start ({start_utc})")
         source = source_name or self.provider.name
 
         try:
@@ -76,10 +82,15 @@ class HistoricalDataPipeline:
                 missing_intervals=[],
                 storage_path=None,
                 success=False,
-                error_message=str(exc),
+                is_empty=False,
+                error_message=f"Provider retrieval failure: {exc}",
+                diagnostics={"exception": str(exc)},
             )
 
         if not raw_bars:
+            logger.warning(
+                "Provider returned empty bar dataset for %s (%s to %s)", symbol, start_utc, end_utc
+            )
             return IngestionResult(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -87,15 +98,44 @@ class HistoricalDataPipeline:
                 bars_stored=0,
                 missing_intervals=[(start_utc, end_utc)],
                 storage_path=None,
-                success=True,
-                error_message="No bars returned from provider for given window.",
+                success=False,
+                is_empty=True,
+                error_message="Empty provider response: no data returned for requested window.",
+                diagnostics={"reason": "empty_provider_response"},
             )
 
         # Quality validation & gap inspection
         report: DataQualityReport = self.validator.validate_bars(
             bars=raw_bars,
             expected_timeframe=timeframe,
+            expected_symbol=symbol,
+            expected_start=start_utc,
+            expected_end=end_utc,
         )
+
+        if not report.is_valid:
+            logger.error(
+                "Data quality validation failed for %s: %d violations, %d duplicates. Dataset rejected.",
+                symbol,
+                len(report.violations),
+                report.duplicate_count,
+            )
+            return IngestionResult(
+                symbol=symbol,
+                timeframe=timeframe,
+                bars_retrieved=len(raw_bars),
+                bars_stored=0,
+                missing_intervals=report.missing_intervals,
+                storage_path=None,
+                success=False,
+                is_empty=False,
+                error_message=f"Data quality validation failed: {'; '.join(report.violations)}",
+                diagnostics={
+                    "violations": report.violations,
+                    "duplicate_count": report.duplicate_count,
+                    "suspected_gaps": report.suspected_gaps,
+                },
+            )
 
         # Persist valid bars into partitioned Parquet storage
         try:
@@ -110,7 +150,9 @@ class HistoricalDataPipeline:
                 missing_intervals=report.missing_intervals,
                 storage_path=None,
                 success=False,
+                is_empty=False,
                 error_message=f"Storage write failed: {exc}",
+                diagnostics={"exception": str(exc)},
             )
 
         return IngestionResult(
@@ -121,5 +163,10 @@ class HistoricalDataPipeline:
             missing_intervals=report.missing_intervals,
             storage_path=saved_path,
             success=True,
+            is_empty=False,
             error_message=None,
+            diagnostics={
+                "suspected_gaps": report.suspected_gaps,
+                "warnings": report.warnings,
+            },
         )

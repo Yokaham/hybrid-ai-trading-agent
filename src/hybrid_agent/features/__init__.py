@@ -13,7 +13,7 @@ from hybrid_agent.features.indicators import (
     compute_sma,
     compute_volume_sma,
 )
-from hybrid_agent.features.pipeline import FeaturePipeline
+from hybrid_agent.features.pipeline import FeaturePipeline, StatefulIncrementalFeatureEngine
 from hybrid_agent.features.registry import (
     FeatureMetadata,
     FeatureRegistry,
@@ -24,6 +24,7 @@ __all__ = [
     "FeatureMetadata",
     "FeaturePipeline",
     "FeatureRegistry",
+    "StatefulIncrementalFeatureEngine",
     "compute_adx",
     "compute_atr",
     "compute_bollinger_bands",

@@ -16,6 +16,7 @@ from hybrid_agent.features.indicators import (
     compute_roc,
     compute_rsi,
     compute_sma,
+    compute_volume_sma,
 )
 
 
@@ -100,6 +101,70 @@ class TestIndicators(unittest.TestCase):
             compute_sma(self.close, period=0)
         with self.assertRaises(ValueError):
             compute_macd(self.close, fast=26, slow=12)  # fast >= slow
+
+    def test_flat_price_series_edge_cases(self) -> None:
+        """Proves that degenerate flat price series are handled gracefully without division-by-zero errors."""
+        n = 50
+        flat_close = pd.Series([100.0] * n)
+        flat_high = pd.Series([100.0] * n)
+        flat_low = pd.Series([100.0] * n)
+
+        # RSI on flat series must be 50.0 (neutral) after warmup
+        rsi = compute_rsi(flat_close, period=14)
+        self.assertTrue((rsi.dropna() == 50.0).all())
+
+        # Bollinger Bands on flat series: std=0, width=0, pct_b=0.5, bandwidth=0
+        upper, middle, lower, pct_b, bandwidth = compute_bollinger_bands(flat_close, period=20)
+        self.assertTrue((middle.dropna() == 100.0).all())
+        self.assertTrue((upper.dropna() == 100.0).all())
+        self.assertTrue((lower.dropna() == 100.0).all())
+        self.assertTrue((pct_b.dropna() == 0.5).all())
+        self.assertTrue((bandwidth.dropna() == 0.0).all())
+
+        # ADX on flat series: TR=0 -> ADX=0
+        adx, plus_di, minus_di = compute_adx(flat_high, flat_low, flat_close, period=14)
+        self.assertTrue((adx.dropna() == 0.0).all())
+        self.assertTrue((plus_di.dropna() == 0.0).all())
+        self.assertTrue((minus_di.dropna() == 0.0).all())
+
+        # ROC on flat series: 0.0
+        roc = compute_roc(flat_close, period=12)
+        self.assertTrue((roc.dropna() == 0.0).all())
+
+        # ATR on flat series: 0.0
+        atr = compute_atr(flat_high, flat_low, flat_close, period=14)
+        self.assertTrue((atr.dropna() == 0.0).all())
+
+        # HV on flat series: 0.0
+        hv = compute_historical_volatility(flat_close, period=20, annualization_factor=252.0)
+        self.assertTrue((hv.dropna() == 0.0).all())
+
+    def test_zero_and_unavailable_volume(self) -> None:
+        """Proves that unavailable or all-zero volume series produce NaN instead of fake zero-volume activity."""
+        n = 50
+        zero_vol = pd.Series([0.0] * n)
+        vol_sma = compute_volume_sma(zero_vol, period=20)
+        self.assertTrue(vol_sma.isna().all())
+
+        rvol = compute_relative_volume(zero_vol, period=20)
+        self.assertTrue(rvol.isna().all())
+
+    def test_configurable_historical_volatility_annualization(self) -> None:
+        """Proves that HV annualization factors (252, 260, 365, None) scale correctly."""
+        hv_equities = compute_historical_volatility(
+            self.close, period=20, annualization_factor=252.0
+        )
+        hv_forex = compute_historical_volatility(self.close, period=20, annualization_factor=260.0)
+        hv_crypto = compute_historical_volatility(self.close, period=20, annualization_factor=365.0)
+        hv_unannualized = compute_historical_volatility(
+            self.close, period=20, annualization_factor=None
+        )
+
+        # Forex factor (260) > Equities factor (252) > Unannualized
+        valid_idx = hv_equities.dropna().index
+        self.assertTrue((hv_forex.loc[valid_idx] > hv_equities.loc[valid_idx]).all())
+        self.assertTrue((hv_crypto.loc[valid_idx] > hv_forex.loc[valid_idx]).all())
+        self.assertTrue((hv_equities.loc[valid_idx] > hv_unannualized.loc[valid_idx]).all())
 
 
 if __name__ == "__main__":

@@ -6,6 +6,18 @@ from datetime import datetime
 from hybrid_agent.core.models import Bar, Quote, Tick, Timeframe
 
 
+class ProviderError(Exception):
+    """Base exception for market data provider errors."""
+
+
+class ProviderConnectionError(ProviderError):
+    """Network, connection, or remote service failure when communicating with provider."""
+
+
+class ProviderRateLimitError(ProviderError):
+    """Rate limit or request quota exceeded on provider API."""
+
+
 class MarketDataProvider(ABC):
     """Abstract base class for all market data providers."""
 

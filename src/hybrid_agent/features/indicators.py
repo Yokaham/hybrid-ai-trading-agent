@@ -66,14 +66,14 @@ def compute_adx(
     plus_dm_smooth = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     minus_dm_smooth = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
-    plus_di = 100.0 * (plus_dm_smooth / tr_smooth.replace(0, np.nan))
-    minus_di = 100.0 * (minus_dm_smooth / tr_smooth.replace(0, np.nan))
+    plus_di = 100.0 * (plus_dm_smooth / tr_smooth.replace(0, np.nan)).fillna(0.0)
+    minus_di = 100.0 * (minus_dm_smooth / tr_smooth.replace(0, np.nan)).fillna(0.0)
 
     di_sum = plus_di + minus_di
     di_diff = (plus_di - minus_di).abs()
-    dx = 100.0 * (di_diff / di_sum.replace(0, np.nan))
+    dx = (100.0 * (di_diff / di_sum.replace(0, np.nan))).fillna(0.0)
 
-    adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().fillna(0.0)
 
     return adx, plus_di, minus_di
 
@@ -96,12 +96,15 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
+    both_zero = (avg_gain == 0.0) & (avg_loss == 0.0)
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
 
     # Boundary cleanups where loss is 0 (RSI=100) or gain is 0 (RSI=0)
     rsi = rsi.where(avg_loss != 0, 100.0)
     rsi = rsi.where(avg_gain != 0, 0.0)
+    # When both gain and loss are zero (flat price series), RSI is 50.0 (neutral)
+    rsi = rsi.where(~both_zero, 50.0)
 
     # Re-apply NaN for initial warm-up period
     rsi.iloc[:period] = np.nan
@@ -188,8 +191,8 @@ def compute_bollinger_bands(
     lower = middle - (num_std * std)
 
     width = upper - lower
-    percent_b = (close - lower) / width.replace(0, np.nan)
-    bandwidth = width / middle.replace(0, np.nan)
+    percent_b = ((close - lower) / width.replace(0, np.nan)).fillna(0.5)
+    bandwidth = (width / middle.replace(0, np.nan)).fillna(0.0)
 
     return upper, middle, lower, percent_b, bandwidth
 
@@ -197,14 +200,36 @@ def compute_bollinger_bands(
 def compute_historical_volatility(
     close: pd.Series,
     period: int = 20,
-    trading_periods: int = 252,
+    annualization_factor: float | None = 252.0,
+    trading_periods: float | None = None,
 ) -> pd.Series:
-    """Computes annualized Historical Volatility based on log returns."""
+    """
+    Computes Historical Volatility based on log returns.
+
+    Annualization Conventions:
+    - Equities (252 trading days): annualization_factor = 252.0
+    - Forex (260 trading days): annualization_factor = 260.0
+    - Crypto (365 trading days): annualization_factor = 365.0
+    - Unannualized: annualization_factor = None or 0.0
+
+    Note: `trading_periods` is supported as a backward-compatible alias for `annualization_factor`.
+    """
     if period <= 1:
         raise ValueError(f"period must be greater than 1, got {period}")
-    log_returns = np.log(close / close.shift(1))
+
+    factor = trading_periods if trading_periods is not None else annualization_factor
+    if factor is not None and factor < 0:
+        raise ValueError(f"annualization_factor must be non-negative, got {factor}")
+
+    shifted = close.shift(1)
+    ratio = close / shifted.replace(0, np.nan)
+    ratio = ratio.where(ratio > 0, np.nan)
+    log_returns = np.log(ratio).fillna(0.0)
+
     rolling_std = log_returns.rolling(window=period, min_periods=period).std()
-    return rolling_std * np.sqrt(trading_periods)
+    if factor is None or factor == 0.0:
+        return rolling_std
+    return rolling_std * np.sqrt(factor)
 
 
 # ==========================================
@@ -213,13 +238,17 @@ def compute_historical_volatility(
 
 
 def compute_volume_sma(volume: pd.Series, period: int = 20) -> pd.Series:
-    """Computes Volume Simple Moving Average."""
+    """Computes Volume Simple Moving Average. Returns NaN series if volume is all zero or unavailable."""
     if period <= 0:
         raise ValueError(f"period must be strictly positive, got {period}")
+    if (volume == 0.0).all():
+        return pd.Series(np.nan, index=volume.index)
     return volume.rolling(window=period, min_periods=period).mean()
 
 
 def compute_relative_volume(volume: pd.Series, period: int = 20) -> pd.Series:
-    """Computes Relative Volume (Current Volume / Rolling Volume SMA)."""
+    """Computes Relative Volume (Current Volume / Rolling Volume SMA). Returns NaN series if volume is unavailable."""
     vol_sma = compute_volume_sma(volume, period)
+    if vol_sma.isna().all():
+        return pd.Series(np.nan, index=volume.index)
     return volume / vol_sma.replace(0, np.nan)

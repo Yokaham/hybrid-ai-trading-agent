@@ -1,9 +1,11 @@
 """Live market data infrastructure, streaming aggregator, and connection lifecycle."""
 
+import collections
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from hybrid_agent.core.models import (
     Bar,
@@ -12,6 +14,7 @@ from hybrid_agent.core.models import (
     Quote,
     Tick,
     Timeframe,
+    VolumeType,
     validate_utc_timestamp,
 )
 from hybrid_agent.data.base import LiveMarketDataProvider
@@ -60,24 +63,92 @@ class LiveFreshnessTracker:
 
 
 class TickDeduplicator:
-    """Filters duplicate or out-of-order streaming tick events."""
+    """
+    Filters duplicate streaming tick events while preserving legitimate market updates.
+    Explicitly separates duplicate event detection (via event fingerprint) from temporal ordering.
+    Maintains a bounded cache of seen event fingerprints.
+    """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_cache_size: int = 10000,
+        max_out_of_order_tolerance_seconds: float = 0.0,
+    ) -> None:
+        self.max_cache_size = max_cache_size
+        self.max_out_of_order_tolerance_seconds = max_out_of_order_tolerance_seconds
+        self._seen_fingerprints: set[tuple[Any, ...]] = set()
+        self._fingerprint_order: collections.deque[tuple[Any, ...]] = collections.deque()
         self._last_timestamps: dict[str, datetime] = {}
 
-    def is_valid_sequence(self, tick: Tick) -> bool:
-        """Returns True if the tick is strictly later than the last processed tick for the symbol."""
-        last_ts = self._last_timestamps.get(tick.symbol)
-        if last_ts is not None and tick.timestamp <= last_ts:
+    def is_duplicate(self, tick: Tick) -> bool:
+        """Checks whether this exact tick event has already been processed."""
+        fp = (
+            tick.symbol.upper(),
+            tick.timestamp,
+            tick.bid,
+            tick.ask,
+            tick.bid_volume,
+            tick.ask_volume,
+        )
+        return fp in self._seen_fingerprints
+
+    def is_out_of_order(self, tick: Tick) -> bool:
+        """Checks whether this tick arrived strictly earlier than the last recorded timestamp beyond tolerance."""
+        last_ts = self._last_timestamps.get(tick.symbol.upper())
+        if last_ts is None:
             return False
-        self._last_timestamps[tick.symbol] = tick.timestamp
+        delta = (last_ts - tick.timestamp).total_seconds()
+        return delta > self.max_out_of_order_tolerance_seconds
+
+    def is_valid_sequence(self, tick: Tick) -> bool:
+        """
+        Evaluates incoming tick:
+        - Returns False if this is an exact duplicate event.
+        - Returns False if this tick is out-of-order beyond allowed tolerance.
+        - Returns True if this is a legitimate update (including distinct updates sharing identical timestamps).
+        """
+        sym = tick.symbol.upper()
+        fp = (
+            sym,
+            tick.timestamp,
+            tick.bid,
+            tick.ask,
+            tick.bid_volume,
+            tick.ask_volume,
+        )
+
+        if fp in self._seen_fingerprints:
+            return False
+
+        if self.is_out_of_order(tick):
+            return False
+
+        # Register into bounded cache
+        self._seen_fingerprints.add(fp)
+        self._fingerprint_order.append(fp)
+        if len(self._fingerprint_order) > self.max_cache_size:
+            oldest = self._fingerprint_order.popleft()
+            self._seen_fingerprints.discard(oldest)
+
+        # Update last timestamp
+        last_ts = self._last_timestamps.get(sym)
+        if last_ts is None or tick.timestamp > last_ts:
+            self._last_timestamps[sym] = tick.timestamp
+
         return True
 
 
 class LiveCandleAggregator:
     """
-    Incrementally aggregates incoming raw ticks or quotes into discrete time-bucketed OHLCV bars.
+    Incrementally aggregates incoming raw quotes into discrete time-bucketed OHLCV bars.
     When a tick crosses a timeframe boundary, seals the completed bar and dispatches it.
+
+    Price & Volume Semantics:
+    - Price Basis: Uses the bid-ask midpoint ((bid + ask) / 2.0).
+    - Volume Semantics: Bid and ask sizes represent displayed market depth quantities, NOT executed
+      trading volume. Because quote streams lack actual trade executions, the aggregator NEVER averages
+      or substitutes quote depth sizes for traded volume. Resulting candles are explicitly tagged with
+      volume=0.0 and volume_type=VolumeType.UNAVAILABLE.
     """
 
     def __init__(
@@ -107,8 +178,9 @@ class LiveCandleAggregator:
 
     def process_tick(self, tick: Tick) -> Bar | None:
         """
-        Ingests a streaming tick.
-        If the tick spans past the current bar end time, seals and returns the completed bar.
+        Ingests a streaming quote tick.
+        Price is calculated strictly as bid-ask midpoint.
+        Volume is marked UNAVAILABLE as quote sizes do not represent executed trades.
         """
         if tick.symbol.upper() != self.symbol:
             raise ValueError(
@@ -116,7 +188,6 @@ class LiveCandleAggregator:
             )
 
         price = (tick.bid + tick.ask) / 2.0
-        volume = (tick.bid_volume + tick.ask_volume) / 2.0
         tick_time = tick.timestamp
 
         completed_bar: Bar | None = None
@@ -129,7 +200,7 @@ class LiveCandleAggregator:
             self._high = price
             self._low = price
             self._close = price
-            self._volume = volume
+            self._volume = 0.0
         elif tick_time >= self._current_bar_end:
             # Seal completed candle
             assert self._current_bar_start is not None
@@ -147,7 +218,8 @@ class LiveCandleAggregator:
                 high=self._high,
                 low=self._low,
                 close=self._close,
-                volume=self._volume,
+                volume=0.0,
+                volume_type=VolumeType.UNAVAILABLE,
                 timeframe=self.timeframe,
                 is_synthetic=False,
                 provenance=tick.provenance,
@@ -163,7 +235,7 @@ class LiveCandleAggregator:
             self._high = price
             self._low = price
             self._close = price
-            self._volume = volume
+            self._volume = 0.0
         else:
             # Update developing candle
             assert self._high is not None
@@ -171,7 +243,6 @@ class LiveCandleAggregator:
             self._high = max(self._high, price)
             self._low = min(self._low, price)
             self._close = price
-            self._volume += volume
 
         return completed_bar
 

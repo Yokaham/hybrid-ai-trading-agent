@@ -14,16 +14,19 @@ class DataQualityReport:
     total_bars: int
     duplicate_count: int = 0
     missing_intervals: list[tuple[datetime, datetime]] = field(default_factory=list)
+    suspected_gaps: list[tuple[datetime, datetime]] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def has_issues(self) -> bool:
-        """Returns True if any duplicates, missing intervals, or violations were detected."""
+        """Returns True if any duplicates, missing intervals, violations, or warnings were detected."""
         return (
             not self.is_valid
             or self.duplicate_count > 0
             or len(self.missing_intervals) > 0
             or len(self.violations) > 0
+            or len(self.warnings) > 0
         )
 
 
@@ -34,6 +37,9 @@ class DataQualityValidator:
     def validate_bars(
         bars: list[Bar],
         expected_timeframe: Timeframe | None = None,
+        expected_symbol: str | None = None,
+        expected_start: datetime | None = None,
+        expected_end: datetime | None = None,
     ) -> DataQualityReport:
         """
         Evaluates a sequence of OHLCV bars for:
@@ -42,6 +48,8 @@ class DataQualityValidator:
         - Timeframe interval adherence & gap identification
         - OHLC relationship boundaries
         - Non-negative volume & positive prices
+        - Instrument and timeframe alignment
+        - Date-range boundary compliance
         """
         if not bars:
             return DataQualityReport(
@@ -50,15 +58,38 @@ class DataQualityValidator:
             )
 
         violations: list[str] = []
+        warnings: list[str] = []
         missing_intervals: list[tuple[datetime, datetime]] = []
+        suspected_gaps: list[tuple[datetime, datetime]] = []
         duplicate_count = 0
         seen_timestamps: set[datetime] = set()
 
         prev_bar: Bar | None = None
         tf_seconds = expected_timeframe.seconds if expected_timeframe else None
+        expected_sym_clean = expected_symbol.strip().upper() if expected_symbol else None
 
         for idx, bar in enumerate(bars):
-            # 1. Price boundary checks
+            # 1. Symbol & Timeframe adherence
+            if expected_sym_clean and bar.symbol.upper() != expected_sym_clean:
+                violations.append(
+                    f"Bar {idx} symbol mismatch: expected {expected_sym_clean}, got {bar.symbol.upper()}"
+                )
+            if expected_timeframe and bar.timeframe != expected_timeframe:
+                violations.append(
+                    f"Bar {idx} timeframe mismatch: expected {expected_timeframe.value}, got {bar.timeframe.value}"
+                )
+
+            # 2. Date-range adherence
+            if expected_start and bar.start_time < expected_start:
+                violations.append(
+                    f"Bar {idx} start_time ({bar.start_time}) is earlier than requested start ({expected_start})"
+                )
+            if expected_end and bar.start_time > expected_end:
+                violations.append(
+                    f"Bar {idx} start_time ({bar.start_time}) is later than requested end ({expected_end})"
+                )
+
+            # 3. Price boundary checks
             if bar.open <= 0 or bar.high <= 0 or bar.low <= 0 or bar.close <= 0:
                 violations.append(
                     f"Bar {idx} ({bar.symbol} @ {bar.start_time}): Non-positive price detected "
@@ -85,7 +116,7 @@ class DataQualityValidator:
                     f"Bar {idx} ({bar.symbol} @ {bar.start_time}): end_time <= start_time"
                 )
 
-            # 2. Duplicate detection
+            # 4. Duplicate detection
             if bar.start_time in seen_timestamps:
                 duplicate_count += 1
                 violations.append(
@@ -93,7 +124,7 @@ class DataQualityValidator:
                 )
             seen_timestamps.add(bar.start_time)
 
-            # 3. Temporal sequence and missing interval detection
+            # 5. Temporal sequence and missing interval detection
             if prev_bar is not None:
                 if bar.start_time < prev_bar.start_time:
                     violations.append(
@@ -102,9 +133,14 @@ class DataQualityValidator:
                     )
                 elif tf_seconds is not None:
                     delta_seconds = (bar.start_time - prev_bar.start_time).total_seconds()
-                    # A gap is defined as a jump exceeding 1.5x expected interval duration
+                    # A suspected gap (e.g., weekend or market closure) is a jump exceeding 1.5x expected interval
                     if delta_seconds > (tf_seconds * 1.5):
-                        missing_intervals.append((prev_bar.end_time, bar.start_time))
+                        gap = (prev_bar.end_time, bar.start_time)
+                        missing_intervals.append(gap)
+                        suspected_gaps.append(gap)
+                        warnings.append(
+                            f"Suspected gap or market closure between {prev_bar.end_time} and {bar.start_time}"
+                        )
 
             prev_bar = bar
 
@@ -115,7 +151,9 @@ class DataQualityValidator:
             total_bars=len(bars),
             duplicate_count=duplicate_count,
             missing_intervals=missing_intervals,
+            suspected_gaps=suspected_gaps,
             violations=violations,
+            warnings=warnings,
         )
 
     @staticmethod

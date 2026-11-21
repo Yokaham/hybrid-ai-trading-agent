@@ -1,8 +1,12 @@
 """Feature engineering pipeline orchestrating technical indicator transformations."""
 
+import collections
+import math
+
+import numpy as np
 import pandas as pd
 
-from hybrid_agent.core.models import Bar
+from hybrid_agent.core.models import Bar, VolumeType
 from hybrid_agent.features.indicators import (
     compute_adx,
     compute_atr,
@@ -23,22 +27,280 @@ from hybrid_agent.features.registry import (
 )
 
 
+class StatefulIncrementalFeatureEngine:
+    """
+    Maintains incremental mathematical state for real-time streaming feature extraction.
+    Updates rolling and recursive indicators in O(1) time per bar without recalculating full history.
+    Supports state invalidation and rebuilding when historical bars are revised.
+    """
+
+    def __init__(self, annualization_factor: float = 252.0) -> None:
+        self.annualization_factor = annualization_factor
+        self.reset()
+
+    def reset(self) -> None:
+        """Clears all internal rolling and recursive indicator states."""
+        self._count = 0
+        self._prev_close: float | None = None
+        self._prev_high: float | None = None
+        self._prev_low: float | None = None
+
+        # SMA
+        self._sma_20_window: collections.deque[float] = collections.deque(maxlen=20)
+        self._sma_50_window: collections.deque[float] = collections.deque(maxlen=50)
+
+        # EMA
+        self._ema_20: float | None = None
+
+        # MACD (fast=12, slow=26, signal=9)
+        self._ema_fast: float | None = None
+        self._ema_slow: float | None = None
+        self._macd_signal: float | None = None
+
+        # RSI (Wilder 14)
+        self._rsi_avg_gain: float | None = None
+        self._rsi_avg_loss: float | None = None
+
+        # ROC (12)
+        self._roc_window: collections.deque[float] = collections.deque(maxlen=13)
+
+        # ATR (14)
+        self._atr_avg_tr: float | None = None
+
+        # ADX (14)
+        self._adx_tr_smooth: float | None = None
+        self._adx_plus_dm_smooth: float | None = None
+        self._adx_minus_dm_smooth: float | None = None
+        self._adx_value: float | None = None
+
+        # Bollinger Bands (20, 2.0)
+        self._bb_window: collections.deque[float] = collections.deque(maxlen=20)
+
+        # Historical Volatility (20)
+        self._hv_returns: collections.deque[float] = collections.deque(maxlen=20)
+
+        # Volume SMA & RVOL (20)
+        self._vol_window: collections.deque[float] = collections.deque(maxlen=20)
+
+    def rebuild(self, bars: list[Bar]) -> None:
+        """Rebuilds state from a historical sequence of bars (e.g. after bar revisions)."""
+        self.reset()
+        for b in bars:
+            self.update(b)
+
+    def update(self, bar: Bar) -> dict[str, float]:
+        """
+        Ingests a newly completed bar and incrementally updates all mathematical indicator states.
+        Executes in O(1) time without recomputing over historical series.
+        """
+        self._count += 1
+        close = float(bar.close)
+        high = float(bar.high)
+        low = float(bar.low)
+        vol = float(bar.volume)
+
+        features: dict[str, float] = {}
+
+        # 1. SMA (20 & 50)
+        self._sma_20_window.append(close)
+        if len(self._sma_20_window) == 20:
+            features["sma_20"] = sum(self._sma_20_window) / 20.0
+
+        self._sma_50_window.append(close)
+        if len(self._sma_50_window) == 50:
+            features["sma_50"] = sum(self._sma_50_window) / 50.0
+
+        # 2. EMA (20)
+        alpha_ema20 = 2.0 / (20.0 + 1.0)
+        if self._ema_20 is None:
+            self._ema_20 = close
+        else:
+            self._ema_20 = alpha_ema20 * close + (1.0 - alpha_ema20) * self._ema_20
+        if self._count >= 20:
+            features["ema_20"] = self._ema_20
+
+        # 3. MACD (fast=12, slow=26, signal=9)
+        alpha_fast = 2.0 / (12.0 + 1.0)
+        alpha_slow = 2.0 / (26.0 + 1.0)
+        alpha_signal = 2.0 / (9.0 + 1.0)
+
+        if self._ema_fast is None:
+            self._ema_fast = close
+        else:
+            self._ema_fast = alpha_fast * close + (1.0 - alpha_fast) * self._ema_fast
+
+        if self._ema_slow is None:
+            self._ema_slow = close
+        else:
+            self._ema_slow = alpha_slow * close + (1.0 - alpha_slow) * self._ema_slow
+
+        macd_line = self._ema_fast - self._ema_slow
+        if self._count >= 26:
+            features["macd_line"] = macd_line
+
+            if self._macd_signal is None:
+                self._macd_signal = macd_line
+            else:
+                self._macd_signal = (
+                    alpha_signal * macd_line + (1.0 - alpha_signal) * self._macd_signal
+                )
+
+            if self._count >= 34:
+                features["macd_signal"] = self._macd_signal
+                features["macd_hist"] = macd_line - self._macd_signal
+
+        # 4. RSI (14) - Wilder smoothing (alpha = 1 / 14)
+        alpha_wilder = 1.0 / 14.0
+        if self._prev_close is not None:
+            delta = close - self._prev_close
+            gain = max(0.0, delta)
+            loss = max(0.0, -delta)
+
+            if self._rsi_avg_gain is None or self._rsi_avg_loss is None:
+                self._rsi_avg_gain = gain
+                self._rsi_avg_loss = loss
+            else:
+                self._rsi_avg_gain = alpha_wilder * gain + (1.0 - alpha_wilder) * self._rsi_avg_gain
+                self._rsi_avg_loss = alpha_wilder * loss + (1.0 - alpha_wilder) * self._rsi_avg_loss
+
+            if self._count > 14:
+                if self._rsi_avg_gain == 0.0 and self._rsi_avg_loss == 0.0:
+                    features["rsi_14"] = 50.0
+                elif self._rsi_avg_loss == 0.0:
+                    features["rsi_14"] = 100.0
+                elif self._rsi_avg_gain == 0.0:
+                    features["rsi_14"] = 0.0
+                else:
+                    rs = self._rsi_avg_gain / self._rsi_avg_loss
+                    features["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+
+        # 5. ROC (12)
+        self._roc_window.append(close)
+        if len(self._roc_window) == 13:
+            old_close = self._roc_window[0]
+            if old_close != 0.0:
+                features["roc_12"] = ((close - old_close) / old_close) * 100.0
+            else:
+                features["roc_12"] = 0.0
+
+        # 6. ATR (14)
+        if self._prev_close is None:
+            tr = high - low
+        else:
+            tr = max(high - low, abs(high - self._prev_close), abs(low - self._prev_close))
+
+        if self._atr_avg_tr is None:
+            self._atr_avg_tr = tr
+        else:
+            self._atr_avg_tr = alpha_wilder * tr + (1.0 - alpha_wilder) * self._atr_avg_tr
+
+        if self._count >= 14:
+            features["atr_14"] = self._atr_avg_tr
+
+        # 7. ADX (14)
+        if self._prev_high is not None and self._prev_low is not None:
+            up_move = high - self._prev_high
+            down_move = self._prev_low - low
+            plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+            minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+            if (
+                self._adx_tr_smooth is None
+                or self._adx_plus_dm_smooth is None
+                or self._adx_minus_dm_smooth is None
+            ):
+                self._adx_tr_smooth = tr
+                self._adx_plus_dm_smooth = plus_dm
+                self._adx_minus_dm_smooth = minus_dm
+            else:
+                self._adx_tr_smooth = alpha_wilder * tr + (1.0 - alpha_wilder) * self._adx_tr_smooth
+                self._adx_plus_dm_smooth = (
+                    alpha_wilder * plus_dm + (1.0 - alpha_wilder) * self._adx_plus_dm_smooth
+                )
+                self._adx_minus_dm_smooth = (
+                    alpha_wilder * minus_dm + (1.0 - alpha_wilder) * self._adx_minus_dm_smooth
+                )
+
+            if self._count >= 14 and self._adx_tr_smooth > 0:
+                p_di = 100.0 * (self._adx_plus_dm_smooth / self._adx_tr_smooth)
+                m_di = 100.0 * (self._adx_minus_dm_smooth / self._adx_tr_smooth)
+                features["plus_di_14"] = p_di
+                features["minus_di_14"] = m_di
+
+                di_sum = p_di + m_di
+                dx = 100.0 * (abs(p_di - m_di) / di_sum) if di_sum > 0 else 0.0
+
+                if self._adx_value is None:
+                    self._adx_value = dx
+                else:
+                    self._adx_value = alpha_wilder * dx + (1.0 - alpha_wilder) * self._adx_value
+
+                if self._count >= 27:
+                    features["adx_14"] = self._adx_value
+
+        # 8. Bollinger Bands (20, 2.0)
+        self._bb_window.append(close)
+        if len(self._bb_window) == 20:
+            mean = sum(self._bb_window) / 20.0
+            variance = sum((x - mean) ** 2 for x in self._bb_window) / 19.0
+            std = math.sqrt(variance)
+            upper = mean + 2.0 * std
+            lower = mean - 2.0 * std
+            width = upper - lower
+
+            features["bb_middle_20"] = mean
+            features["bb_upper_20"] = upper
+            features["bb_lower_20"] = lower
+            features["bb_pct_b_20"] = (close - lower) / width if width > 0 else 0.5
+            features["bb_bandwidth_20"] = width / mean if mean > 0 else 0.0
+
+        # 9. Historical Volatility (20)
+        if self._prev_close is not None and self._prev_close > 0 and close > 0:
+            log_ret = math.log(close / self._prev_close)
+            self._hv_returns.append(log_ret)
+            if len(self._hv_returns) == 20:
+                mean_ret = sum(self._hv_returns) / 20.0
+                var_ret = sum((r - mean_ret) ** 2 for r in self._hv_returns) / 19.0
+                hv_std = math.sqrt(var_ret)
+                ann = math.sqrt(self.annualization_factor) if self.annualization_factor else 1.0
+                features["hv_20"] = hv_std * ann
+
+        # 10. Volume SMA & RVOL (20)
+        is_vol_unavailable = (
+            hasattr(bar, "volume_type") and bar.volume_type == VolumeType.UNAVAILABLE
+        )
+        if not is_vol_unavailable:
+            self._vol_window.append(vol)
+            if len(self._vol_window) == 20:
+                v_mean = sum(self._vol_window) / 20.0
+                if v_mean > 0:
+                    features["vol_sma_20"] = v_mean
+                    features["rvol_20"] = vol / v_mean
+
+        self._prev_close = close
+        self._prev_high = high
+        self._prev_low = low
+
+        return features
+
+
 class FeaturePipeline:
     """
     Transforms normalized market bars into quantitative features.
-    Guarantees deterministic output and strict lookahead-free calculations.
+    Guarantees deterministic output, 100% feature registry coverage, and strict lookahead-free calculations.
     """
 
     def __init__(self, registry: FeatureRegistry | None = None) -> None:
         self.registry = registry or default_feature_registry
         self._register_default_features()
+        self._default_engine: StatefulIncrementalFeatureEngine | None = None
 
     def _register_default_features(self) -> None:
         """Populates the feature registry with default mathematical specifications."""
         features = [
             FeatureMetadata(
-                name="SMA",
-                description="Simple Moving Average of closing prices",
+                name="SMA_20",
+                description="20-period Simple Moving Average of closing prices",
                 category="TREND",
                 required_inputs=["close"],
                 parameters={"period": 20},
@@ -46,8 +308,17 @@ class FeaturePipeline:
                 output_columns=["sma_20"],
             ),
             FeatureMetadata(
-                name="EMA",
-                description="Exponential Moving Average of closing prices",
+                name="SMA_50",
+                description="50-period Simple Moving Average of closing prices",
+                category="TREND",
+                required_inputs=["close"],
+                parameters={"period": 50},
+                warmup_period=50,
+                output_columns=["sma_50"],
+            ),
+            FeatureMetadata(
+                name="EMA_20",
+                description="20-period Exponential Moving Average of closing prices",
                 category="TREND",
                 required_inputs=["close"],
                 parameters={"period": 20},
@@ -55,8 +326,8 @@ class FeaturePipeline:
                 output_columns=["ema_20"],
             ),
             FeatureMetadata(
-                name="ADX",
-                description="Average Directional Index with +DI and -DI",
+                name="ADX_14",
+                description="Average Directional Index with +DI and -DI (Wilder smoothing)",
                 category="TREND",
                 required_inputs=["high", "low", "close"],
                 parameters={"period": 14},
@@ -64,7 +335,7 @@ class FeaturePipeline:
                 output_columns=["adx_14", "plus_di_14", "minus_di_14"],
             ),
             FeatureMetadata(
-                name="RSI",
+                name="RSI_14",
                 description="Relative Strength Index using Wilder smoothing",
                 category="MOMENTUM",
                 required_inputs=["close"],
@@ -82,8 +353,8 @@ class FeaturePipeline:
                 output_columns=["macd_line", "macd_signal", "macd_hist"],
             ),
             FeatureMetadata(
-                name="ROC",
-                description="Price Rate of Change percentage",
+                name="ROC_12",
+                description="12-period Price Rate of Change percentage",
                 category="MOMENTUM",
                 required_inputs=["close"],
                 parameters={"period": 12},
@@ -91,8 +362,8 @@ class FeaturePipeline:
                 output_columns=["roc_12"],
             ),
             FeatureMetadata(
-                name="ATR",
-                description="Average True Range volatility indicator",
+                name="ATR_14",
+                description="14-period Average True Range volatility indicator",
                 category="VOLATILITY",
                 required_inputs=["high", "low", "close"],
                 parameters={"period": 14},
@@ -100,7 +371,7 @@ class FeaturePipeline:
                 output_columns=["atr_14"],
             ),
             FeatureMetadata(
-                name="BollingerBands",
+                name="BollingerBands_20",
                 description="Bollinger Bands (Upper, Middle, Lower, %B, Bandwidth)",
                 category="VOLATILITY",
                 required_inputs=["close"],
@@ -115,17 +386,17 @@ class FeaturePipeline:
                 ],
             ),
             FeatureMetadata(
-                name="HistoricalVolatility",
+                name="HistoricalVolatility_20",
                 description="Annualized historical volatility based on log returns",
                 category="VOLATILITY",
                 required_inputs=["close"],
-                parameters={"period": 20, "trading_periods": 252},
+                parameters={"period": 20, "annualization_factor": 252.0},
                 warmup_period=21,
                 output_columns=["hv_20"],
             ),
             FeatureMetadata(
-                name="VolumeSMA",
-                description="Simple Moving Average of traded volume",
+                name="VolumeSMA_20",
+                description="20-period Simple Moving Average of traded volume",
                 category="VOLUME",
                 required_inputs=["volume"],
                 parameters={"period": 20},
@@ -133,7 +404,7 @@ class FeaturePipeline:
                 output_columns=["vol_sma_20"],
             ),
             FeatureMetadata(
-                name="RelativeVolume",
+                name="RelativeVolume_20",
                 description="Ratio of current volume to rolling volume SMA",
                 category="VOLUME",
                 required_inputs=["volume"],
@@ -147,6 +418,12 @@ class FeaturePipeline:
                 self.registry.register(f)
             except ValueError:
                 pass  # Already registered
+
+    def create_incremental_engine(
+        self, annualization_factor: float = 252.0
+    ) -> StatefulIncrementalFeatureEngine:
+        """Instantiates a dedicated stateful incremental calculation engine."""
+        return StatefulIncrementalFeatureEngine(annualization_factor=annualization_factor)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -188,59 +465,40 @@ class FeaturePipeline:
         res["bb_lower_20"] = lower
         res["bb_pct_b_20"] = pct_b
         res["bb_bandwidth_20"] = bandwidth
-        res["hv_20"] = compute_historical_volatility(res["close"], period=20, trading_periods=252)
+        res["hv_20"] = compute_historical_volatility(
+            res["close"], period=20, annualization_factor=252.0
+        )
 
-        # Volume
-        res["vol_sma_20"] = compute_volume_sma(res["volume"], period=20)
-        res["rvol_20"] = compute_relative_volume(res["volume"], period=20)
+        # Volume (Checks whether volume is unavailable or all 0)
+        vol_unavailable = False
+        if "volume_type" in res.columns:
+            vol_unavailable = (res["volume_type"] == VolumeType.UNAVAILABLE.value).any()
+
+        if vol_unavailable or (res["volume"] == 0.0).all():
+            res["vol_sma_20"] = np.nan
+            res["rvol_20"] = np.nan
+        else:
+            res["vol_sma_20"] = compute_volume_sma(res["volume"], period=20)
+            res["rvol_20"] = compute_relative_volume(res["volume"], period=20)
 
         return res
 
     def transform_incremental(
         self,
         current_bar: Bar,
-        history_bars: list[Bar],
+        history_bars: list[Bar] | None = None,
+        engine: StatefulIncrementalFeatureEngine | None = None,
     ) -> dict[str, float]:
         """
-        Calculates latest scalar feature values for a newly sealed bar given its preceding history.
-        Ensures 100% equivalence between streaming updates and batch dataframe calculations.
+        Calculates latest scalar feature values for a newly sealed bar using stateful incremental computation.
+        Accepts newly completed bars and updates features in O(1) time without recalculating full history.
         """
-        all_bars = history_bars + [current_bar]
-        records = [
-            {
-                "open": b.open,
-                "high": b.high,
-                "low": b.low,
-                "close": b.close,
-                "volume": b.volume,
-            }
-            for b in all_bars
-        ]
-        df = pd.DataFrame(records)
-        transformed = self.transform(df)
-        latest_row = transformed.iloc[-1].to_dict()
+        if engine is not None:
+            return engine.update(current_bar)
 
-        # Return only calculated feature columns
-        feature_keys = [
-            "sma_20",
-            "sma_50",
-            "ema_20",
-            "adx_14",
-            "plus_di_14",
-            "minus_di_14",
-            "rsi_14",
-            "macd_line",
-            "macd_signal",
-            "macd_hist",
-            "roc_12",
-            "atr_14",
-            "bb_upper_20",
-            "bb_middle_20",
-            "bb_lower_20",
-            "bb_pct_b_20",
-            "bb_bandwidth_20",
-            "hv_20",
-            "vol_sma_20",
-            "rvol_20",
-        ]
-        return {k: float(latest_row[k]) for k in feature_keys if pd.notna(latest_row.get(k))}
+        if self._default_engine is None:
+            self._default_engine = self.create_incremental_engine()
+            if history_bars:
+                self._default_engine.rebuild(history_bars)
+
+        return self._default_engine.update(current_bar)

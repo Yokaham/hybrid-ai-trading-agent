@@ -4,6 +4,9 @@ from hybrid_agent.data.base import (
     HistoricalMarketDataProvider,
     LiveMarketDataProvider,
     MarketDataProvider,
+    ProviderConnectionError,
+    ProviderError,
+    ProviderRateLimitError,
 )
 from hybrid_agent.data.feed import MarketDataFeed
 from hybrid_agent.data.live import (
@@ -35,6 +38,9 @@ __all__ = [
     "MockHistoricalDataProvider",
     "MockLiveMarketDataProvider",
     "ParquetStorageEngine",
+    "ProviderConnectionError",
+    "ProviderError",
+    "ProviderRateLimitError",
     "TickDeduplicator",
     "YahooFinanceHistoricalProvider",
 ]
