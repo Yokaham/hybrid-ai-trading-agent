@@ -65,7 +65,7 @@
 - Separation of gross position notional from monetary downside risk at stop-loss.
 - Zero-tolerance regulatory enforcement regarding unauthorized offshore platforms (FEMA / RBI Alert List).
 
-### Milestone 2: Market Data Infrastructure & Feature Engineering (Current Status: Verified & Corrected in Milestones 2A & 2B)
+### Milestone 2: Market Data Infrastructure & Feature Engineering (Current Status: Verified & Corrected in Milestones 2A, 2B & 2C)
 - Abstract provider interfaces: `MarketDataProvider`, `HistoricalMarketDataProvider`, `LiveMarketDataProvider` with typed error mechanisms (`ProviderConnectionError`, `ProviderError`).
 - Deterministic offline mock provider with Geometric Brownian Motion (`MockHistoricalDataProvider`, `MockLiveMarketDataProvider`).
 - Real-world historical data adapter for exploratory research using Yahoo Finance (`YahooFinanceHistoricalProvider`) with exact interval filtering, original value preservation without price manufacturing, and documented limitations.

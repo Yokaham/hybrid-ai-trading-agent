@@ -71,7 +71,8 @@ def compute_adx(
 
     di_sum = plus_di + minus_di
     di_diff = (plus_di - minus_di).abs()
-    dx = 100.0 * (di_diff / di_sum.replace(0, np.nan))
+    dx = (100.0 * (di_diff / di_sum.replace(0, np.nan))).fillna(0.0)
+    dx = dx.where(~di_sum.isna(), np.nan)
 
     adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
@@ -191,8 +192,10 @@ def compute_bollinger_bands(
     lower = middle - (num_std * std)
 
     width = upper - lower
-    percent_b = ((close - lower) / width.replace(0, np.nan)).fillna(0.5)
-    bandwidth = (width / middle.replace(0, np.nan)).fillna(0.0)
+    percent_b = (close - lower) / width.replace(0, np.nan)
+    percent_b = percent_b.where(middle.isna(), percent_b.fillna(0.5))
+    bandwidth = width / middle.replace(0, np.nan)
+    bandwidth = bandwidth.where(middle.isna(), bandwidth.fillna(0.0))
 
     return upper, middle, lower, percent_b, bandwidth
 

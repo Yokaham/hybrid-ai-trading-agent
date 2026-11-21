@@ -23,7 +23,6 @@ from hybrid_agent.features.indicators import (
 from hybrid_agent.features.registry import (
     FeatureMetadata,
     FeatureRegistry,
-    default_feature_registry,
 )
 
 
@@ -320,7 +319,8 @@ class FeaturePipeline:
                 f"annualization_factor must be non-negative, got {annualization_factor}"
             )
         self.annualization_factor = annualization_factor
-        self.registry = registry or default_feature_registry
+        # Ensure independent registry per pipeline instance by default to avoid cross-contamination
+        self.registry = registry if registry is not None else FeatureRegistry()
         self._register_default_features()
         self._default_engine: StatefulIncrementalFeatureEngine | None = None
 
@@ -443,10 +443,16 @@ class FeaturePipeline:
             ),
         ]
         for f in features:
-            try:
+            key = f.name.lower()
+            if key in self.registry._registry:
+                existing = self.registry.get(f.name)
+                if existing.parameters != f.parameters:
+                    raise ValueError(
+                        f"Conflicting feature registration for '{f.name}': "
+                        f"existing parameters {existing.parameters} conflict with pipeline parameters {f.parameters}."
+                    )
+            else:
                 self.registry.register(f)
-            except ValueError:
-                pass  # Already registered
 
     def create_incremental_engine(
         self, annualization_factor: float | None = None

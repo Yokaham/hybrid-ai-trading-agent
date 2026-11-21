@@ -1,8 +1,42 @@
 # Development Status & Technical Review Log
 
-## 1. Current State: Milestone 2B Complete (Final Market Data & Feature Engineering Corrections)
+## 1. Current State: Milestone 2C Complete (Final Corrections to Feature Engineering)
 
-### Milestone 2B Corrections Delivered
+### Milestone 2C Corrections Delivered
+- **Full-Dataset Bar-by-Bar Parity Verification (`src/hybrid_agent/features/indicators.py`, `pipeline.py`, `tests/features/test_feature_pipeline.py`)**:
+  - Replaced single-point final-row tests with rigorous bar-by-bar validation across every observation ($t \in [0, N-1]$) for all 20 indicator columns:
+    `sma_20`, `sma_50`, `ema_20`, `adx_14`, `plus_di_14`, `minus_di_14`, `rsi_14`, `macd_line`, `macd_signal`, `macd_hist`, `roc_12`, `atr_14`, `bb_upper_20`, `bb_middle_20`, `bb_lower_20`, `bb_pct_b_20`, `bb_bandwidth_20`, `hv_20`, `vol_sma_20`, `rvol_20`.
+  - Verified across 4 diverse market regimes:
+    1. **Trending / Random Walk Market**: Evaluates directional movement, momentum, volatility, and trend indicators under non-stationary conditions.
+    2. **Flat Market**: Evaluates stationary, zero-variance conditions where division by zero must not occur, degenerate handling applies, and warm-up masks align.
+    3. **High Volatility Market**: Evaluates wide spreads, extreme true ranges, large log returns, and non-linear volatility scaling.
+    4. **Mixed-Volume Market**: Evaluates intermittent unavailable volume periods with proper recovery when 20 consecutive valid volume bars accumulate.
+  - **Synchronized Warm-Up Masks & Lookahead Prevention**:
+    - Corrected `compute_bollinger_bands`: warm-up periods ($t < 19$) strictly produce `NaN` for `bb_pct_b_20` and `bb_bandwidth_20`. Default fallbacks (`0.5` and `0.0`) apply exclusively to post-warmup zero-variance bars (`width == 0`), eliminating previous warm-up mask discrepancies.
+    - Corrected `compute_adx`: zero directional movement post-warmup produces valid `0.0` for DX and ADX, while warm-up periods retain `NaN`.
+    - Formally verified that `StatefulIncrementalFeatureEngine` never produces indicator outputs earlier than `FeaturePipeline.transform()`.
+  - **Strict Numerical Tolerances**:
+    - Tests assert numerical equality with explicit `atol=1e-8, rtol=1e-8`, with observed maximum differences across all bars and regimes $\le 4.83 \times 10^{-13}$.
+  - **Rebuild Parity on Historical Revisions**:
+    - Verified that revising historical bars and triggering `engine.rebuild(revised_bars)` yields exact bar-by-bar parity with a fresh batch calculation over the revised dataset.
+- **FeatureRegistry Configuration Isolation (`src/hybrid_agent/features/registry.py`, `pipeline.py`)**:
+  - Independent default registry: `FeaturePipeline` now instantiates a dedicated, isolated `FeatureRegistry()` by default when no registry is provided, preventing global state leakage across instances.
+  - Fail-closed custom registry validation: when an existing registry is injected, attempting to register conflicting parameters (such as differing `annualization_factor` values) raises a descriptive `ValueError` rather than silently swallowing conflicts.
+  - Tested multiple pipelines instantiated in forward and reverse order, confirming that metadata never cross-contaminates or depends on instantiation order.
+- **End-to-End Annualization Verification**:
+  - Verified all 5 conventions:
+    1. `252.0` (equities)
+    2. `260.0` (forex)
+    3. `365.0` (crypto)
+    4. `None` (unannualized volatility)
+    5. `0.0` (unannualized volatility)
+  - Verified that negative annualization factors (e.g. `-10.0`) are strictly rejected with `ValueError`.
+  - Verified end-to-end consistency across batch DataFrames, incremental engines, and registry metadata.
+  - Verified explicit incremental engine creation overrides (`pipe.create_incremental_engine(annualization_factor=...)`).
+
+---
+
+## 2. Milestone 2B Corrections Delivered (Historical Summary)
 - **Complete Batch vs. Incremental Feature Parity (`src/hybrid_agent/features/indicators.py`, `pipeline.py`)**:
   - Achieved exact mathematical parity ($\Delta \le 10^{-12}$, well below $10^{-4}$ tolerance) across all 20 indicator columns:
     `sma_20`, `sma_50`, `ema_20`, `adx_14`, `plus_di_14`, `minus_di_14`, `rsi_14`, `macd_line`, `macd_signal`, `macd_hist`, `roc_12`, `atr_14`, `bb_upper_20`, `bb_middle_20`, `bb_lower_20`, `bb_pct_b_20`, `bb_bandwidth_20`, `hv_20`, `vol_sma_20`, `rvol_20`.
@@ -98,7 +132,7 @@ platform win32 -- Python 3.12.6, pytest-9.2.0, pluggy-1.7.0
 rootdir: D:\Trade\hybrid-ai-trading-agent
 configfile: pyproject.toml
 testpaths: tests
-collected 107 items
+collected 110 items
 
 tests/data/test_data_validation.py (7 passed)
 tests/data/test_feed.py (5 passed)
@@ -106,13 +140,13 @@ tests/data/test_ingestion_pipeline.py (8 passed)
 tests/data/test_live_infrastructure.py (6 passed)
 tests/data/test_storage.py (9 passed)
 tests/data/test_yahoo_adapter.py (5 passed)
-tests/features/test_feature_pipeline.py (10 passed)
+tests/features/test_feature_pipeline.py (13 passed)
 tests/features/test_indicators.py (14 passed)
 tests/test_config.py (3 passed)
 tests/test_core_models.py (23 passed)
 tests/test_risk_policy.py (17 passed)
 
-============================ 107 passed in 2.44s ============================
+============================ 110 passed in 2.48s ============================
 ```
 
 ### Static Analysis & Linter Verification

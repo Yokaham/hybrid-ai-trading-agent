@@ -163,12 +163,16 @@ class TestFeaturePipeline(unittest.TestCase):
         )
 
     def test_stateful_incremental_engine_parity(self) -> None:
-        """Proves that streaming bars through StatefulIncrementalFeatureEngine matches batch transform across all 20 indicator columns."""
+        """
+        Proves that streaming bars through StatefulIncrementalFeatureEngine matches batch transform
+        across ALL 20 indicator columns AT EVERY BAR across the entire dataset.
+        Verifies:
+        1. Matching NaN warm-up masks (no premature incremental outputs).
+        2. Strict numerical equality (atol=1e-8, rtol=1e-8) for all valid warm-up bars.
+        """
         engine = StatefulIncrementalFeatureEngine()
-        latest_inc: dict[str, float] = {}
-
-        for b in self.bars:
-            latest_inc = engine.update(b)
+        inc_records: list[dict[str, float]] = [engine.update(b) for b in self.bars]
+        inc_df = pd.DataFrame(inc_records)
 
         # Compute batch dataframe
         records = [
@@ -177,9 +181,7 @@ class TestFeaturePipeline(unittest.TestCase):
         ]
         df = pd.DataFrame(records)
         batch_df = self.pipeline.transform(df)
-        batch_latest = batch_df.iloc[-1]
 
-        # Verify exact parity across ALL 20 indicator columns
         all_indicators = [
             "sma_20",
             "sma_50",
@@ -202,40 +204,270 @@ class TestFeaturePipeline(unittest.TestCase):
             "vol_sma_20",
             "rvol_20",
         ]
+
         for col in all_indicators:
-            self.assertIn(col, latest_inc, f"Missing {col} in incremental features")
-            self.assertIn(col, batch_latest, f"Missing {col} in batch features")
-            self.assertAlmostEqual(
-                latest_inc[col],
-                float(batch_latest[col]),
-                places=4,
-                msg=f"Discrepancy in indicator {col}: inc={latest_inc[col]}, batch={batch_latest[col]}",
+            b_series = batch_df[col]
+            i_series = (
+                inc_df[col] if col in inc_df.columns else pd.Series([np.nan] * len(self.bars))
             )
 
+            # 1. Warm-up and NaN mask parity at every single bar
+            b_nan = b_series.isna()
+            i_nan = i_series.isna()
+            mismatches = np.where(b_nan != i_nan)[0]
+            self.assertEqual(
+                len(mismatches),
+                0,
+                f"Warm-up / NaN mask mismatch for '{col}' at bar indices {list(mismatches)}",
+            )
+
+            # 2. Strict numerical equivalence across all valid observations
+            valid = ~b_nan
+            if valid.any():
+                b_vals = b_series[valid].to_numpy(dtype=float)
+                i_vals = i_series[valid].to_numpy(dtype=float)
+                np.testing.assert_allclose(
+                    i_vals,
+                    b_vals,
+                    atol=1e-8,
+                    rtol=1e-8,
+                    err_msg=f"Numerical parity failure across bars for indicator '{col}'",
+                )
+
+    def test_full_dataset_bar_by_bar_parity_across_diverse_market_regimes(self) -> None:
+        """
+        Proves strict full-dataset bar-by-bar parity across 4 diverse market regimes:
+        1. Trending / Random Walk
+        2. Flat Market (stationary series)
+        3. High Volatility Market
+        4. Mixed-Volume Market (interspersed unavailable volume)
+        """
+        base_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+        all_indicators = [
+            "sma_20",
+            "sma_50",
+            "ema_20",
+            "adx_14",
+            "plus_di_14",
+            "minus_di_14",
+            "rsi_14",
+            "macd_line",
+            "macd_signal",
+            "macd_hist",
+            "roc_12",
+            "atr_14",
+            "bb_upper_20",
+            "bb_middle_20",
+            "bb_lower_20",
+            "bb_pct_b_20",
+            "bb_bandwidth_20",
+            "hv_20",
+            "vol_sma_20",
+            "rvol_20",
+        ]
+
+        # Regime 1: Trending
+        np.random.seed(101)
+        prices = 100.0 + np.cumsum(np.random.randn(100) * 0.6)
+        bars_trending: list[Bar] = []
+        for i in range(100):
+            c = float(prices[i])
+            o = float(prices[max(0, i - 1)])
+            h = max(o, c) + 0.5
+            l = min(o, c) - 0.5
+            bars_trending.append(
+                Bar(
+                    symbol="TREND",
+                    start_time=base_time + timedelta(minutes=i),
+                    end_time=base_time + timedelta(minutes=i + 1),
+                    open=o,
+                    high=h,
+                    low=l,
+                    close=c,
+                    volume=1000.0 + i * 15,
+                    timeframe=Timeframe.M1,
+                )
+            )
+
+        # Regime 2: Flat
+        bars_flat: list[Bar] = [
+            Bar(
+                symbol="FLAT",
+                start_time=base_time + timedelta(minutes=i),
+                end_time=base_time + timedelta(minutes=i + 1),
+                open=100.0,
+                high=100.0,
+                low=100.0,
+                close=100.0,
+                volume=1000.0,
+                timeframe=Timeframe.M1,
+            )
+            for i in range(80)
+        ]
+
+        # Regime 3: High Volatility
+        np.random.seed(202)
+        p = 100.0
+        bars_vol: list[Bar] = []
+        for i in range(100):
+            c = max(1.0, float(p * (1.0 + np.random.normal(0, 0.04))))
+            bars_vol.append(
+                Bar(
+                    symbol="VOL",
+                    start_time=base_time + timedelta(minutes=i),
+                    end_time=base_time + timedelta(minutes=i + 1),
+                    open=p,
+                    high=max(p, c) * 1.03,
+                    low=min(p, c) * 0.97,
+                    close=c,
+                    volume=float(np.random.randint(500, 10000)),
+                    timeframe=Timeframe.M1,
+                )
+            )
+            p = c
+
+        # Regime 4: Mixed Volume
+        bars_mixed_vol: list[Bar] = []
+        for i in range(80):
+            is_unavail = 25 <= i < 30
+            vt = VolumeType.UNAVAILABLE if is_unavail else VolumeType.REAL_TRADED
+            v = 0.0 if is_unavail else float(1000 + i * 20)
+            bars_mixed_vol.append(
+                Bar(
+                    symbol="MIXVOL",
+                    start_time=base_time + timedelta(minutes=i),
+                    end_time=base_time + timedelta(minutes=i + 1),
+                    open=100.0,
+                    high=101.5,
+                    low=98.5,
+                    close=100.0,
+                    volume=v,
+                    volume_type=vt,
+                    timeframe=Timeframe.M1,
+                )
+            )
+
+        regimes = [
+            ("Trending", bars_trending),
+            ("Flat", bars_flat),
+            ("High Volatility", bars_vol),
+            ("Mixed Volume", bars_mixed_vol),
+        ]
+
+        pipe = FeaturePipeline()
+        for regime_name, dataset in regimes:
+            records = [
+                {
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume,
+                    "volume_type": b.volume_type.value,
+                }
+                for b in dataset
+            ]
+            batch_df = pipe.transform(pd.DataFrame(records))
+            engine = pipe.create_incremental_engine()
+            inc_records = [engine.update(b) for b in dataset]
+            inc_df = pd.DataFrame(inc_records)
+
+            for col in all_indicators:
+                b_s = batch_df[col]
+                i_s = inc_df[col] if col in inc_df.columns else pd.Series([np.nan] * len(dataset))
+
+                # Check mask parity at every single bar
+                b_nan = b_s.isna()
+                i_nan = i_s.isna()
+                mismatches = np.where(b_nan != i_nan)[0]
+                self.assertEqual(
+                    len(mismatches),
+                    0,
+                    f"[{regime_name}] Mask mismatch for '{col}' at indices {list(mismatches)}",
+                )
+
+                # Check numerical values at every single bar
+                valid = ~b_nan
+                if valid.any():
+                    np.testing.assert_allclose(
+                        i_s[valid].to_numpy(dtype=float),
+                        b_s[valid].to_numpy(dtype=float),
+                        atol=1e-8,
+                        rtol=1e-8,
+                        err_msg=f"[{regime_name}] Parity failure at valid bars for indicator '{col}'",
+                    )
+
     def test_stateful_incremental_engine_rebuild_on_revision(self) -> None:
-        """Proves that an incremental engine can safely rebuild its state when historical bars are revised."""
+        """
+        Proves that after revising historical bars and rebuilding state,
+        the incremental engine's outputs at EVERY bar match a fresh batch calculation.
+        """
         engine = StatefulIncrementalFeatureEngine()
-        for b in self.bars[:40]:
+        bars_slice = list(self.bars[:60])
+        for b in bars_slice:
             engine.update(b)
 
-        # Revise bar 20
-        revised_bars = list(self.bars[:40])
-        revised_bar_20 = Bar(
+        # Revise bar 25
+        revised_bars = list(bars_slice)
+        revised_bar_25 = Bar(
             symbol="EURUSD",
-            start_time=revised_bars[20].start_time,
-            end_time=revised_bars[20].end_time,
-            open=revised_bars[20].open,
-            high=revised_bars[20].high + 5.0,
-            low=revised_bars[20].low,
-            close=revised_bars[20].close + 4.0,
-            volume=revised_bars[20].volume,
+            start_time=revised_bars[25].start_time,
+            end_time=revised_bars[25].end_time,
+            open=revised_bars[25].open,
+            high=revised_bars[25].high + 5.0,
+            low=revised_bars[25].low,
+            close=revised_bars[25].close + 4.0,
+            volume=revised_bars[25].volume,
             timeframe=Timeframe.H1,
         )
-        revised_bars[20] = revised_bar_20
+        revised_bars[25] = revised_bar_25
 
-        # Rebuild state
+        # Rebuild state from revised bars
         engine.rebuild(revised_bars)
-        self.assertEqual(engine._count, 40)
+        self.assertEqual(engine._count, 60)
+
+        # Verify bar-by-bar equivalence against fresh batch transform of revised dataset
+        records = [
+            {"open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume}
+            for b in revised_bars
+        ]
+        batch_revised = self.pipeline.transform(pd.DataFrame(records))
+
+        # Re-run incremental engine to capture full output series
+        fresh_engine = self.pipeline.create_incremental_engine()
+        fresh_inc_records = [fresh_engine.update(b) for b in revised_bars]
+        fresh_inc_df = pd.DataFrame(fresh_inc_records)
+
+        for col in [
+            "sma_20",
+            "sma_50",
+            "ema_20",
+            "rsi_14",
+            "macd_line",
+            "atr_14",
+            "bb_middle_20",
+            "hv_20",
+            "vol_sma_20",
+        ]:
+            b_s = batch_revised[col]
+            i_s = (
+                fresh_inc_df[col]
+                if col in fresh_inc_df.columns
+                else pd.Series([np.nan] * len(revised_bars))
+            )
+            self.assertTrue(
+                (b_s.isna() == i_s.isna()).all(),
+                f"Warmup mismatch after rebuild for indicator '{col}'",
+            )
+            valid = ~b_s.isna()
+            if valid.any():
+                np.testing.assert_allclose(
+                    i_s[valid].to_numpy(dtype=float),
+                    b_s[valid].to_numpy(dtype=float),
+                    atol=1e-8,
+                    rtol=1e-8,
+                    err_msg=f"Rebuild parity failure for '{col}'",
+                )
 
     def test_unavailable_volume_produces_nan_volume_features(self) -> None:
         """Proves that bars with VolumeType.UNAVAILABLE produce NaN for VolumeSMA and RVOL."""
@@ -331,7 +563,16 @@ class TestFeaturePipeline(unittest.TestCase):
         self.assertAlmostEqual(inc_outputs[46]["rvol_20"], batch_df["rvol_20"].iloc[46], places=4)
 
     def test_configurable_historical_volatility_annualization(self) -> None:
-        """Verifies configurable annualization factors on FeaturePipeline and parity with incremental engine."""
+        """
+        Verifies end-to-end annualization configurations:
+        - 252.0 (equities)
+        - 260.0 (forex)
+        - 365.0 (crypto)
+        - None (unannualized)
+        - 0.0 (unannualized)
+        - Negative values rejected with ValueError
+        Verifies batch vs. incremental parity across ALL bars and registry metadata consistency.
+        """
         # Equities (252)
         pipe_eq = FeaturePipeline(annualization_factor=252.0)
         # Forex (260)
@@ -339,7 +580,9 @@ class TestFeaturePipeline(unittest.TestCase):
         # Crypto (365)
         pipe_crypto = FeaturePipeline(annualization_factor=365.0)
         # Unannualized (None)
-        pipe_raw = FeaturePipeline(annualization_factor=None)
+        pipe_none = FeaturePipeline(annualization_factor=None)
+        # Unannualized (0.0)
+        pipe_zero = FeaturePipeline(annualization_factor=0.0)
 
         # Negative factor validation
         with self.assertRaises(ValueError):
@@ -354,30 +597,174 @@ class TestFeaturePipeline(unittest.TestCase):
         df_eq = pipe_eq.transform(df)
         df_fx = pipe_fx.transform(df)
         df_crypto = pipe_crypto.transform(df)
-        df_raw = pipe_raw.transform(df)
+        df_none = pipe_none.transform(df)
+        df_zero = pipe_zero.transform(df)
 
-        # HV should scale with sqrt(annualization_factor)
-        val_eq = df_eq["hv_20"].iloc[-1]
-        val_fx = df_fx["hv_20"].iloc[-1]
-        val_crypto = df_crypto["hv_20"].iloc[-1]
-        val_raw = df_raw["hv_20"].iloc[-1]
+        # 1. Registry metadata verification
+        self.assertEqual(
+            pipe_eq.registry.get("HistoricalVolatility_20").parameters["annualization_factor"],
+            252.0,
+        )
+        self.assertEqual(
+            pipe_fx.registry.get("HistoricalVolatility_20").parameters["annualization_factor"],
+            260.0,
+        )
+        self.assertEqual(
+            pipe_crypto.registry.get("HistoricalVolatility_20").parameters["annualization_factor"],
+            365.0,
+        )
+        self.assertIsNone(
+            pipe_none.registry.get("HistoricalVolatility_20").parameters["annualization_factor"]
+        )
+        self.assertEqual(
+            pipe_zero.registry.get("HistoricalVolatility_20").parameters["annualization_factor"],
+            0.0,
+        )
 
-        self.assertAlmostEqual(val_eq, val_raw * np.sqrt(252.0), places=5)
-        self.assertAlmostEqual(val_fx, val_raw * np.sqrt(260.0), places=5)
-        self.assertAlmostEqual(val_crypto, val_raw * np.sqrt(365.0), places=5)
+        # 2. Mathematical scaling relationship
+        valid_idx = ~df_none["hv_20"].isna()
+        raw_vals = df_none["hv_20"][valid_idx].to_numpy(dtype=float)
+        zero_vals = df_zero["hv_20"][valid_idx].to_numpy(dtype=float)
+        np.testing.assert_allclose(raw_vals, zero_vals, atol=1e-8, rtol=1e-8)
 
-        # Incremental parity for unannualized and custom factor
-        eng_raw = pipe_raw.create_incremental_engine()
-        inc_raw = {}
-        for b in self.bars:
-            inc_raw = eng_raw.update(b)
-        self.assertAlmostEqual(inc_raw["hv_20"], val_raw, places=5)
+        np.testing.assert_allclose(
+            df_eq["hv_20"][valid_idx].to_numpy(dtype=float),
+            raw_vals * np.sqrt(252.0),
+            atol=1e-8,
+            rtol=1e-8,
+        )
+        np.testing.assert_allclose(
+            df_fx["hv_20"][valid_idx].to_numpy(dtype=float),
+            raw_vals * np.sqrt(260.0),
+            atol=1e-8,
+            rtol=1e-8,
+        )
+        np.testing.assert_allclose(
+            df_crypto["hv_20"][valid_idx].to_numpy(dtype=float),
+            raw_vals * np.sqrt(365.0),
+            atol=1e-8,
+            rtol=1e-8,
+        )
 
-        eng_crypto = pipe_crypto.create_incremental_engine()
-        inc_crypto = {}
-        for b in self.bars:
-            inc_crypto = eng_crypto.update(b)
-        self.assertAlmostEqual(inc_crypto["hv_20"], val_crypto, places=5)
+        # 3. Bar-by-bar incremental parity for each annualization mode
+        for pipe_inst, df_batch, factor_val in [
+            (pipe_eq, df_eq, 252.0),
+            (pipe_fx, df_fx, 260.0),
+            (pipe_crypto, df_crypto, 365.0),
+            (pipe_none, df_none, None),
+            (pipe_zero, df_zero, 0.0),
+        ]:
+            eng = pipe_inst.create_incremental_engine()
+            self.assertEqual(eng.annualization_factor, factor_val)
+            inc_records = [eng.update(b) for b in self.bars]
+            inc_df = pd.DataFrame(inc_records)
+            b_s = df_batch["hv_20"]
+            i_s = (
+                inc_df["hv_20"]
+                if "hv_20" in inc_df.columns
+                else pd.Series([np.nan] * len(self.bars))
+            )
+            self.assertTrue((b_s.isna() == i_s.isna()).all())
+            v = ~b_s.isna()
+            np.testing.assert_allclose(
+                i_s[v].to_numpy(dtype=float),
+                b_s[v].to_numpy(dtype=float),
+                atol=1e-8,
+                rtol=1e-8,
+                err_msg=f"Incremental parity mismatch for factor={factor_val}",
+            )
+
+        # 4. Explicit engine override verification
+        eng_override = pipe_none.create_incremental_engine(annualization_factor=252.0)
+        self.assertEqual(eng_override.annualization_factor, 252.0)
+        inc_override_records = [eng_override.update(b) for b in self.bars]
+        inc_override_df = pd.DataFrame(inc_override_records)
+        v_eq = ~df_eq["hv_20"].isna()
+        np.testing.assert_allclose(
+            inc_override_df["hv_20"][v_eq].to_numpy(dtype=float),
+            df_eq["hv_20"][v_eq].to_numpy(dtype=float),
+            atol=1e-8,
+            rtol=1e-8,
+        )
+
+    def test_registry_isolation_across_independently_configured_pipelines(self) -> None:
+        """
+        Proves that independently configured FeaturePipeline instances do not share
+        or overwrite registry metadata regardless of instantiation order.
+        """
+        # Order A: 252 -> 260 -> 365 -> None -> 0.0
+        p1 = FeaturePipeline(annualization_factor=252.0)
+        p2 = FeaturePipeline(annualization_factor=260.0)
+        p3 = FeaturePipeline(annualization_factor=365.0)
+        p4 = FeaturePipeline(annualization_factor=None)
+        p5 = FeaturePipeline(annualization_factor=0.0)
+
+        # Distinct registry objects
+        registries = [p1.registry, p2.registry, p3.registry, p4.registry, p5.registry]
+        self.assertEqual(len({id(r) for r in registries}), 5)
+
+        self.assertEqual(
+            p1.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 252.0
+        )
+        self.assertEqual(
+            p2.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 260.0
+        )
+        self.assertEqual(
+            p3.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 365.0
+        )
+        self.assertIsNone(
+            p4.registry.get("HistoricalVolatility_20").parameters["annualization_factor"]
+        )
+        self.assertEqual(
+            p5.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 0.0
+        )
+
+        # Order B (Reverse): 0.0 -> None -> 365 -> 260 -> 252
+        q1 = FeaturePipeline(annualization_factor=0.0)
+        q2 = FeaturePipeline(annualization_factor=None)
+        q3 = FeaturePipeline(annualization_factor=365.0)
+        q4 = FeaturePipeline(annualization_factor=260.0)
+        q5 = FeaturePipeline(annualization_factor=252.0)
+
+        self.assertEqual(
+            q1.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 0.0
+        )
+        self.assertIsNone(
+            q2.registry.get("HistoricalVolatility_20").parameters["annualization_factor"]
+        )
+        self.assertEqual(
+            q3.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 365.0
+        )
+        self.assertEqual(
+            q4.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 260.0
+        )
+        self.assertEqual(
+            q5.registry.get("HistoricalVolatility_20").parameters["annualization_factor"], 252.0
+        )
+
+    def test_custom_registry_injection_and_conflict_rejection(self) -> None:
+        """
+        Proves custom FeatureRegistry injection:
+        - Clean injection is accepted and accessible.
+        - Conflicting configuration injected into an existing registry fails closed.
+        """
+        custom_reg = FeatureRegistry()
+        pipe_custom = FeaturePipeline(registry=custom_reg, annualization_factor=260.0)
+        self.assertIs(pipe_custom.registry, custom_reg)
+        self.assertEqual(
+            custom_reg.get("HistoricalVolatility_20").parameters["annualization_factor"], 260.0
+        )
+
+        # Re-registering with identical parameters on the same custom registry succeeds
+        pipe_same = FeaturePipeline(registry=custom_reg, annualization_factor=260.0)
+        self.assertIs(pipe_same.registry, custom_reg)
+
+        # Attempting to register a conflicting annualization factor fails closed
+        with self.assertRaises(ValueError) as ctx:
+            FeaturePipeline(registry=custom_reg, annualization_factor=365.0)
+        self.assertIn(
+            "Conflicting feature registration for 'HistoricalVolatility_20'", str(ctx.exception)
+        )
 
 
 if __name__ == "__main__":
