@@ -1,6 +1,36 @@
 # Development Status & Technical Review Log
 
-## 1. Current State: Milestone 2C Complete (Final Corrections to Feature Engineering)
+## 1. Current State: Milestone 3A Complete (Backtesting Framework Evaluation & Integration Prototype)
+
+### Milestone 3A Deliverables Completed
+- **Independent Framework Evaluation (`ml4t-backtest==0.2.0` & QuantConnect/LEAN)**:
+  - Stood up isolated Python 3.12.6 virtual environment (`D:\Trade\eval_ml4t_venv`) on Windows 11 64-bit without modifying the primary project `.venv` or `pyproject.toml`.
+  - Conducted complete source-code audit of ML4T backtest modules (`engine`, `broker`, `execution`, `models`, `accounting`, `datafeed`, `risk`, `calendar`).
+  - Audited comparative architecture of QuantConnect/LEAN (`IFillModel`, `ISlippageModel`, `IFeeModel`, `CashBook`, `MarginCallModel`).
+- **Domain Adapter Prototype (`research/backtest_evaluation/adapter.py`)**:
+  - Implemented `bars_to_polars_feed()`: converts immutable domain `Bar` sequences with UTC timestamps into Polars DataFrames for ML4T `DataFeed`, supporting top-of-book quotes.
+  - Implemented `RiskEnforcingStrategy`: wraps ML4T strategy execution with pre-trade `RiskEngine.evaluate_order()` validation, validating monetary risk, position ceiling, and drawdown limits before delegating to the broker.
+  - Implemented `extract_standardized_output()`: normalizes backtest results into `StandardizedBacktestOutput`, separating open vs closed trades and deriving exact cash, equity, commission, slippage, and net P&L metrics.
+- **Empirical Test Suite (`research/backtest_evaluation/test_execution_harness.py`)**:
+  - Implemented and passed all 11 empirical verification tests covering the 8 mandatory execution vectors:
+    1. **Case A (Chronological Execution)**: Verified `ExecutionMode.NEXT_BAR` executes signals from bar $t$ on bar $t+1$ Open. Demonstrated look-ahead bias inherent in `SAME_BAR` close execution.
+    2. **Case B (Bid/Ask Quote Routing)**: Verified `ExecutionPrice.QUOTE_SIDE` routes BUY orders to Ask price and SELL orders to Bid price when top-of-book quotes are supplied.
+    3. **Case C (Transaction Costs)**: Verified exact mathematical deduction of fixed slippage ($0.05/share) and per-trade commission ($2.00/order) against cash and net realized P&L (-$5.00 net outcome on flat round-trip).
+    4. **Case D (Stop-Loss & Take-Profit Behavior)**: Verified realistic gap-down stop execution at bar Open price ($90.00 vs $95.00 stop level). Identified optimistic take-profit bias in naive `submit_bracket` and demonstrated conservative stop-loss-first ordering using `RuleChain`.
+    5. **Case E (Liquidity & Partial Fills)**: Verified `VolumeParticipationLimit` restricts order fills to configured percentage of bar volume (filled 20 shares out of 100 on 1,000 share order).
+    6. **Case F (Position Mark-to-Market & No Auto-Liquidation)**: Verified open positions remain marked to market in final equity without automatic profitable liquidation or closing order manufacturing.
+    7. **Case G (Multi-Currency Constraints)**: Verified that ML4T strictly enforces a single declared currency and raises `ValueError("A single cash variation account requires the same declared currency")` when mixed currency instruments are submitted in futures variation, and ignores currency in nominal 1:1 equity/forex deductions.
+    8. **Case H (Look-Ahead Protection & Immutability)**: Verified causal streaming and immutability.
+    9. **Pre-Trade Risk Engine Enforcement**: Verified authorized order was approved and executed while oversized order ($5,000 notional, breaching 5% capital risk ceiling) was intercepted and rejected with descriptive diagnostics.
+- **Framework Selection Decision**:
+  - Formally selected **Option B (Native Event-Driven Backtesting Engine)**. Detailed evaluation report and decision matrix documented in `docs/BACKTEST_EVALUATION.md`.
+- **Roadmap & Architecture Alignment (`docs/ROADMAP.md`, `docs/ARCHITECTURE.md`)**:
+  - Reordered project roadmap so event-driven backtesting (Milestone 3) and baseline rule-based strategies (Milestone 4) strictly precede machine learning signal optimization (Milestone 5).
+  - Documented the methodological imperative: preventing the "frictionless market" mirage, calibrating the scientific measurement instrument first, and establishing empirical benchmarks against which ML models must compete.
+
+---
+
+## 2. Previous State: Milestone 2C Complete (Final Corrections to Feature Engineering)
 
 ### Milestone 2C Corrections Delivered
 - **Full-Dataset Bar-by-Bar Parity Verification (`src/hybrid_agent/features/indicators.py`, `pipeline.py`, `tests/features/test_feature_pipeline.py`)**:

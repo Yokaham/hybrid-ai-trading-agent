@@ -21,15 +21,34 @@
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Milestone 3: Machine Learning Signal Synthesis & Hyperparameter Optimization    |
-| - LightGBM probabilistic classification and regression modeling.                |
-| - Combinatorial Purged Cross-Validation (CPCV) and embargo schemes.             |
-| - Optuna study orchestration for Bayesian parameter search.                     |
+| Milestone 3: Event-Driven Backtesting Engine & Execution Simulation (ACTIVE)    |
+| - Milestone 3A: Framework evaluation (ML4T vs LEAN) & prototype (COMPLETED).    |
+| - Milestone 3B: Native event-driven simulation engine with chronological queue. |
+| - Realistic microstructure: bid/ask execution, commission, slippage, liquidity. |
+| - Conservative stop-first order matching & multi-currency CashBook accounting.  |
 +---------------------------------------------------------------------------------+
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Milestone 4: Advanced Risk Management & Capital Allocation                      |
+| Milestone 4: Baseline Rule-Based Strategies & Performance Benchmarking          |
+| - Classical rule-based strategies: Moving average crossovers, breakout channels,|
+|   and mean-reversion bands with deterministic logic.                            |
+| - Rigorous baseline benchmarking under realistic transaction friction.          |
+| - Standardized performance analytics: Sharpe, Sortino, Calmar, Max Drawdown.    |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+| Milestone 5: Machine Learning Signal Synthesis & Hyperparameter Optimization    |
+| - LightGBM probabilistic classification and regression modeling.                |
+| - Combinatorial Purged Cross-Validation (CPCV) and embargo schemes.             |
+| - Optuna study orchestration for Bayesian parameter search.                     |
+| - ML signal validation against established rule-based baselines in backtester.  |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+| Milestone 6: Multi-Asset Capital Allocation & Advanced Portfolio Risk           |
 | - Multi-currency monetary risk conversion and real-time tick value valuation.   |
 | - Dynamic volatility-adjusted position sizing (fractional Kelly / ATR scaling). |
 | - Portfolio correlation caps, multi-tier circuit breakers, and drawdowns.       |
@@ -37,15 +56,7 @@
                                        |
                                        v
 +---------------------------------------------------------------------------------+
-| Milestone 5: Event-Driven Microstructure Backtesting Harness                    |
-| - Deterministic synchronous event bus simulating clock and market ticks.        |
-| - Realistic execution friction: dynamic spreads, volume slippage, and delays.   |
-| - Quantitative performance analytics: Sharpe, Sortino, Calmar, Max Drawdown.    |
-+---------------------------------------------------------------------------------+
-                                       |
-                                       v
-+---------------------------------------------------------------------------------+
-| Milestone 6: Simulated Paper Execution & Audit Telemetry                        |
+| Milestone 7: Simulated Paper Execution & Audit Telemetry                        |
 | - Safe PaperSimulatedBroker execution engine.                                   |
 | - Structured immutable JSONL event logs and trade journal auditability.         |
 | - Real-time metrics streaming and invariant verification monitors.              |
@@ -54,9 +65,27 @@
 
 ---
 
+## Methodological Imperative: Why Backtesting & Baseline Strategies Must Precede Machine Learning
+
+In quantitative trading system design, sequence dictates scientific validity. Placing the **Event-Driven Backtesting Engine (Milestone 3)** and **Baseline Rule-Based Strategies (Milestone 4)** before **Machine Learning Signal Synthesis (Milestone 5)** is a non-negotiable methodological requirement driven by four foundational principles:
+
+### 1. Eliminating the "Frictionless Market" Mirage
+Machine learning models (such as gradient-boosted decision trees in LightGBM) and Bayesian hyperparameter optimizers (Optuna) are powerful loss-minimizing systems. If an ML model is trained or tuned against raw future price changes without realistic execution simulation (bid-ask spread, order book liquidity constraints, execution latency, commission friction, slippage, and gap-open risk), the optimizer will inevitably exploit execution illusions. It will select features and hyperparameter combinations that generate frequent, razor-thin theoretical gains that are completely destroyed once realistic friction is deducted. Grounding the evaluation pipeline in an event-driven backtesting engine ensures that any signal learned by the model survives net of all costs.
+
+### 2. Calibrating the Scientific Measurement Instrument First
+In empirical science, one does not synthesize complex experimental compounds before building and calibrating the laboratory scale. The event-driven backtester is the primary measurement instrument of the quantitative platform. If the measurement instrument is built after the predictive model, any defect, timing assumption, or look-ahead bug in the backtester will invalidate months of model training and cross-validation work. Developing the backtesting engine first guarantees that the measurement instrument is independently verified, unit-tested, and audited.
+
+### 3. Establishing Empirical Benchmark Baselines
+Machine learning introduces significant parameter complexity, non-linear dependencies, and overfitting risk. In institutional quantitative research, a machine learning strategy must never be deployed in isolation; it must explicitly demonstrate statistically significant outperformance over simpler, transparent, classical rule-based baselines (e.g., trend-following breakout channels, moving average crossovers, mean-reversion Bollinger bands) tested under identical market conditions and cost friction. Building baseline strategies in Milestone 4 establishes the performance benchmarks against which Milestone 5 ML models must be evaluated.
+
+### 4. Preventing Causal and Temporal Leakage
+Event-driven backtesting enforces strict chronological execution: signals generated at bar $t$ Close cannot execute until bar $t+1$ Open. Machine learning pipelines frequently suffer from subtle data leakage (e.g., standardizing features using full-dataset statistics, unpurged cross-validation splits, or executing at the same bar's close price). Building the event-driven engine first provides a battle-tested streaming harness that verifies that features and predictions are calculated strictly causally before being submitted to the broker.
+
+---
+
 ## Detailed Milestone Specifications
 
-### Milestone 1: Foundation, Core Domain, & Governance (Current Status: Verified)
+### Milestone 1: Foundation, Core Domain, & Governance (Status: Verified & Accepted)
 - GitHub repository established: `Yokaham/hybrid-ai-trading-agent` with Apache-2.0 license.
 - Comparative research register evaluating 8 major quant engines against our architecture.
 - Domain model validation: Timezone-aware UTC enforcement, strict OHLC invariants, bid/ask spread checks.
@@ -65,7 +94,7 @@
 - Separation of gross position notional from monetary downside risk at stop-loss.
 - Zero-tolerance regulatory enforcement regarding unauthorized offshore platforms (FEMA / RBI Alert List).
 
-### Milestone 2: Market Data Infrastructure & Feature Engineering (Current Status: Verified & Corrected in Milestones 2A, 2B & 2C)
+### Milestone 2: Market Data Infrastructure & Feature Engineering (Status: Verified & Accepted in Milestones 2A, 2B & 2C)
 - Abstract provider interfaces: `MarketDataProvider`, `HistoricalMarketDataProvider`, `LiveMarketDataProvider` with typed error mechanisms (`ProviderConnectionError`, `ProviderError`).
 - Deterministic offline mock provider with Geometric Brownian Motion (`MockHistoricalDataProvider`, `MockLiveMarketDataProvider`).
 - Real-world historical data adapter for exploratory research using Yahoo Finance (`YahooFinanceHistoricalProvider`) with exact interval filtering, original value preservation without price manufacturing, and documented limitations.
@@ -82,20 +111,43 @@
 - Per-observation volume availability handling across batch and incremental engines.
 - Dual-mode `FeaturePipeline`: Complete mathematical parity across all 20 indicator columns between batch vectorised transform and `StatefulIncrementalFeatureEngine` ($O(1)$ updates and state rebuilding on revisions). Proven zero lookahead bias verified through future-mutation unit tests. Configurable HV annualization factor dynamically tracked in registry.
 
-### Milestone 3: Machine Learning Modeling & Tuning
-- Feature transformations and stationary representation.
-- LightGBM training pipelines with combinatorial purged cross-validation.
-- Optuna Bayesian optimization studies for hyperparameter tuning.
+### Milestone 3: Event-Driven Backtesting Engine & Microstructure Simulation (Status: Active — Milestone 3A Completed)
+- **Milestone 3A (Framework Evaluation & Prototype)**:
+  - Isolated evaluation of `ml4t-backtest` and `QuantConnect/LEAN`.
+  - Comprehensive empirical execution harness testing 8 mandatory vectors (Cases A through H).
+  - Pre-trade `RiskEngine` enforcement prototype.
+  - Framework selection decision: Option B (Native event-driven engine).
+- **Milestone 3B (Native Event-Driven Engine Implementation)**:
+  - Pure Python deterministic event engine operating on domain `Bar`, `Tick`, `Order`, `InstrumentSpecification`.
+  - Chronological execution queue enforcing next-bar open execution (`ExecutionMode.NEXT_BAR`) with zero look-ahead bias.
+  - Realistic fill models: Bid/ask quote routing (Buy on Ask, Sell on Bid), volume participation limits, gap-open stop execution.
+  - Conservative stop-first order matching for bracket and simultaneous stop/take-profit triggers.
+  - Multi-currency CashBook with fail-closed currency conversion.
+  - Position mark-to-market and accounting reconciliation without artificial end-of-data liquidation.
 
-### Milestone 4: Advanced Risk Management & Sizing
-- Full dynamic position sizer incorporating ATR volatility and stop-loss distance.
+### Milestone 4: Baseline Rule-Based Strategies & Performance Benchmarking
+- Implementation of transparent, classical quantitative strategies:
+  - Dual Moving Average Crossover (trend-following).
+  - Donchian Channel / Turtle Breakout (momentum).
+  - Bollinger Band Mean-Reversion with volatility filter.
+- Standardized quantitative reporting: Sharpe Ratio, Sortino Ratio, Calmar Ratio, Maximum Drawdown, Profit Factor, Win Rate, Average Trade Expectancy.
+- Parameter sensitivity analysis and stability heatmaps.
+- Establishment of benchmark performance hurdles for future ML evaluation.
+
+### Milestone 5: Machine Learning Signal Synthesis & Hyperparameter Optimization
+- Feature scaling, transformation, and stationary representation.
+- LightGBM probabilistic classification and regression modeling.
+- Combinatorial Purged Cross-Validation (CPCV) with embargo windows to eliminate temporal leakage.
+- Optuna Bayesian optimization studies with objective functions tied to net risk-adjusted returns from the Milestone 3 backtesting engine.
+- Benchmark comparison: Verifying that ML models deliver statistically significant alpha over Milestone 4 rule-based baselines net of all transaction costs.
+
+### Milestone 6: Multi-Asset Capital Allocation & Advanced Portfolio Risk
+- Full dynamic position sizing incorporating ATR volatility and stop-loss distance.
 - Multi-currency live currency conversion for account currency harmonization.
-- Real-time portfolio exposure and correlation matrix monitoring.
+- Real-time portfolio exposure, sector concentration, and correlation matrix monitoring.
+- Multi-tier circuit breakers, trailing drawdowns, and portfolio-level risk limits.
 
-### Milestone 5: Microstructure Backtesting
-- Event-driven deterministic backtest runner.
-- Order fill simulation with bid-ask spread models and volume-weighted slippage.
-
-### Milestone 6: Paper Execution & Observability
+### Milestone 7: Simulated Paper Execution & Audit Telemetry
 - Isolated paper trading broker adapter.
 - Audit logging, telemetry, and live paper execution safety reporting.
+- Immutable JSONL trade journal and reconciliation monitors.
