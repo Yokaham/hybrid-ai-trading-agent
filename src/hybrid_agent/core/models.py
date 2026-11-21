@@ -2,6 +2,7 @@
 
 import math
 from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -12,6 +13,7 @@ from hybrid_agent.core.constants import (
     OrderStatus,
     OrderType,
     OrderValidationError,
+    ValuationModel,
 )
 
 
@@ -94,7 +96,7 @@ class Bar(BaseModel, frozen=True):
 
 
 class InstrumentSpecification(BaseModel, frozen=True):
-    """Explicit market instrument trading specification."""
+    """Explicit market instrument trading specification and valuation metadata."""
 
     symbol: str
     tick_size: float = Field(gt=0.0)
@@ -105,6 +107,7 @@ class InstrumentSpecification(BaseModel, frozen=True):
     profit_currency: str = Field(default="USD", min_length=3, max_length=5)
     quote_currency: str = Field(default="USD", min_length=3, max_length=5)
     base_currency: str = Field(default="USD", min_length=3, max_length=5)
+    valuation_model: ValuationModel = Field(default=ValuationModel.LINEAR)
 
     @model_validator(mode="after")
     def validate_spec_invariants(self) -> "InstrumentSpecification":
@@ -165,6 +168,18 @@ class Order(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_initialized", False) and name == "status":
+            raise InvalidOrderStateTransitionError(
+                "Direct mutation of order 'status' is prohibited. "
+                "Use order.transition_to(new_status) to enforce validated lifecycle rules."
+            )
+        super().__setattr__(name, value)
+
     @field_validator("created_at", "updated_at")
     @classmethod
     def check_utc(cls, v: datetime) -> datetime:
@@ -174,7 +189,7 @@ class Order(BaseModel):
     def validate_directional_prices(self) -> "Order":
         ref_price = self.limit_price
 
-        # Directional validation for stop loss
+        # Directional validation for stop loss when limit price is defined
         if self.stop_loss_price is not None:
             if self.stop_loss_price <= 0.0:
                 raise ValueError("stop_loss_price must be positive")
@@ -188,7 +203,7 @@ class Order(BaseModel):
                         f"Directional Error: SELL stop_loss_price ({self.stop_loss_price}) must be strictly above entry price ({ref_price})"
                     )
 
-        # Directional validation for take profit
+        # Directional validation for take profit when limit price is defined
         if self.take_profit_price is not None:
             if self.take_profit_price <= 0.0:
                 raise ValueError("take_profit_price must be positive")
@@ -210,9 +225,9 @@ class Order(BaseModel):
             raise InvalidOrderStateTransitionError(
                 f"Illegal order lifecycle transition from '{self.status.value}' to '{new_status.value}'"
             )
-        self.status = new_status
+        super().__setattr__("status", new_status)
         now = timestamp if timestamp is not None else datetime.now(UTC)
-        self.updated_at = validate_utc_timestamp(now)
+        super().__setattr__("updated_at", validate_utc_timestamp(now))
 
     def validate_against_instrument(self, spec: InstrumentSpecification) -> None:
         """Validates order specifications against an instrument specification."""
@@ -230,7 +245,10 @@ class Order(BaseModel):
 
 
 class Position(BaseModel):
-    """Open position entity separating gross notional exposure from monetary downside risk."""
+    """
+    Open position entity separating gross notional exposure from monetary downside risk.
+    Assumes linear payoff structure (Spot / Cash Equity / Direct Forex).
+    """
 
     symbol: str
     side: OrderSide
@@ -244,17 +262,20 @@ class Position(BaseModel):
 
     @property
     def notional_value(self) -> float:
-        """Gross exposure of the open position."""
+        """
+        Gross exposure of the open position under linear valuation assumption:
+        Notional = Quantity * CurrentPrice * ContractSize.
+        """
         return self.quantity * self.current_price * self.contract_size
 
     @property
     def monetary_risk(self) -> float:
         """
-        Quantifies downside monetary capital at risk.
-        If a stop_loss_price is established, risk is bounded by |entry - stop_loss| * qty * contract_size.
-        If unhedged without a stop loss:
-          - For BUY: Full downside notional (entry price to 0)
-          - For SELL: Notional at risk (unbounded theoretically, returns full entry notional baseline)
+        Quantifies downside monetary capital at risk under linear valuation assumption.
+        If a stop_loss_price is established: |entry - stop_loss| * qty * contract_size.
+        If unhedged:
+          - For BUY: Total entry notional (entry price to 0)
+          - For SELL: Notional baseline (unbounded theoretically, returns full entry notional baseline)
         """
         if self.stop_loss_price is not None:
             price_delta = abs(self.average_entry_price - self.stop_loss_price)

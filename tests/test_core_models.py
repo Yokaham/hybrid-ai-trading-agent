@@ -11,6 +11,7 @@ from hybrid_agent.core.constants import (
     OrderStatus,
     OrderType,
     OrderValidationError,
+    ValuationModel,
 )
 from hybrid_agent.core.events import MarketTickEvent
 from hybrid_agent.core.models import Bar, InstrumentSpecification, Order, Position, Tick
@@ -29,6 +30,7 @@ class TestCoreModels(unittest.TestCase):
             profit_currency="USD",
             quote_currency="USD",
             base_currency="EUR",
+            valuation_model=ValuationModel.LINEAR,
         )
 
     # 1. Timestamps: Timezone-aware UTC enforcement
@@ -266,7 +268,7 @@ class TestCoreModels(unittest.TestCase):
             )
         self.assertIn("Directional Error", str(ctx.exception))
 
-    # 6. Order State Transitions
+    # 6. Order State Transitions & Direct Mutation Prevention
     def test_valid_order_state_transitions(self) -> None:
         order = Order(
             id="ord-lifecycle",
@@ -315,6 +317,30 @@ class TestCoreModels(unittest.TestCase):
         # Cannot transition out of terminal FILLED state
         with self.assertRaises(InvalidOrderStateTransitionError):
             order.transition_to(OrderStatus.CANCELLED)
+
+    def test_direct_order_status_mutation_is_blocked(self) -> None:
+        """Proves that direct assignment to order.status raises an exception."""
+        order = Order(
+            id="ord-direct-mut",
+            symbol="EURUSD",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=1.0,
+            limit_price=1.0850,
+            created_at=self.now_utc,
+            updated_at=self.now_utc,
+        )
+        # Attempt direct status mutation
+        with self.assertRaises(InvalidOrderStateTransitionError) as ctx:
+            order.status = OrderStatus.APPROVED
+        self.assertIn("Direct mutation of order 'status' is prohibited", str(ctx.exception))
+
+        with self.assertRaises(InvalidOrderStateTransitionError) as ctx:
+            order.status = OrderStatus.FILLED
+        self.assertIn("Direct mutation of order 'status' is prohibited", str(ctx.exception))
+
+        # Status must remain PENDING_RISK
+        self.assertEqual(order.status, OrderStatus.PENDING_RISK)
 
     # 7. Position Notional vs Monetary Risk Separation
     def test_position_notional_and_monetary_risk_separation(self) -> None:

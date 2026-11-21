@@ -2,11 +2,14 @@
 
 from hybrid_agent.core.constants import (
     ALLOWED_ORDER_TRANSITIONS,
+    CurrencyConversionError,
     InvalidOrderStateTransitionError,
     OrderSide,
     OrderStatus,
     OrderType,
     OrderValidationError,
+    UnsupportedValuationModelError,
+    ValuationModel,
 )
 from hybrid_agent.core.models import (
     Bar,
@@ -20,6 +23,7 @@ from hybrid_agent.core.models import (
 __all__ = [
     "ALLOWED_ORDER_TRANSITIONS",
     "Bar",
+    "CurrencyConversionError",
     "InstrumentSpecification",
     "InvalidOrderStateTransitionError",
     "Order",
@@ -29,5 +33,7 @@ __all__ = [
     "OrderValidationError",
     "Position",
     "Tick",
+    "UnsupportedValuationModelError",
+    "ValuationModel",
     "validate_utc_timestamp",
 ]
