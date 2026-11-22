@@ -131,3 +131,11 @@ We formally recommend **Option B**: Build our native execution engine within the
      - Explicit commission calculation with mandatory `commission_currency`.
    - **Temporal Guard**:
      - Strict assertion that $T_{\text{execution}} \ge T_{\text{submission}} \ge T_{\text{signal}}$.
+
+
+---
+
+## 5. Specifications & Evidence Documents
+
+- Complete architectural specifications for Milestone 3B.4 are detailed in [`native_execution_specification.md`](native_execution_specification.md).
+- The detailed evidentiary review and audit of all candidates is documented in [`final_evidence_review.md`](final_evidence_review.md).

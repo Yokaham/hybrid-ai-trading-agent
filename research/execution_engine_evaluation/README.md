@@ -1,6 +1,6 @@
 # Milestone 3B.4A — Execution Engine Evaluation & Integration Prototype
 
-This directory contains the independent evaluation, source analysis, and integration prototype for **Milestone 3B.4A** of the Hybrid AI Trading Agent project.
+This directory contains the independent evaluation, empirical runtime tests, source code analysis, and integration prototype for **Milestone 3B.4A** of the Hybrid AI Trading Agent project.
 
 ---
 
@@ -31,27 +31,28 @@ No changes were made to the root `pyproject.toml`, main virtual environment, or 
 
 ---
 
-## 3. Documents in this Evaluation
+## 3. Directory Structure & Key Documents
 
 | Document | Purpose & Scope |
 | :--- | :--- |
-| [`candidate_comparison.md`](candidate_comparison.md) | In-depth source code analysis of LEAN, Zipline Reloaded, QSTrader, Backtrader, and bt across 12 criteria (licensing, matching models, partial fills, slippage, and integration complexity). |
-| [`nautilus_integration_pilot.md`](nautilus_integration_pilot.md) | Empirical evaluation of NautilusTrader 1.231.0: installation telemetry, execution tests (Market, Limit, Stop, Partial Fills, Liquidity, Determinism, Temporal Causality), and our prototype translation adapter. |
-| [`architecture_recommendation.md`](architecture_recommendation.md) | Synthesis of findings and formal recommendation (Option B: Native FillEngine with adapted Apache-2.0 models). |
+| [`final_evidence_review.md`](final_evidence_review.md) | **Authoritative Evidence Audit**: Categorizes every claim into Genuine Runtime Tests, Synthetic Checks, Architectural Inferences, and Unverified Capabilities. |
+| [`native_execution_specification.md`](native_execution_specification.md) | **Pre-Implementation Specification (Milestone 3B.4)**: Component contracts, `OrderExecutionState` wrapper, OCO brackets, child order scaling, FillEngine matching rules, and 10 core constraints. |
+| [`nautilus_integration_pilot.md`](nautilus_integration_pilot.md) | Detailed report on NautilusTrader 1.231.0 installation, runtime matching telemetry, and impedance mismatches. |
+| [`candidate_comparison.md`](candidate_comparison.md) | In-depth source code analysis of LEAN, Zipline Reloaded, QSTrader, Backtrader, and bt across 12 institutional criteria. |
+| [`architecture_recommendation.md`](architecture_recommendation.md) | Strategic decision matrix and formal recommendation (Option B: Native FillEngine and OrderManager). |
+| [`harness/test_nautilus_execution.py`](harness/test_nautilus_execution.py) | Verified evaluation harness running genuine NautilusTrader 1.231.0 `BacktestEngine` tests in `eval_nautilus_venv`. |
+| [`harness/test_adapter_prototype.py`](harness/test_adapter_prototype.py) | Hardened integration prototype demonstrating execution message translation and transactional portfolio invariant protection. |
 
 ---
 
 ## 4. Reproducing the Evaluation Harness
 
-To execute the NautilusTrader pilot and integration prototype:
+To execute the NautilusTrader runtime tests and integration prototype:
 
 ```powershell
-# 1. Activate isolated evaluation environment
-D:\Trade\eval_nautilus_venv\Scripts\Activate.ps1
+# 1. Run the isolated NautilusTrader 1.231.0 runtime test suite
+D:\Trade\eval_nautilus_venv\Scripts\python.exe research/execution_engine_evaluation/harness/test_nautilus_execution.py
 
-# 2. Run the isolated execution test harness
-python research/execution_engine_evaluation/harness/test_nautilus_execution.py
-
-# 3. Run the event adapter integration prototype
-python research/execution_engine_evaluation/harness/test_adapter_prototype.py
+# 2. Run the integration adapter prototype with transactional invariant verification
+.\.venv\Scripts\python.exe research/execution_engine_evaluation/harness/test_adapter_prototype.py
 ```

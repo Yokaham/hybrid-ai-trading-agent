@@ -20,62 +20,40 @@ Installing `nautilus_trader==1.231.0` pulls in 12 third-party dependencies:
 - `pytz`, `tzdata`, `python-dateutil`, `click`, `tqdm`
 
 **Observed Installation Behavior**:
-- Windows 11 / Python 3.12 wheel is pre-compiled and installs without requiring a local Rust toolchain or MSVC build environment.
+- Windows 11 / Python 3.12 wheel is pre-compiled and installs cleanly.
 - However, the binary wheel is exceptionally large (~112.8 MB compressed, expanding to >280 MB on disk).
 - Network installation on Windows requires care to avoid standard pip download pipe stalling on large assets.
 - Imports work cleanly in the dedicated Python 3.12.6 environment.
 
 ---
 
-## 2. Execution Capabilities Evaluation (Capabilities A – G)
+## 2. Evidentiary Audit: Runtime Execution vs. Synthetic Checks
 
-Using synthetic market data and isolated simulation harnesses, we evaluated NautilusTrader's execution mechanics against our institutional trading requirements.
+The evaluation distinguishes between:
+1. **GENUINE RUNTIME TESTS**: Executed directly against NautilusTrader 1.231.0 `BacktestEngine`, `OrderMatchingEngine`, and `SimulatedExchange` in `D:\Trade\eval_nautilus_venv`.
+2. **SYNTHETIC SANITY CHECKS**: Mathematical formulas and invariant validations evaluated outside the engine (such as non-linear volume share impact).
+3. **ARCHITECTURALLY INFERRED**: Structural properties identified through source code inspection.
+4. **UNVERIFIED**: Capabilities not testable with available L1 top-of-book data.
 
-### A. Market Execution
-- **Behavior**: Market BUY orders match against the best available Ask quote; Market SELL orders match against the best available Bid quote.
-- **Timestamps**: Execution timestamps inherit the exact timestamp of the matching quote/tick.
-- **Displayed Size Constraint**: In standard book mode, when available displayed quote size is smaller than order size ($Q_{\text{order}} > Q_{\text{ask}}$), the fill is capped at $Q_{\text{ask}}$ with the remainder left open.
-- **Verified vs. Assumption**: Verified that market orders fill against opposite L1 quotes rather than mid-price or previous bar closes.
+For the full line-by-line evidentiary audit, see [`final_evidence_review.md`](final_evidence_review.md).
 
-### B. Limit Execution
-- **Marketable Limits**: A Limit Buy with $P_{\text{limit}} \ge P_{\text{ask}}$ fills immediately at $P_{\text{ask}}$ (price improvement over the limit).
-- **Resting Limits**: Non-marketable limits are inserted into the simulated exchange book.
-- **Crossing / Becoming Executable**: When subsequent quote updates cross the limit price ($P_{\text{ask}} \le P_{\text{limit}}$ for buys; $P_{\text{bid}} \ge P_{\text{limit}}$ for sells), the order is matched.
-- **Unfilled Limits**: Limits that are never crossed remain resting in the order book until cancelled or simulation end.
+### Capability Assessment Summary
 
-### C. Stop Execution
-- **NautilusTrader Model**: NautilusTrader 1.x models stop orders via `StopMarketOrder` and `StopLimitOrder`.
-- **Trigger vs. Execution**: Evaluates trigger conditions against market events. Once the trigger price is breached ($P_{\text{market}} \le P_{\text{stop}}$ for sell stop; $P_{\text{market}} \ge P_{\text{stop}}$ for buy stop), the order triggers and transitions to market execution.
-- **Comparison with Our Domain Model**:
-  - Our core domain model represents stops as `OrderType.STOP_LOSS` with `stop_loss_price`.
-  - In NautilusTrader, a Stop Loss is a separate `StopMarketOrder` linked via contingent bracket IDs.
-  - The separation of trigger evaluation from execution matching is identical to our planned `FillEngine` architecture.
-
-### D. Partial Execution
-- **Volume & Sizing**: When order size exceeds immediately available liquidity, NautilusTrader produces partial execution messages.
-- **Quantity Tracking**:
-  - `last_qty`: Amount executed in this fill.
-  - `leaves_qty`: Amount remaining open to execute.
-  - `cum_qty`: Cumulative amount executed to date.
-- **Invariant**: $Q_{\text{cum}} \le Q_{\text{orig}}$ is strictly maintained.
-- **Cancellation of Remainder**: Cancelling an order with $Q_{\text{leaves}} > 0$ cancels only the remainder; executed partial positions are immutable and preserved.
-
-### E. Liquidity and Slippage
-- **Quote-Size Consumption**: In `SimulatedExchange`, filled quotes can consume displayed depth so subsequent orders in the same tick cannot reuse already filled liquidity.
-- **Bar Capacity**: In bar-only mode, NautilusTrader relies on bar pricing, but fine-grained volume-share slippage (e.g. participation caps like Zipline's `VolumeShareSlippage`) requires custom execution model plugins.
-- **Missing / Zero Liquidity**: When liquidity is zero, market orders fail to fill and either reject or remain pending, matching realistic venue conditions.
-
-### F. Determinism
-- **Replay Consistency**: Given identical data streams and configurations, the simulation produces bit-for-bit identical executions and event sequences.
-- **Random Seeds**: Deterministic fill models are strictly preferred over probabilistic models.
-
-### G. Temporal Correctness
-- **Event Causality**: Orders submitted at timestamp $T_{\text{sub}}$ cannot execute against ticks or bars where $T_{\text{event}} < T_{\text{sub}}$.
-- **Bar Boundary Rule**: A completed historical bar with interval $[T_{\text{start}}, T_{\text{end}}]$ only becomes available to strategy callbacks at $T_{\text{end}}$. Orders generated from that bar cannot retrospectively execute against that bar's Open or Close.
+| Capability | Category | Empirical Result in NautilusTrader 1.231.0 |
+| :--- | :--- | :--- |
+| **Market Orders vs L1 Quotes** | GENUINE RUNTIME TEST | **VERIFIED**: Market BUY filled at Ask ($150.10); Qty=10; timestamp preserved. |
+| **Limit Orders (Resting / Crossing)** | GENUINE RUNTIME TEST | **VERIFIED**: Resting BUY limit held at $t_0$ ($150.10 Ask); executed at $t_1$ when Ask crossed to $149.00. |
+| **Stop-Market Triggering** | GENUINE RUNTIME TEST | **VERIFIED**: Stop BUY ($150.50) held untriggered at $t_0$; triggered and filled at breached Ask ($150.70) at $t_1$. |
+| **Partial Execution & Leaves Qty** | GENUINE RUNTIME TEST | **VERIFIED**: Order of 100 shares matched against quote size 40 with `liquidity_consumption=True`. Fill 1: qty=40, `leaves_qty=60`, status=`PARTIALLY_FILLED`. Fill 2: qty=60, `leaves_qty=0`, status=`FILLED`. |
+| **Liquidity Consumption (L1)** | GENUINE RUNTIME TEST | **VERIFIED**: Displayed quote size was consumed on fill; subsequent iterations at the same timestamp could not reuse depleted liquidity. |
+| **Deterministic Replay** | GENUINE RUNTIME TEST | **VERIFIED**: Sequential passes produced bit-for-bit identical executions, trade IDs (`T-e649a477ad160053-001`), prices, and quantities. |
+| **Volume-Share Slippage on Bars** | SYNTHETIC SANITY CHECK | **EXTERNAL MODEL**: Nautilus does not model volume share impact out-of-the-box. Verified mathematically outside engine. |
+| **Temporal Causality Invariants** | SYNTHETIC SANITY CHECK | **VALIDATED**: Invariants ($T_{\text{exec}} \ge T_{\text{sub}} \ge T_{\text{signal}}$, $T_{\text{avail}} \ge T_{\text{end}}$) verified. |
+| **Exchange Queue Position** | UNVERIFIED | **NOT FEASIBLE**: Requires full L2/L3 order book depth and continuous trade prints. |
 
 ---
 
-## 3. Integration Prototype: NautilusTrader to Authoritative Portfolio
+## 3. Integration Prototype: Message Translation & Portfolio Invariance
 
 ### 3.1 Architectural Barrier: Dual Portfolio Prevention
 
@@ -83,15 +61,15 @@ NautilusTrader is designed as an all-in-one framework where the `SimulatedExchan
 
 **Our Core Constraint**: Our custom multi-currency `Portfolio` (CashBook, AccountingLedger, PositionTracker) must remain the **sole authoritative accounting system**. Maintaining two parallel portfolios would introduce synchronization drift, differing rounding semantics, and severe bugs.
 
-### 3.2 The Prototype Translation Adapter
+### 3.2 The Conceptual Translation Prototype
 
-We designed and verified an event translation adapter (`NautilusEventAdapter` in `harness/test_adapter_prototype.py`) that demonstrates how external execution messages map into our native domain models:
+We implemented and hardened a translation prototype (`NautilusEventAdapter` in `harness/test_adapter_prototype.py`) demonstrating that execution messages can map into our native domain models:
 
 ```mermaid
 sequenceDiagram
     participant MarketData as Market Data Feed
-    participant Engine as NautilusTrader Matcher
-    participant Adapter as NautilusEventAdapter
+    participant Engine as External Matcher
+    participant Adapter as Event Adapter Prototype
     participant Core as Order & EventQueue
     participant Portfolio as Authoritative Portfolio
 
@@ -99,7 +77,7 @@ sequenceDiagram
     Core->>Engine: Submit Order (ID, Symbol, Qty)
     Engine->>Engine: Match & Generate OrderFilled Message
     Engine->>Adapter: OrderFilled (last_px, last_qty, leaves_qty, ts_ns)
-    Adapter->>Adapter: Validate Invariants (Qty, Timestamps)
+    Adapter->>Adapter: Validate Invariants (CumQty, LeavesQty, Side, FeeCurrency)
     alt leaves_qty > 0
         Adapter->>Portfolio: OrderPartiallyFilledEvent
     else leaves_qty == 0
@@ -108,7 +86,7 @@ sequenceDiagram
     Portfolio->>Portfolio: apply_fill() (Atomic Cash, Ledger, Position update)
 ```
 
-### 3.3 Prototype Verification Results
+### 3.3 Prototype Invariant Verification Results
 
 The prototype adapter was verified in `harness/test_adapter_prototype.py` against our production `Portfolio`:
 1. **Partial Fill Translation**:
@@ -122,12 +100,18 @@ The prototype adapter was verified in `harness/test_adapter_prototype.py` agains
    - Applied to `Portfolio.apply_fill()`: Held 100 shares with weighted average entry price $\$150.60$.
 3. **Portfolio Mark to Market**:
    - Marked at $\$155.00$: Total equity calculated accurately at $\$100,435.00$ with zero ledger leakage.
+4. **Hardened Invariant Enforcement**:
+   - Rejects inconsistent cumulative quantity ($\text{cum\_qty} \neq \text{prev} + \text{last\_qty}$).
+   - Rejects inconsistent leaves quantity ($\text{leaves\_qty} \neq \text{orig} - \text{cum\_qty}$).
+   - Rejects instrument identity or side mismatches.
+   - Rejects missing commission currency when fee > 0.
+   - Enforces transactional rollback: internal state is not mutated if event validation fails.
+   - Enforces exact integer nanosecond-to-microsecond UTC timestamp conversion.
+   - Translates cancellation with required `reason` string.
 
 ---
 
 ## 4. Impedance Mismatches & Findings
-
-While the adapter prototype proves that translation is technically possible, deep evaluation revealed several fundamental impedance mismatches:
 
 1. **License Barrier (LGPL-3.0 vs. Apache-2.0)**:
    - NautilusTrader is licensed under LGPL-3.0.
@@ -141,8 +125,9 @@ While the adapter prototype proves that translation is technically possible, dee
 
 ---
 
-## 5. Conclusion
+## 5. Conclusion & Recommendation
 
-NautilusTrader provides a highly capable matching engine, and our adapter prototype confirms that its fill events can be mapped into our authoritative `Portfolio`. However, due to LGPL-3.0 licensing constraints, dependency bloat (~113 MB binary wheel), and internal portfolio coupling, adopting NautilusTrader as a dependency is **not recommended**. 
+NautilusTrader provides an excellent matching engine for L1 quote ticks. However, due to LGPL-3.0 licensing constraints, dependency bloat (~113 MB binary wheel), and internal portfolio coupling, adopting NautilusTrader as a dependency is **rejected**.
 
-Instead, our native `FillEngine` (Milestone 3B.4) will implement the verified matching semantics directly in pure Python 3.12 under Apache-2.0.
+Instead, we recommend **Option B**: implement our own native `FillEngine` and `OrderManager` in Milestone 3B.4, adopting the institutional execution models of QuantConnect LEAN and Zipline under Apache-2.0.
+Full architectural specifications are detailed in [`native_execution_specification.md`](native_execution_specification.md).
