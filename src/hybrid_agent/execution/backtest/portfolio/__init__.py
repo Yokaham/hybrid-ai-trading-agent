@@ -23,6 +23,7 @@ from hybrid_agent.execution.backtest.portfolio.portfolio import (
 )
 from hybrid_agent.execution.backtest.portfolio.positions import (
     AccountingClassification,
+    InstrumentAccountingIdentity,
     OversellingError,
     PositionAccountingModel,
     PositionFillResult,
@@ -38,6 +39,7 @@ __all__ = [
     "ConversionResult",
     "DuplicateFXObservationError",
     "FXRateObservation",
+    "InstrumentAccountingIdentity",
     "InsufficientFundsError",
     "LedgerEntry",
     "LedgerEntryType",

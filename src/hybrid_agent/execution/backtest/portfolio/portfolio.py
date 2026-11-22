@@ -24,6 +24,7 @@ from hybrid_agent.execution.backtest.portfolio.ledger import (
 )
 from hybrid_agent.execution.backtest.portfolio.positions import (
     AccountingClassification,
+    InstrumentAccountingIdentity,
     PositionTracker,
 )
 
@@ -57,6 +58,25 @@ class Portfolio:
         self.cashbook = cashbook if cashbook is not None else CashBook()
         self.ledger = ledger if ledger is not None else AccountingLedger()
         self.positions = positions if positions is not None else PositionTracker()
+
+    def register_instrument(
+        self,
+        symbol: str,
+        accounting_classification: AccountingClassification,
+        quote_currency: str,
+        profit_currency: str,
+    ) -> InstrumentAccountingIdentity:
+        """Register established accounting identity for an instrument."""
+        return self.positions.register_instrument(
+            symbol=symbol,
+            accounting_classification=accounting_classification,
+            quote_currency=quote_currency,
+            profit_currency=profit_currency,
+        )
+
+    def get_instrument_identity(self, symbol: str) -> InstrumentAccountingIdentity | None:
+        """Retrieve established accounting identity for a symbol, if any."""
+        return self.positions.get_instrument_identity(symbol)
 
     def initialize_cash(
         self,
@@ -143,26 +163,45 @@ class Portfolio:
         timestamp = validate_utc_timestamp(event.timestamp)
         ref_id = event.order.id or f"fill-{timestamp.isoformat()}"
 
-        # 1. Upfront consistency validation against existing open position
-        existing_pos = self.positions.get_record(symbol)
-        if existing_pos is not None and not existing_pos.is_closed:
-            if existing_pos.accounting_classification != acct_type:
+        # 1. Upfront consistency validation against established instrument identity or open position
+        norm_quote = CashBook.normalize_currency(spec.quote_currency)
+        norm_profit = CashBook.normalize_currency(spec.profit_currency)
+        identity = self.positions.get_instrument_identity(symbol)
+
+        if identity is not None:
+            if identity.accounting_classification != acct_type:
                 raise ValueError(
-                    f"Symbol '{symbol}' has an open position with classification "
-                    f"'{existing_pos.accounting_classification.value}' and cannot accept fills with '{acct_type.value}'."
+                    f"Symbol '{symbol}' has established accounting classification "
+                    f"'{identity.accounting_classification.value}' and cannot accept fills with '{acct_type.value}'."
                 )
-            norm_quote = CashBook.normalize_currency(spec.quote_currency)
-            if existing_pos.quote_currency != norm_quote:
+            if identity.quote_currency != norm_quote:
                 raise ValueError(
-                    f"Symbol '{symbol}' quote currency mismatch: open position uses "
-                    f"'{existing_pos.quote_currency}', fill specified '{norm_quote}'."
+                    f"Symbol '{symbol}' quote currency mismatch: established identity uses "
+                    f"'{identity.quote_currency}', fill specified '{norm_quote}'."
                 )
-            norm_profit = CashBook.normalize_currency(spec.profit_currency)
-            if existing_pos.profit_currency != norm_profit:
+            if identity.profit_currency != norm_profit:
                 raise ValueError(
-                    f"Symbol '{symbol}' profit currency mismatch: open position uses "
-                    f"'{existing_pos.profit_currency}', fill specified '{norm_profit}'."
+                    f"Symbol '{symbol}' profit currency mismatch: established identity uses "
+                    f"'{identity.profit_currency}', fill specified '{norm_profit}'."
                 )
+        else:
+            existing_pos = self.positions.get_record(symbol)
+            if existing_pos is not None:
+                if existing_pos.accounting_classification != acct_type:
+                    raise ValueError(
+                        f"Symbol '{symbol}' has an open position with classification "
+                        f"'{existing_pos.accounting_classification.value}' and cannot accept fills with '{acct_type.value}'."
+                    )
+                if existing_pos.quote_currency != norm_quote:
+                    raise ValueError(
+                        f"Symbol '{symbol}' quote currency mismatch: open position uses "
+                        f"'{existing_pos.quote_currency}', fill specified '{norm_quote}'."
+                    )
+                if existing_pos.profit_currency != norm_profit:
+                    raise ValueError(
+                        f"Symbol '{symbol}' profit currency mismatch: open position uses "
+                        f"'{existing_pos.profit_currency}', fill specified '{norm_profit}'."
+                    )
 
         # Determine fee currency
         fee_currency: str | None = None
@@ -176,6 +215,7 @@ class Portfolio:
         ledger_seq = self.ledger._next_sequence_id
         pos_snapshot = {k: copy.deepcopy(v) for k, v in self.positions._positions.items()}
         pnl_snapshot = dict(self.positions._cumulative_realized_pnl)
+        identities_snapshot = dict(self.positions._instrument_identities)
 
         try:
             # ------------------------------------------------------------------
@@ -293,7 +333,9 @@ class Portfolio:
                 )
 
                 # CFDs do NOT debit/credit opening notional. Realized P&L is posted only upon closing.
-                if fill_res.closed_quantity > Decimal("0.0") and fill_res.realized_pnl != Decimal("0.0"):
+                if fill_res.closed_quantity > Decimal("0.0") and fill_res.realized_pnl != Decimal(
+                    "0.0"
+                ):
                     self.cashbook.apply_movement(pnl_currency, fill_res.realized_pnl)
                     self.ledger.record(
                         timestamp=timestamp,
@@ -331,6 +373,7 @@ class Portfolio:
             self.ledger._next_sequence_id = ledger_seq
             self.positions._positions = pos_snapshot
             self.positions._cumulative_realized_pnl = pnl_snapshot
+            self.positions._instrument_identities = identities_snapshot
             raise
 
     process_fill = apply_fill  # Alias
@@ -355,7 +398,9 @@ class Portfolio:
         try:
             self.cashbook.apply_movement(norm_curr, dec_amount)
             entry_type = (
-                LedgerEntryType.FINANCING_CREDIT if dec_amount >= Decimal("0.0") else LedgerEntryType.FINANCING_CHARGE
+                LedgerEntryType.FINANCING_CREDIT
+                if dec_amount >= Decimal("0.0")
+                else LedgerEntryType.FINANCING_CHARGE
             )
             self.ledger.record(
                 timestamp=utc_time,
@@ -437,7 +482,9 @@ class Portfolio:
             self.ledger._next_sequence_id = ledger_seq
             raise
 
-    def update_market_price(self, symbol: str, price: Decimal | float | str, timestamp: datetime) -> None:
+    def update_market_price(
+        self, symbol: str, price: Decimal | float | str, timestamp: datetime
+    ) -> None:
         """Update market price mark for an active position."""
         self.positions.update_mark(symbol, price, timestamp)
 
@@ -513,6 +560,10 @@ class Portfolio:
     ) -> PortfolioMarkedEvent:
         """Mark portfolio to market and construct the authoritative PortfolioMarkedEvent.
 
+        Ensures atomic execution: if any price mark or subsequent valuation fails, all
+        position marks and timestamps, cash balances, and ledger entries are rolled back
+        to their exact pre-operation state.
+
         Args:
             timestamp: Point-in-time timestamp (UTC).
             current_prices: Optional map of symbol -> latest market price.
@@ -523,63 +574,77 @@ class Portfolio:
         """
         utc_time = validate_utc_timestamp(timestamp)
 
-        # Update market marks if provided
-        if current_prices:
-            for symbol, price in current_prices.items():
-                self.update_market_price(symbol, price, utc_time)
+        # Snapshot state across PositionTracker, CashBook, and Ledger for atomic rollback
+        pos_snapshot = {k: copy.deepcopy(v) for k, v in self.positions._positions.items()}
+        cb_snapshot = dict(self.cashbook._balances)
+        ledger_entries_len = len(self.ledger._entries)
+        ledger_seq = self.ledger._next_sequence_id
 
-        # 1. Total equity in account currency (enforces historical mark causality)
-        equity_dec = self.get_total_equity(as_of=utc_time)
+        try:
+            # Update market marks if provided
+            if current_prices:
+                for symbol, price in current_prices.items():
+                    self.update_market_price(symbol, price, utc_time)
 
-        # 2. Total cash in account currency
-        total_cash_dec = Decimal("0.0")
-        for curr, balance in self.cashbook.get_all_balances().items():
-            if balance != Decimal("0.0"):
-                conv = self.currency_converter.convert(
-                    amount=balance,
-                    from_currency=curr,
-                    to_currency=self.account_currency,
-                    as_of=utc_time,
-                )
-                total_cash_dec += conv.converted_amount
+            # 1. Total equity in account currency (enforces historical mark causality)
+            equity_dec = self.get_total_equity(as_of=utc_time)
 
-        # 3. Total unrealized P&L in account currency
-        total_unrealized_dec = Decimal("0.0")
-        for rec in self.positions.get_open_records():
-            unrealized = rec.unrealized_pnl
-            if unrealized != Decimal("0.0"):
-                conv = self.currency_converter.convert(
-                    amount=unrealized,
-                    from_currency=rec.profit_currency,
-                    to_currency=self.account_currency,
-                    as_of=utc_time,
-                )
-                total_unrealized_dec += conv.converted_amount
+            # 2. Total cash in account currency
+            total_cash_dec = Decimal("0.0")
+            for curr, balance in self.cashbook.get_all_balances().items():
+                if balance != Decimal("0.0"):
+                    conv = self.currency_converter.convert(
+                        amount=balance,
+                        from_currency=curr,
+                        to_currency=self.account_currency,
+                        as_of=utc_time,
+                    )
+                    total_cash_dec += conv.converted_amount
 
-        # 4. Total cumulative realized P&L in account currency (reporting telemetry, NOT added to equity)
-        total_realized_dec = Decimal("0.0")
-        for curr, realized in self.positions.get_all_cumulative_realized_pnl().items():
-            if realized != Decimal("0.0"):
-                conv = self.currency_converter.convert(
-                    amount=realized,
-                    from_currency=curr,
-                    to_currency=self.account_currency,
-                    as_of=utc_time,
-                )
-                total_realized_dec += conv.converted_amount
+            # 3. Total unrealized P&L in account currency
+            total_unrealized_dec = Decimal("0.0")
+            for rec in self.positions.get_open_records():
+                unrealized = rec.unrealized_pnl
+                if unrealized != Decimal("0.0"):
+                    conv = self.currency_converter.convert(
+                        amount=unrealized,
+                        from_currency=rec.profit_currency,
+                        to_currency=self.account_currency,
+                        as_of=utc_time,
+                    )
+                    total_unrealized_dec += conv.converted_amount
 
-        # 5. Drawdown calculation
-        drawdown_pct = 0.0
-        if peak_equity is not None:
-            peak_dec = CashBook.validate_amount(peak_equity)
-            if peak_dec > Decimal("0.0") and equity_dec < peak_dec:
-                drawdown_pct = float((peak_dec - equity_dec) / peak_dec * Decimal("100.0"))
+            # 4. Total cumulative realized P&L in account currency (reporting telemetry, NOT added to equity)
+            total_realized_dec = Decimal("0.0")
+            for curr, realized in self.positions.get_all_cumulative_realized_pnl().items():
+                if realized != Decimal("0.0"):
+                    conv = self.currency_converter.convert(
+                        amount=realized,
+                        from_currency=curr,
+                        to_currency=self.account_currency,
+                        as_of=utc_time,
+                    )
+                    total_realized_dec += conv.converted_amount
 
-        return PortfolioMarkedEvent(
-            equity=float(equity_dec),
-            cash=float(total_cash_dec),
-            unrealized_pnl=float(total_unrealized_dec),
-            realized_pnl=float(total_realized_dec),
-            drawdown_pct=max(0.0, drawdown_pct),
-            timestamp=utc_time,
-        )
+            # 5. Drawdown calculation
+            drawdown_pct = 0.0
+            if peak_equity is not None:
+                peak_dec = CashBook.validate_amount(peak_equity)
+                if peak_dec > Decimal("0.0") and equity_dec < peak_dec:
+                    drawdown_pct = float((peak_dec - equity_dec) / peak_dec * Decimal("100.0"))
+
+            return PortfolioMarkedEvent(
+                equity=float(equity_dec),
+                cash=float(total_cash_dec),
+                unrealized_pnl=float(total_unrealized_dec),
+                realized_pnl=float(total_realized_dec),
+                drawdown_pct=max(0.0, drawdown_pct),
+                timestamp=utc_time,
+            )
+        except Exception:
+            # Atomic rollback of all position marks, timestamps, cash, and ledger
+            self.positions._positions = pos_snapshot
+            self.cashbook._balances = cb_snapshot
+            del self.ledger._entries[ledger_entries_len:]
+            self.ledger._next_sequence_id = ledger_seq
+            raise

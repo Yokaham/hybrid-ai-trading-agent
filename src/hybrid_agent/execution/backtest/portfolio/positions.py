@@ -27,6 +27,16 @@ class AccountingClassification(str, Enum):
 PositionAccountingModel = AccountingClassification
 
 
+@dataclass(frozen=True)
+class InstrumentAccountingIdentity:
+    """Immutable accounting identity establishing classification and currency configuration for an instrument."""
+
+    symbol: str
+    accounting_classification: AccountingClassification
+    quote_currency: str
+    profit_currency: str
+
+
 class OversellingError(ValueError):
     """Raised when an equity sell order exceeds the currently held long quantity."""
 
@@ -82,7 +92,12 @@ class _PositionRecord:
         if self.quantity == Decimal("0.0"):
             return Decimal("0.0")
         direction = Decimal("1.0") if self.side == OrderSide.BUY else Decimal("-1.0")
-        return (self.current_price - self.average_entry_price) * self.quantity * self.contract_size * direction
+        return (
+            (self.current_price - self.average_entry_price)
+            * self.quantity
+            * self.contract_size
+            * direction
+        )
 
     def to_domain_position(self) -> Position:
         """Convert internal Decimal state to the authoritative core domain Position model."""
@@ -138,6 +153,63 @@ class PositionTracker:
     def __init__(self) -> None:
         self._positions: dict[str, _PositionRecord] = {}
         self._cumulative_realized_pnl: dict[str, Decimal] = {}
+        self._instrument_identities: dict[str, InstrumentAccountingIdentity] = {}
+
+    def register_instrument(
+        self,
+        symbol: str,
+        accounting_classification: AccountingClassification,
+        quote_currency: str,
+        profit_currency: str,
+    ) -> InstrumentAccountingIdentity:
+        """Register or validate the immutable accounting identity for an instrument."""
+        norm_quote = CashBook.normalize_currency(quote_currency)
+        norm_profit = CashBook.normalize_currency(profit_currency)
+
+        if isinstance(accounting_classification, str):
+            val = accounting_classification.strip().upper()
+            if val in ("CFD", "LINEAR_CFD"):
+                acct = AccountingClassification.LINEAR_CFD
+            elif val in ("CASH_EQUITY", "EQUITY", "CASH_EQUITIES"):
+                acct = AccountingClassification.CASH_EQUITY
+            else:
+                raise ValueError(
+                    f"Unsupported accounting classification: {accounting_classification}"
+                )
+        else:
+            acct = accounting_classification
+
+        existing = self._instrument_identities.get(symbol)
+        if existing is not None:
+            if existing.accounting_classification != acct:
+                raise ValueError(
+                    f"Instrument '{symbol}' has established accounting classification "
+                    f"'{existing.accounting_classification.value}' and cannot be redefined as '{acct.value}'."
+                )
+            if existing.quote_currency != norm_quote:
+                raise ValueError(
+                    f"Instrument '{symbol}' has established quote currency "
+                    f"'{existing.quote_currency}' and cannot be redefined with '{norm_quote}'."
+                )
+            if existing.profit_currency != norm_profit:
+                raise ValueError(
+                    f"Instrument '{symbol}' has established profit currency "
+                    f"'{existing.profit_currency}' and cannot be redefined with '{norm_profit}'."
+                )
+            return existing
+
+        identity = InstrumentAccountingIdentity(
+            symbol=symbol,
+            accounting_classification=acct,
+            quote_currency=norm_quote,
+            profit_currency=norm_profit,
+        )
+        self._instrument_identities[symbol] = identity
+        return identity
+
+    def get_instrument_identity(self, symbol: str) -> InstrumentAccountingIdentity | None:
+        """Retrieve established accounting identity for a symbol, if any."""
+        return self._instrument_identities.get(symbol)
 
     def get_position(self, symbol: str) -> Position | None:
         """Retrieve the authoritative core domain Position for a symbol, if active."""
@@ -189,9 +261,21 @@ class PositionTracker:
         if pos is None:
             # Flat position representation
             rec = self._positions.get(symbol)
-            pnl = float(self.get_cumulative_realized_pnl(rec.profit_currency)) if rec is not None else 0.0
-            avg_px = float(rec.average_entry_price) if rec is not None and rec.average_entry_price > Decimal("0.0") else 1.0
-            curr_px = float(rec.current_price) if rec is not None and rec.current_price > Decimal("0.0") else 1.0
+            pnl = (
+                float(self.get_cumulative_realized_pnl(rec.profit_currency))
+                if rec is not None
+                else 0.0
+            )
+            avg_px = (
+                float(rec.average_entry_price)
+                if rec is not None and rec.average_entry_price > Decimal("0.0")
+                else 1.0
+            )
+            curr_px = (
+                float(rec.current_price)
+                if rec is not None and rec.current_price > Decimal("0.0")
+                else 1.0
+            )
             pos = Position(
                 symbol=symbol,
                 side=rec.side if rec is not None else OrderSide.BUY,
@@ -256,6 +340,35 @@ class PositionTracker:
         if q_dec <= Decimal("0.0"):
             raise ValueError(f"Fill quantity must be positive, got {q_dec}")
 
+        norm_quote = CashBook.normalize_currency(spec.quote_currency)
+        norm_profit = CashBook.normalize_currency(spec.profit_currency)
+
+        # Enforce stable instrument accounting identity across entire lifecycle (survives position closures)
+        identity = self._instrument_identities.get(symbol)
+        if identity is not None:
+            if identity.accounting_classification != acct_model:
+                raise ValueError(
+                    f"Symbol '{symbol}' has established accounting classification "
+                    f"'{identity.accounting_classification.value}' and cannot accept fills with '{acct_model.value}'."
+                )
+            if identity.quote_currency != norm_quote:
+                raise ValueError(
+                    f"Symbol '{symbol}' quote currency mismatch: established identity uses "
+                    f"'{identity.quote_currency}', fill specified '{norm_quote}'."
+                )
+            if identity.profit_currency != norm_profit:
+                raise ValueError(
+                    f"Symbol '{symbol}' profit currency mismatch: established identity uses "
+                    f"'{identity.profit_currency}', fill specified '{norm_profit}'."
+                )
+        else:
+            self.register_instrument(
+                symbol=symbol,
+                accounting_classification=acct_model,
+                quote_currency=norm_quote,
+                profit_currency=norm_profit,
+            )
+
         pos = self._positions.get(symbol)
         if pos is not None and not pos.is_closed:
             # Classification consistency check
@@ -265,14 +378,12 @@ class PositionTracker:
                     f"'{pos.accounting_classification.value}' and cannot accept fills with '{acct_model.value}'."
                 )
             # Quote currency consistency check
-            norm_quote = CashBook.normalize_currency(spec.quote_currency)
             if pos.quote_currency != norm_quote:
                 raise ValueError(
                     f"Symbol '{symbol}' quote currency mismatch: open position uses "
                     f"'{pos.quote_currency}', fill specified '{norm_quote}'."
                 )
             # Profit currency consistency check
-            norm_profit = CashBook.normalize_currency(spec.profit_currency)
             if pos.profit_currency != norm_profit:
                 raise ValueError(
                     f"Symbol '{symbol}' profit currency mismatch: open position uses "
@@ -283,7 +394,9 @@ class PositionTracker:
         # Case A: Cash Equity (Long-only)
         # ----------------------------------------------------------------------
         if acct_model == AccountingClassification.CASH_EQUITY:
-            if side == OrderSide.SELL and (pos is None or pos.is_closed or pos.side != OrderSide.BUY):
+            if side == OrderSide.SELL and (
+                pos is None or pos.is_closed or pos.side != OrderSide.BUY
+            ):
                 raise ValueError(
                     f"Short cash equities are prohibited. Cannot sell {symbol} without existing long position."
                 )
@@ -453,7 +566,9 @@ class PositionTracker:
 
                 closed_qty = q_dec
                 direction = Decimal("1.0") if pos.side == OrderSide.BUY else Decimal("-1.0")
-                realized_pnl = (p_dec - pos.average_entry_price) * closed_qty * contract_size * direction
+                realized_pnl = (
+                    (p_dec - pos.average_entry_price) * closed_qty * contract_size * direction
+                )
 
                 pos.quantity -= closed_qty
                 pos.current_price = p_dec

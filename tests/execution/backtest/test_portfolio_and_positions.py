@@ -586,7 +586,9 @@ def test_portfolio_actual_fx_cash_conversion(converter: TimestampedCurrencyConve
     portfolio.initialize_cash("EUR", Decimal("1000.00"), t0)
 
     # Convert 500 EUR -> USD @ EUR/USD = 1.1000 -> 550 USD
-    res = portfolio.convert_cash("EUR", "USD", Decimal("500.00"), timestamp=t0, reference_id="fx-001")
+    res = portfolio.convert_cash(
+        "EUR", "USD", Decimal("500.00"), timestamp=t0, reference_id="fx-001"
+    )
     assert res.converted_amount == Decimal("550.00")
 
     # Balances updated
@@ -626,7 +628,9 @@ def test_portfolio_valuation_only_translation_creates_no_ledger_entries(
     assert portfolio.ledger.entry_count == entries_before
 
 
-def test_portfolio_stale_or_missing_fx_fails_closed(converter: TimestampedCurrencyConverter) -> None:
+def test_portfolio_stale_or_missing_fx_fails_closed(
+    converter: TimestampedCurrencyConverter,
+) -> None:
     portfolio = Portfolio(account_currency="USD", currency_converter=converter)
     t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
 
@@ -714,7 +718,9 @@ def test_portfolio_atomic_rollback_on_failed_fill(
         created_at=t0,
         updated_at=t0,
     )
-    fill1 = OrderFilledEvent(order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0)
+    fill1 = OrderFilledEvent(
+        order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0
+    )
     portfolio.apply_fill(fill1, equity_spec, AccountingClassification.CASH_EQUITY)
 
     # State after valid buy
@@ -739,7 +745,9 @@ def test_portfolio_atomic_rollback_on_failed_fill(
     )
 
     with pytest.raises(OversellingError, match="exceeds open position quantity"):
-        portfolio.apply_fill(fill_oversell, equity_spec, AccountingClassification.CASH_EQUITY, "USD")
+        portfolio.apply_fill(
+            fill_oversell, equity_spec, AccountingClassification.CASH_EQUITY, "USD"
+        )
 
     # Verify atomic rollback: CashBook, Ledger, and PositionTracker remain 100% unchanged
     assert portfolio.cashbook.get_balance("USD") == Decimal("5000.00")
@@ -770,7 +778,9 @@ def test_symbol_cannot_switch_accounting_classification_while_position_open(
         created_at=t0,
         updated_at=t0,
     )
-    fill1 = OrderFilledEvent(order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0)
+    fill1 = OrderFilledEvent(
+        order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0
+    )
     portfolio.apply_fill(fill1, equity_spec, AccountingClassification.CASH_EQUITY)
 
     # Attempt to apply LINEAR_CFD fill to AAPL while CASH_EQUITY position is open
@@ -783,7 +793,9 @@ def test_symbol_cannot_switch_accounting_classification_while_position_open(
         created_at=t0,
         updated_at=t0,
     )
-    fill_cfd = OrderFilledEvent(order=order_cfd, fill_price=100.0, fill_quantity=10.0, fee=0.0, timestamp=t0)
+    fill_cfd = OrderFilledEvent(
+        order=order_cfd, fill_price=100.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
 
     with pytest.raises(ValueError, match="cannot accept fills with 'LINEAR_CFD'"):
         portfolio.apply_fill(fill_cfd, equity_spec, AccountingClassification.LINEAR_CFD)
@@ -813,7 +825,9 @@ def test_symbol_cannot_switch_currency_while_position_open(
         created_at=t0,
         updated_at=t0,
     )
-    fill1 = OrderFilledEvent(order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0)
+    fill1 = OrderFilledEvent(
+        order=order1, fill_price=100.0, fill_quantity=50.0, fee=0.0, timestamp=t0
+    )
     portfolio.apply_fill(fill1, equity_spec, AccountingClassification.CASH_EQUITY)
 
     # Create inconsistent spec where AAPL quote currency is suddenly EUR
@@ -838,7 +852,9 @@ def test_symbol_cannot_switch_currency_while_position_open(
         created_at=t0,
         updated_at=t0,
     )
-    fill2 = OrderFilledEvent(order=order2, fill_price=100.0, fill_quantity=10.0, fee=0.0, timestamp=t0)
+    fill2 = OrderFilledEvent(
+        order=order2, fill_price=100.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
 
     with pytest.raises(ValueError, match="quote currency mismatch"):
         portfolio.apply_fill(fill2, inconsistent_spec, AccountingClassification.CASH_EQUITY)
@@ -867,7 +883,9 @@ def test_historical_mark_causality_rejections(
         created_at=t0,
         updated_at=t0,
     )
-    fill = OrderFilledEvent(order=order, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0)
+    fill = OrderFilledEvent(
+        order=order, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
     portfolio.apply_fill(fill, equity_spec, AccountingClassification.CASH_EQUITY)
 
     # Mark position at t2 (12:00)
@@ -914,7 +932,9 @@ def test_cfd_realized_pnl_reconciliation_and_no_double_counting(
         created_at=t0,
         updated_at=t0,
     )
-    fill_open = OrderFilledEvent(order=order_open, fill_price=18000.0, fill_quantity=10.0, fee=10.0, timestamp=t0)
+    fill_open = OrderFilledEvent(
+        order=order_open, fill_price=18000.0, fill_quantity=10.0, fee=10.0, timestamp=t0
+    )
     portfolio.apply_fill(fill_open, cfd_spec, AccountingClassification.LINEAR_CFD, "EUR")
 
     # Cash balance reflects only commission deduction: 10,000 - 10 = 9,990 EUR
@@ -936,7 +956,9 @@ def test_cfd_realized_pnl_reconciliation_and_no_double_counting(
         created_at=t2,
         updated_at=t2,
     )
-    fill_close = OrderFilledEvent(order=order_close, fill_price=18100.0, fill_quantity=10.0, fee=10.0, timestamp=t2)
+    fill_close = OrderFilledEvent(
+        order=order_close, fill_price=18100.0, fill_quantity=10.0, fee=10.0, timestamp=t2
+    )
     portfolio.apply_fill(fill_close, cfd_spec, AccountingClassification.LINEAR_CFD, "EUR")
 
     # Final Cash in EUR = 9990 + 1000 (realized PnL) - 10 (commission) = 10,980 EUR
@@ -957,3 +979,374 @@ def test_cfd_realized_pnl_reconciliation_and_no_double_counting(
     # Reporting field displays cumulative realized PnL converted to USD: 1000 EUR * 1.10 = 1100.0 USD
     assert marked_evt.realized_pnl == 1100.0
 
+
+# ==============================================================================
+# 5. Stable Instrument Accounting Identity & Atomic Marking Tests
+# ==============================================================================
+
+
+def test_closed_position_retains_accounting_identity_and_rejects_incompatible_reopen(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # 1. Buy 100 AAPL as CASH_EQUITY
+    order_buy = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=100.0,
+        id="buy-1",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill_buy = OrderFilledEvent(
+        order=order_buy, fill_price=150.0, fill_quantity=100.0, fee=0.0, timestamp=t0
+    )
+    portfolio.apply_fill(fill_buy, equity_spec, AccountingClassification.CASH_EQUITY)
+    assert portfolio.positions.get_position("AAPL") is not None
+
+    # Check identity established
+    identity = portfolio.get_instrument_identity("AAPL")
+    assert identity is not None
+    assert identity.accounting_classification == AccountingClassification.CASH_EQUITY
+
+    # 2. Sell 100 AAPL (fully close position)
+    order_sell = Order(
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=100.0,
+        id="sell-1",
+        created_at=t1,
+        updated_at=t1,
+    )
+    fill_sell = OrderFilledEvent(
+        order=order_sell, fill_price=155.0, fill_quantity=100.0, fee=0.0, timestamp=t1
+    )
+    portfolio.apply_fill(fill_sell, equity_spec, AccountingClassification.CASH_EQUITY)
+    assert portfolio.positions.get_position("AAPL") is None  # Closed
+
+    # 3. Attempt to reopen closed AAPL as LINEAR_CFD -> MUST be rejected
+    order_cfd = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=50.0,
+        id="cfd-reopen",
+        created_at=t2,
+        updated_at=t2,
+    )
+    fill_cfd = OrderFilledEvent(
+        order=order_cfd, fill_price=155.0, fill_quantity=50.0, fee=0.0, timestamp=t2
+    )
+    with pytest.raises(ValueError, match="established accounting classification"):
+        portfolio.apply_fill(fill_cfd, equity_spec, AccountingClassification.LINEAR_CFD)
+
+    # 4. Reopen as CASH_EQUITY -> MUST succeed
+    order_reopen = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=50.0,
+        id="equity-reopen",
+        created_at=t2,
+        updated_at=t2,
+    )
+    fill_reopen = OrderFilledEvent(
+        order=order_reopen, fill_price=155.0, fill_quantity=50.0, fee=0.0, timestamp=t2
+    )
+    evt = portfolio.apply_fill(fill_reopen, equity_spec, AccountingClassification.CASH_EQUITY)
+    assert evt.position.quantity == 50.0
+    assert portfolio.positions.get_position("AAPL") is not None
+
+
+def test_closed_position_retains_currency_identity_and_rejects_currency_change(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+    portfolio.initialize_cash("EUR", Decimal("50000.00"), t0)
+
+    # 1. Buy and sell AAPL to close it
+    order_buy = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="buy-1",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_buy, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+    order_sell = Order(
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="sell-1",
+        created_at=t1,
+        updated_at=t1,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_sell, fill_price=155.0, fill_quantity=10.0, fee=0.0, timestamp=t1
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+    assert portfolio.positions.get_position("AAPL") is None
+
+    # 2. Incompatible quote currency spec
+    eur_quote_spec = InstrumentSpecification(
+        symbol="AAPL",
+        tick_size=0.01,
+        contract_size=1.0,
+        min_volume=1.0,
+        volume_step=1.0,
+        price_precision=2,
+        profit_currency="USD",
+        quote_currency="EUR",
+        base_currency="USD",
+        valuation_model=ValuationModel.LINEAR,
+    )
+    order_reopen = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="reopen-eur-quote",
+        created_at=t2,
+        updated_at=t2,
+    )
+    with pytest.raises(ValueError, match="quote currency mismatch"):
+        portfolio.apply_fill(
+            OrderFilledEvent(
+                order=order_reopen, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t2
+            ),
+            eur_quote_spec,
+            AccountingClassification.CASH_EQUITY,
+        )
+
+    # 3. Incompatible profit currency spec
+    eur_profit_spec = InstrumentSpecification(
+        symbol="AAPL",
+        tick_size=0.01,
+        contract_size=1.0,
+        min_volume=1.0,
+        volume_step=1.0,
+        price_precision=2,
+        profit_currency="EUR",
+        quote_currency="USD",
+        base_currency="USD",
+        valuation_model=ValuationModel.LINEAR,
+    )
+    with pytest.raises(ValueError, match="profit currency mismatch"):
+        portfolio.apply_fill(
+            OrderFilledEvent(
+                order=order_reopen, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t2
+            ),
+            eur_profit_spec,
+            AccountingClassification.CASH_EQUITY,
+        )
+
+
+def test_explicitly_configured_separate_instrument_identities(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # AAPL is CASH_EQUITY
+    aapl_id = portfolio.register_instrument(
+        symbol="AAPL",
+        accounting_classification=AccountingClassification.CASH_EQUITY,
+        quote_currency="USD",
+        profit_currency="USD",
+    )
+    assert aapl_id.accounting_classification == AccountingClassification.CASH_EQUITY
+
+    # AAPL_CFD is LINEAR_CFD
+    aapl_cfd_id = portfolio.register_instrument(
+        symbol="AAPL_CFD",
+        accounting_classification=AccountingClassification.LINEAR_CFD,
+        quote_currency="USD",
+        profit_currency="USD",
+    )
+    assert aapl_cfd_id.accounting_classification == AccountingClassification.LINEAR_CFD
+
+    # Verify both can be retrieved independently
+    assert portfolio.get_instrument_identity("AAPL") == aapl_id
+    assert portfolio.get_instrument_identity("AAPL_CFD") == aapl_cfd_id
+
+
+def test_mark_portfolio_atomic_rollback_on_partial_failure(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # Open AAPL @ $150
+    order_aapl = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="buy-aapl",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_aapl, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+
+    # Open MSFT @ $300
+    msft_spec = InstrumentSpecification(
+        symbol="MSFT",
+        tick_size=0.01,
+        contract_size=1.0,
+        min_volume=1.0,
+        volume_step=1.0,
+        price_precision=2,
+        profit_currency="USD",
+        quote_currency="USD",
+        base_currency="USD",
+        valuation_model=ValuationModel.LINEAR,
+    )
+    order_msft = Order(
+        symbol="MSFT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="buy-msft",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_msft, fill_price=300.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+        ),
+        msft_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+
+    aapl_rec_before = portfolio.positions.get_record("AAPL")
+    msft_rec_before = portfolio.positions.get_record("MSFT")
+    assert aapl_rec_before is not None and aapl_rec_before.current_price == Decimal("150.0")
+    assert aapl_rec_before.last_updated == t0
+    assert msft_rec_before is not None and msft_rec_before.current_price == Decimal("300.0")
+    assert msft_rec_before.last_updated == t0
+
+    cb_balances_before = dict(portfolio.cashbook.get_all_balances())
+    ledger_count_before = len(portfolio.ledger.get_entries())
+
+    # Attempt mark_portfolio with valid AAPL price (160.0) but INVALID MSFT price (-10.0)
+    with pytest.raises(ValueError, match="Mark price must be positive"):
+        portfolio.mark_portfolio(
+            timestamp=t1,
+            current_prices={"AAPL": 160.0, "MSFT": -10.0},
+        )
+
+    # Verify atomic rollback: AAPL mark was NOT permanently changed to 160.0 or t1
+    aapl_rec_after = portfolio.positions.get_record("AAPL")
+    msft_rec_after = portfolio.positions.get_record("MSFT")
+    assert aapl_rec_after is not None
+    assert aapl_rec_after.current_price == Decimal("150.0")
+    assert aapl_rec_after.last_updated == t0
+    assert msft_rec_after is not None
+    assert msft_rec_after.current_price == Decimal("300.0")
+    assert msft_rec_after.last_updated == t0
+
+    # Cashbook and ledger unchanged
+    assert portfolio.cashbook.get_all_balances() == cb_balances_before
+    assert len(portfolio.ledger.get_entries()) == ledger_count_before
+
+
+def test_mark_portfolio_atomic_rollback_on_valuation_failure(
+    equity_spec: InstrumentSpecification, cfd_spec: InstrumentSpecification
+) -> None:
+    # Converter with short 1-hour max_age
+    conv = TimestampedCurrencyConverter(default_max_age=timedelta(hours=1), pivot_currency="USD")
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    conv.add_rate(FXRateObservation("EUR", "USD", Decimal("1.1000"), t0))
+
+    portfolio = Portfolio(account_currency="USD", currency_converter=conv)
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # Open AAPL @ $150
+    order_aapl = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="buy-aapl",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_aapl, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+
+    # Open GER40 CFD @ 18000 EUR
+    order_ger = Order(
+        symbol="GER40",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=1.0,
+        id="buy-ger",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_ger, fill_price=18000.0, fill_quantity=1.0, fee=0.0, timestamp=t0
+        ),
+        cfd_spec,
+        AccountingClassification.LINEAR_CFD,
+    )
+
+    # Mark at t1 = t0 + 2 days (EUR rate is now stale -> StaleFXRateError on valuation)
+    t1 = t0 + timedelta(days=2)
+    with pytest.raises(StaleFXRateError):
+        portfolio.mark_portfolio(
+            timestamp=t1,
+            current_prices={"AAPL": 160.0, "GER40": 18200.0},
+        )
+
+    # Verify atomic rollback: AAPL and GER40 marks and timestamps restored to t0 state
+    aapl_rec = portfolio.positions.get_record("AAPL")
+    ger_rec = portfolio.positions.get_record("GER40")
+    assert aapl_rec is not None
+    assert aapl_rec.current_price == Decimal("150.0")
+    assert aapl_rec.last_updated == t0
+    assert ger_rec is not None
+    assert ger_rec.current_price == Decimal("18000.0")
+    assert ger_rec.last_updated == t0
