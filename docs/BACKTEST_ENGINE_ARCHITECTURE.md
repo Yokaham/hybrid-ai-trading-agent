@@ -352,6 +352,26 @@ To prevent double-counting of transaction costs, the engine establishes one cons
 - **Total Portfolio Equity**:
   $$\text{Equity}_{\text{base}} = \sum_{c \in \mathcal{C}} \text{FX}(C_c) + \sum_{p \in \mathcal{P}_{\text{cfd}}} \text{FX}(\text{Unrealized P\&L}_p)$$
 
+### 7.4 Supported Accounting Models & Explicit Boundaries (Milestone 3B.3)
+
+Milestone 3B.3 implements the core portfolio and accounting foundations:
+1. **Cash Equities Model**:
+   - Long-only inventory tracking with weighted-average entry price.
+   - Buys debit 100% upfront notional $(Q \times P \times \text{ContractSize})$ plus commission from quote currency cash.
+   - Sells credit gross proceeds $(Q \times P \times \text{ContractSize})$ less commission. Realized P&L is intrinsically captured in cash proceeds and is never double-credited.
+   - Overselling protection: selling more shares than held raises `OversellingError`. Short selling of cash equities is explicitly disabled.
+2. **Linear CFDs Model**:
+   - Long and Short contract inventory tracking with weighted-average entry price.
+   - Opening fills incur no notional cash debit; only commissions are debited.
+   - Closing fills credit/debit net realized gross P&L directly to cash in the profit currency.
+   - Position reversal protection: opposing fills larger than the open position raise `PositionReversalError` (a position must be closed before opening an opposing direction).
+3. **Valuation Mark-to-Market**:
+   - Portfolio equity valuation converts foreign cash balances and position valuations using `TimestampedCurrencyConverter`.
+   - Valuation translation produces zero journal transactions in `AccountingLedger`.
+4. **Explicit Boundaries & Deferred Components**:
+   - `FillEngine`, microstructure models (spread, slippage, liquidity), and order management (`OrderManager`) are deferred to **Milestone 3B.4**.
+   - Financing charge accrual models and `PortfolioRiskTracker` risk reservations are deferred to **Milestone 3B.5**.
+
 ---
 
 ## 8. Separation of Free Margin, Buying Power & Risk Capacity
@@ -432,6 +452,9 @@ class BacktestCurrencyAdapter:
 ---
 
 ## 10. Portfolio Risk Reservations & Decoupling
+
+> [!NOTE] Implementation Phasing
+> `PortfolioRiskTracker` and risk reservations are implemented in **Milestone 3B.5** alongside `BacktestEngine`, rather than as premature placeholders in Milestone 3B.3. Milestone 3B.3 focuses strictly on foundational deterministic accounting components (`TimestampedCurrencyConverter`, `BacktestCurrencyAdapter`, `CashBook`, `AccountingLedger`, `PositionTracker`, and `Portfolio`).
 
 ### 10.1 Decoupled Architecture (Avoiding Circular Dependencies)
 To avoid circular references between `Portfolio` and `PortfolioRiskTracker`, state is passed via immutable snapshots:

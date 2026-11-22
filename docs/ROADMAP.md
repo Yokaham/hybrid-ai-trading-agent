@@ -111,7 +111,7 @@ Event-driven backtesting enforces strict chronological execution: signals genera
 - Per-observation volume availability handling across batch and incremental engines.
 - Dual-mode `FeaturePipeline`: Complete mathematical parity across all 20 indicator columns between batch vectorised transform and `StatefulIncrementalFeatureEngine` ($O(1)$ updates and state rebuilding on revisions). Proven zero lookahead bias verified through future-mutation unit tests. Configurable HV annualization factor dynamically tracked in registry.
 
-### Milestone 3: Event-Driven Backtesting Engine & Microstructure Simulation (Status: Active — Milestone 3B.2 Completed)
+### Milestone 3: Event-Driven Backtesting Engine & Microstructure Simulation (Status: Active — Milestone 3B.3 Completed)
 - **Milestone 3A (Framework Evaluation & Prototype)**:
   - Isolated evaluation of `ml4t-backtest` and `QuantConnect/LEAN`.
   - Comprehensive empirical execution harness testing 8 mandatory vectors (Cases A through H).
@@ -130,8 +130,14 @@ Event-driven backtesting enforces strict chronological execution: signals genera
   - `EventQueue`: Deterministic priority queue ordered by `(timestamp, priority, sequence_id)` with stable FIFO tie-breaking and non-retroactive dispatch constraints.
   - Backtesting Event DTOs: `MarketBarClosedEvent`, `MarketBarOpenedEvent`, `OrderSubmittedEvent`, `OrderPartiallyFilledEvent`, `OrderFilledEvent`, `OrderCancelledEvent`, `PositionUpdatedEvent`, `PortfolioMarkedEvent`, `BacktestCompletedEvent`.
   - Critical zero-latency boundary ordering verification and non-retroactive fill protection.
-- **Milestone 3B.3 to 3B.6 (Upcoming)**:
-  - 3B.3: Multi-Currency CashBook, Timestamped FX Converter, Position Tracker, and Accounting Ledger.
+- **Milestone 3B.3 (Multi-Currency Portfolio & Accounting Foundation — Completed)**:
+  - `TimestampedCurrencyConverter`: Point-in-time exchange rate resolution, fail-closed staleness policy, inverse quotation, account-currency triangulation, and signed decimal conversion preserving negative liabilities.
+  - `BacktestCurrencyAdapter`: Adapts timestamped converter to synchronous `CurrencyConverter` interface in `risk/policy.py`.
+  - `CashBook`: Multi-currency balance ledger with uppercase normalization, liability tracking, and fail-closed cash adequacy verification.
+  - `AccountingLedger`: Append-only double-entry transaction journal with monotonic sequence IDs and complete auditability.
+  - `PositionTracker`: Long-only cash equities (100% upfront notional, proceeds credited, no overselling, single commission debit) and linear CFDs (isolated notional, realized P&L credited to cash, no auto-reversal, position reversal protection).
+  - `Portfolio`: Orchestrates multi-currency cash balances, positions, and ledger entries with dynamic base currency mark-to-market translation producing zero fictional ledger transactions.
+- **Milestone 3B.4 to 3B.6 (Upcoming)**:
   - 3B.4: Microstructure Cost & Liquidity Models, FillEngine, and OrderManager.
   - 3B.5: Pre-Trade Risk Engine Wiring and BacktestEngine Coordinator.
   - 3B.6: Performance Analytics Engine, Report Generator, and Mutation Verification Suite.
