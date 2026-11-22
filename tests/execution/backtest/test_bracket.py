@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from hybrid_agent.core.constants import OrderSide, OrderStatus, OrderType
+from hybrid_agent.core.constants import OrderSide, OrderStatus, OrderType, OrderValidationError
 from hybrid_agent.core.models import InstrumentSpecification, Order
 from hybrid_agent.execution.backtest.bracket import (
     BracketExposureBreachError,
@@ -20,6 +20,7 @@ from hybrid_agent.execution.backtest.bracket import (
 from hybrid_agent.execution.backtest.events import OrderFilledEvent, OrderSubmittedEvent
 from hybrid_agent.execution.backtest.order_manager import (
     DuplicateFillError,
+    InvalidOrderStateError,
     OrderManager,
 )
 from hybrid_agent.execution.backtest.portfolio import (
@@ -1209,3 +1210,519 @@ class TestOCOBracketLifecycle:
         manager.cancel_order("o-cancel", timestamp=t1, reason="cancel")
         with pytest.raises(InvalidBracketStateError, match="Cannot attach bracket to cancelled"):
             manager.register_bracket("o-cancel", stop_loss_price=140.0, take_profit_price=160.0)
+
+    def test_parent_remainder_cancelled_when_exit_fully_closes_bracket_stop_loss(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """When an exit leg (Stop-Loss) fully closes the bracket, parent entry remainder is automatically cancelled."""
+        order = make_parent_order("parent-1", quantity=100.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        # Parent partially fills 40 shares
+        t1 = base_time + timedelta(seconds=1)
+        fill1 = FillRecord(
+            fill_id="f-entry-1",
+            order_id="parent-1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            fill_quantity=Decimal(40),
+            fill_price=Decimal("150.00"),
+            fee=Decimal(0),
+            timestamp=t1,
+        )
+        manager.record_fill(fill1)
+
+        parent_snap = manager.get_execution_state("parent-1")
+        assert parent_snap.filled_quantity == Decimal(40)
+        assert parent_snap.leaves_quantity == Decimal(60)
+        assert parent_snap.is_partially_filled is True
+        assert parent_snap.is_terminal is False
+        assert "parent-1" in [o.order.id for o in manager.get_active_orders()]
+
+        bracket = manager.get_bracket_for_order("parent-1")
+        assert bracket is not None
+        assert bracket.status == BracketStatus.ACTIVE
+        assert bracket.allocated_quantity == Decimal(40)
+        assert bracket.residual_quantity == Decimal(40)
+        sl_id = bracket.active_stop_loss_order_id
+        tp_id = bracket.active_take_profit_order_id
+        assert sl_id is not None and tp_id is not None
+
+        # Stop-Loss fills 40 shares, bringing residual_quantity to 0
+        t2 = base_time + timedelta(seconds=2)
+        fill_sl = FillRecord(
+            fill_id="f-sl-1",
+            order_id=sl_id,
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            fill_quantity=Decimal(40),
+            fill_price=Decimal("140.00"),
+            fee=Decimal(0),
+            timestamp=t2,
+        )
+        manager.record_fill(fill_sl)
+
+        # 1. Bracket must be CLOSED (NOT CANCELLED)
+        bracket_snap = manager.get_bracket(bracket.bracket_id)
+        assert bracket_snap.status == BracketStatus.CLOSED
+        assert bracket_snap.is_closed is True
+        assert bracket_snap.residual_quantity == Decimal(0)
+        assert bracket_snap.closed_quantity == Decimal(40)
+
+        # 2. Parent entry order remainder must be cancelled
+        parent_after = manager.get_execution_state("parent-1")
+        assert parent_after.status == ExecutionStatus.CANCELLED
+        assert parent_after.order.status == OrderStatus.CANCELLED
+        assert parent_after.is_cancelled is True
+        assert parent_after.leaves_quantity == Decimal(0)
+        assert parent_after.filled_quantity == Decimal(40)
+
+        # 3. Active child orders must be cleared and inactive
+        assert bracket_snap.active_stop_loss_order_id is None
+        assert bracket_snap.active_take_profit_order_id is None
+        assert manager.active_order_count == 0
+
+        # TP must be cancelled
+        tp_after = manager.get_execution_state(tp_id)
+        assert tp_after.is_cancelled is True
+        assert tp_after.leaves_quantity == Decimal(0)
+
+        # 4. Attempting to record subsequent parent fill raises error
+        t3 = base_time + timedelta(seconds=3)
+        fill_late_parent = FillRecord(
+            fill_id="f-entry-2",
+            order_id="parent-1",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            fill_quantity=Decimal(20),
+            fill_price=Decimal("150.00"),
+            fee=Decimal(0),
+            timestamp=t3,
+        )
+        with pytest.raises(InvalidOrderStateError):
+            manager.record_fill(fill_late_parent, allow_late_fill=False)
+
+        with pytest.raises(
+            InvalidBracketStateError,
+            match="Cannot record parent entry fill for closed bracket",
+        ):
+            manager.record_fill(fill_late_parent, allow_late_fill=True)
+
+    def test_parent_remainder_cancelled_when_exit_fully_closes_bracket_take_profit(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """When Take-Profit fully closes the bracket, parent entry remainder is cancelled and bracket remains CLOSED."""
+        order = make_parent_order("parent-tp", quantity=100.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        t1 = base_time + timedelta(seconds=1)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp-entry",
+                order_id="parent-tp",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_quantity=Decimal(50),
+                fill_price=Decimal("150.00"),
+                fee=Decimal(0),
+                timestamp=t1,
+            )
+        )
+
+        bracket = manager.get_bracket_for_order("parent-tp")
+        assert bracket is not None
+        tp_id = bracket.active_take_profit_order_id
+        sl_id = bracket.active_stop_loss_order_id
+        assert tp_id is not None and sl_id is not None
+
+        # Take-Profit fills 50 shares -> closes bracket
+        t2 = base_time + timedelta(seconds=2)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp-1",
+                order_id=tp_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(50),
+                fill_price=Decimal("165.00"),
+                fee=Decimal(0),
+                timestamp=t2,
+            )
+        )
+
+        bracket_snap = manager.get_bracket(bracket.bracket_id)
+        assert bracket_snap.status == BracketStatus.CLOSED
+        assert bracket_snap.is_closed is True
+
+        parent_after = manager.get_execution_state("parent-tp")
+        assert parent_after.status == ExecutionStatus.CANCELLED
+        assert parent_after.order.status == OrderStatus.CANCELLED
+        assert parent_after.leaves_quantity == Decimal(0)
+        assert parent_after.filled_quantity == Decimal(50)
+
+        assert bracket_snap.active_stop_loss_order_id is None
+        assert bracket_snap.active_take_profit_order_id is None
+        assert manager.active_order_count == 0
+
+    def test_partially_filled_parent_remains_active_when_residual_exposure_remains(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """Partially filled parent remains active when exit fill does not close the bracket."""
+        order = make_parent_order("parent-partial", quantity=100.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        t1 = base_time + timedelta(seconds=1)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-p1",
+                order_id="parent-partial",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_quantity=Decimal(40),
+                fill_price=Decimal("150.00"),
+                fee=Decimal(0),
+                timestamp=t1,
+            )
+        )
+
+        bracket = manager.get_bracket_for_order("parent-partial")
+        assert bracket is not None
+        tp_id = bracket.active_take_profit_order_id
+        assert tp_id is not None
+
+        # TP fills only 15 out of 40 -> residual becomes 25
+        t2 = base_time + timedelta(seconds=2)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp-part",
+                order_id=tp_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(15),
+                fill_price=Decimal("165.00"),
+                fee=Decimal(0),
+                timestamp=t2,
+            )
+        )
+
+        # Parent order remains ACTIVE / PARTIALLY_FILLED with 60 leaves
+        parent_after = manager.get_execution_state("parent-partial")
+        assert parent_after.is_partially_filled is True
+        assert parent_after.is_terminal is False
+        assert parent_after.leaves_quantity == Decimal(60)
+        assert "parent-partial" in [o.order.id for o in manager.get_active_orders()]
+
+        # Bracket remains ACTIVE with 25 residual
+        b_after = manager.get_bracket(bracket.bracket_id)
+        assert b_after.is_active is True
+        assert b_after.residual_quantity == Decimal(25)
+
+    def test_late_fill_on_cancelled_child_resizes_both_active_legs_and_prevents_overrun(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """Verifies exact 50 -> 30 -> 15 late fill scenario: both active child legs are resized, preventing overrun."""
+        order = make_parent_order("parent-50", quantity=50.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        # 1. Parent entry fills 50
+        t1 = base_time + timedelta(seconds=1)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-p50",
+                order_id="parent-50",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_quantity=Decimal(50),
+                fill_price=Decimal("150.00"),
+                fee=Decimal(0),
+                timestamp=t1,
+            )
+        )
+
+        b1 = manager.get_bracket_for_order("parent-50")
+        assert b1 is not None
+        assert b1.allocated_quantity == Decimal(50)
+        assert b1.residual_quantity == Decimal(50)
+
+        sl1_id = b1.active_stop_loss_order_id
+        tp1_id = b1.active_take_profit_order_id
+        assert sl1_id is not None and tp1_id is not None
+        assert manager.get_execution_state(sl1_id).leaves_quantity == Decimal(50)
+        assert manager.get_execution_state(tp1_id).leaves_quantity == Decimal(50)
+
+        # 2. TP fills 20 -> residual becomes 30. SL-1 is cancelled and replaced with SL-2 (30).
+        t2 = base_time + timedelta(seconds=2)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp-20",
+                order_id=tp1_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(20),
+                fill_price=Decimal("165.00"),
+                fee=Decimal(0),
+                timestamp=t2,
+            )
+        )
+
+        b2 = manager.get_bracket(b1.bracket_id)
+        assert b2.residual_quantity == Decimal(30)
+        sl2_id = b2.active_stop_loss_order_id
+        tp2_id = b2.active_take_profit_order_id
+        assert sl2_id is not None and sl2_id != sl1_id
+        assert manager.get_execution_state(sl1_id).is_cancelled is True
+        assert manager.get_execution_state(sl2_id).leaves_quantity == Decimal(30)
+        # Active TP leaves is also 30
+        assert tp2_id is not None
+        assert manager.get_execution_state(tp2_id).leaves_quantity == Decimal(30)
+
+        # 3. Late fill arrives on old cancelled SL-1 for 15 units with allow_late_fill=True
+        t3 = base_time + timedelta(seconds=3)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-sl1-late-15",
+                order_id=sl1_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(15),
+                fill_price=Decimal("140.00"),
+                fee=Decimal(0),
+                timestamp=t3,
+            ),
+            allow_late_fill=True,
+        )
+
+        b3 = manager.get_bracket(b1.bracket_id)
+        assert b3.residual_quantity == Decimal(15)
+        assert b3.closed_quantity == Decimal(35)  # 20 + 15
+
+        # Both active legs must be resized to exactly 15!
+        sl3_id = b3.active_stop_loss_order_id
+        tp3_id = b3.active_take_profit_order_id
+        assert sl3_id is not None and sl3_id != sl2_id
+        assert tp3_id is not None
+        assert manager.get_execution_state(sl2_id).is_cancelled is True
+
+        sl3_state = manager.get_execution_state(sl3_id)
+        tp3_state = manager.get_execution_state(tp3_id)
+        assert sl3_state.leaves_quantity == Decimal(15)
+        assert tp3_state.leaves_quantity == Decimal(15)
+        assert sl3_state.is_active is True
+        assert tp3_state.is_active is True
+
+        # 4. Subsequent fill for 15 units on TP-3 closes residual completely
+        t4 = base_time + timedelta(seconds=4)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp3-15",
+                order_id=tp3_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(15),
+                fill_price=Decimal("165.00"),
+                fee=Decimal(0),
+                timestamp=t4,
+            )
+        )
+
+        b4 = manager.get_bracket(b1.bracket_id)
+        assert b4.status == BracketStatus.CLOSED
+        assert b4.residual_quantity == Decimal(0)
+        assert b4.closed_quantity == Decimal(50)
+        assert b4.active_stop_loss_order_id is None
+        assert b4.active_take_profit_order_id is None
+        assert manager.active_order_count == 0
+        assert manager.get_execution_state(sl3_id).is_cancelled is True
+
+    def test_late_fill_on_old_stop_loss_after_stop_loss_replacement(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """Late fill on old SL resizes both replacement SL-2 and active TP."""
+        order = make_parent_order("p-sl-late", quantity=50.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        t1 = base_time + timedelta(seconds=1)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-p-sl",
+                order_id="p-sl-late",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_quantity=Decimal(50),
+                fill_price=Decimal("150.00"),
+                fee=Decimal(0),
+                timestamp=t1,
+            )
+        )
+
+        b1 = manager.get_bracket_for_order("p-sl-late")
+        assert b1 is not None
+        sl1_id = b1.active_stop_loss_order_id
+        tp1_id = b1.active_take_profit_order_id
+        assert sl1_id is not None and tp1_id is not None
+
+        # SL-1 fills 10 units -> residual becomes 40.
+        t2 = base_time + timedelta(seconds=2)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-sl1-10",
+                order_id=sl1_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(10),
+                fill_price=Decimal("140.00"),
+                fee=Decimal(0),
+                timestamp=t2,
+            )
+        )
+
+        # TP is cancelled and replaced to 40. SL-1 had 50, now leaves 40.
+        # Cancel SL-1
+        manager.cancel_order(sl1_id, timestamp=t2, reason="manual test adjustment")
+
+        # Late fill arrives on SL-1
+        t3 = base_time + timedelta(seconds=3)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-sl1-late-5",
+                order_id=sl1_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(5),
+                fill_price=Decimal("140.00"),
+                fee=Decimal(0),
+                timestamp=t3,
+            ),
+            allow_late_fill=True,
+        )
+
+        b3 = manager.get_bracket(b1.bracket_id)
+        assert b3.residual_quantity == Decimal(35)
+        # Check active child leaves are <= 35
+        sl_curr = b3.active_stop_loss_order_id
+        tp_curr = b3.active_take_profit_order_id
+        if sl_curr is not None:
+            assert manager.get_execution_state(sl_curr).leaves_quantity <= Decimal(35)
+        if tp_curr is not None:
+            assert manager.get_execution_state(tp_curr).leaves_quantity <= Decimal(35)
+
+    def test_cancelled_child_fill_rejected_by_default_without_explicit_permission(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """Cancelled child order rejects fill by default when allow_late_fill=False."""
+        order = make_parent_order("p-reject", quantity=50.0)
+        manager.register_order(
+            OrderSubmittedEvent(order=order, timestamp=base_time, submission_time=base_time)
+        )
+
+        t1 = base_time + timedelta(seconds=1)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-p-rej",
+                order_id="p-reject",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_quantity=Decimal(50),
+                fill_price=Decimal("150.00"),
+                fee=Decimal(0),
+                timestamp=t1,
+            )
+        )
+
+        b1 = manager.get_bracket_for_order("p-reject")
+        assert b1 is not None
+        sl1_id = b1.active_stop_loss_order_id
+        tp1_id = b1.active_take_profit_order_id
+        assert sl1_id is not None and tp1_id is not None
+
+        # TP fills 20 -> SL-1 is cancelled
+        t2 = base_time + timedelta(seconds=2)
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-tp-fill",
+                order_id=tp1_id,
+                symbol="AAPL",
+                side=OrderSide.SELL,
+                fill_quantity=Decimal(20),
+                fill_price=Decimal("165.00"),
+                fee=Decimal(0),
+                timestamp=t2,
+            )
+        )
+        assert manager.get_execution_state(sl1_id).is_cancelled is True
+
+        # Late fill on cancelled SL-1 without allow_late_fill raises InvalidOrderStateError
+        t3 = base_time + timedelta(seconds=3)
+        late_fill = FillRecord(
+            fill_id="f-late-rej",
+            order_id=sl1_id,
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            fill_quantity=Decimal(10),
+            fill_price=Decimal("140.00"),
+            fee=Decimal(0),
+            timestamp=t3,
+        )
+        with pytest.raises(InvalidOrderStateError, match="Cannot record fill on terminal order"):
+            manager.record_fill(late_fill, allow_late_fill=False)
+
+        # Same late fill with allow_late_fill=True succeeds
+        snap = manager.record_fill(late_fill, allow_late_fill=True)
+        assert snap.order.id == sl1_id
+
+    def test_atomic_auto_bracket_registration_failure_rolls_back_completely(
+        self, manager: OrderManager, base_time: datetime
+    ) -> None:
+        """Atomic rollback on auto-bracket registration failure leaves zero orphaned parent orders or brackets."""
+        # 1. Spec tick size violation on stop_loss_price (tick size 0.01)
+        bad_price_order = make_parent_order("bad-price-ord", stop_loss_price=140.005)
+        event1 = OrderSubmittedEvent(
+            order=bad_price_order, timestamp=base_time, submission_time=base_time
+        )
+
+        with pytest.raises(OrderValidationError):
+            manager.register_order(event1)
+
+        # Confirm zero orphaned state
+        assert manager.has_order("bad-price-ord") is False
+        assert manager.has_bracket("BRACKET-bad-price-ord") is False
+        assert manager.total_bracket_count == 0
+        assert manager.total_order_count == 0
+        assert len(manager.get_active_orders()) == 0
+
+        # 2. Spec volume step violation on parent order quantity (volume step 1.0)
+        bad_qty_order = make_parent_order("bad-qty-ord", quantity=10.5)
+        event2 = OrderSubmittedEvent(
+            order=bad_qty_order, timestamp=base_time, submission_time=base_time
+        )
+
+        with pytest.raises(OrderValidationError, match="does not align with volume_step"):
+            manager.register_order(event2)
+
+        # Confirm still zero orphaned state
+        assert manager.has_order("bad-qty-ord") is False
+        assert manager.has_bracket("BRACKET-bad-qty-ord") is False
+        assert manager.total_bracket_count == 0
+        assert manager.total_order_count == 0
+
+        # 3. Valid order succeeds cleanly
+        valid_order = make_parent_order("valid-ord")
+        event3 = OrderSubmittedEvent(
+            order=valid_order, timestamp=base_time, submission_time=base_time
+        )
+        manager.register_order(event3)
+
+        assert manager.has_order("valid-ord") is True
+        assert manager.has_bracket("BRACKET-valid-ord") is True
+        assert manager.total_bracket_count == 1
+        assert manager.total_order_count == 1

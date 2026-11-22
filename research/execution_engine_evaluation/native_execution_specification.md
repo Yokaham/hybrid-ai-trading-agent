@@ -120,6 +120,22 @@ When an entry order receives a partial fill:
    - The child SL/TP orders remain active, perfectly protecting the executed quantity ($Q_{\text{executed}}$).
    - Executed positions are **never reversed or erased** when an unfilled entry remainder is cancelled.
 
+### 3.4 Review Corrections & Invariant Hardening (Milestone 3B.4.3)
+1. **Parent Entry Remainder Auto-Cancellation on Bracket Closure**:
+   - When an exit fill completely closes a bracket ($\text{residual\_quantity} = 0$), any unexecuted leaves on the parent entry order are automatically cancelled with the simulation timestamp.
+   - Historical parent fills are preserved; the bracket status remains `BracketStatus.CLOSED` (never marked `CANCELLED`).
+   - Subsequent parent fills against a closed bracket are rejected with `InvalidBracketStateError`.
+2. **Complete Child Leg Reconciliation**:
+   - Exit fills (including late fills on previously cancelled legs) reconcile both active legs (same role and opposite role).
+   - Guarantees that neither active leg has leaves exceeding $\text{residual\_quantity}$.
+   - When residual quantity reaches zero, all active child orders are cancelled and active order references cleared.
+3. **Explicit Permission for Late Fills**:
+   - Cancelled orders reject late fills by default (`allow_late_fill=False`) with `InvalidOrderStateError`.
+   - Recording late fills on cancelled orders requires explicit permission (`allow_late_fill=True`).
+4. **Atomic Auto-Bracket Registration**:
+   - Pre-flight validation against `InstrumentSpecification` ensures tick-size and price precision constraints before modifying state.
+   - Failures during bracket/child creation trigger a clean transactional rollback leaving zero orphaned orders or partial brackets.
+
 ---
 
 ## 4. FillEngine Specification

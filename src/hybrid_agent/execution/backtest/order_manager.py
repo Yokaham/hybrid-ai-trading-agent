@@ -3,7 +3,12 @@
 from datetime import datetime
 from decimal import Decimal
 
-from hybrid_agent.core.constants import ALLOWED_ORDER_TRANSITIONS, OrderSide, OrderStatus, OrderType
+from hybrid_agent.core.constants import (
+    ALLOWED_ORDER_TRANSITIONS,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from hybrid_agent.core.models import InstrumentSpecification, Order, validate_utc_timestamp
 from hybrid_agent.execution.backtest.bracket import (
     Bracket,
@@ -159,6 +164,7 @@ class OrderManager:
         Raises:
             TypeError: If event or order are of invalid types.
             ValueError: If timestamps are invalid, out of chronological order, or specifications conflict.
+            OrderValidationError: If order or bracket prices/quantities violate instrument specification rules.
             InvalidOrderStateError: If the order is not in APPROVED or SUBMITTED status.
             DuplicateOrderError: If the order ID is already registered with conflicting parameters.
         """
@@ -201,11 +207,8 @@ class OrderManager:
                 f"Order must be in APPROVED or SUBMITTED status."
             )
 
-        # Pre-validate bracket prices before registration if both exist
-        if order.stop_loss_price is not None and order.take_profit_price is not None:
-            self._validate_bracket_prices(order, order.stop_loss_price, order.take_profit_price)
-
-        # Validate instrument specification type and symbol if provided
+        # Resolve candidate instrument specification upfront
+        candidate_spec: InstrumentSpecification | None
         if instrument_spec is not None:
             if not isinstance(instrument_spec, InstrumentSpecification):
                 raise TypeError(
@@ -215,6 +218,30 @@ class OrderManager:
                 raise ValueError(
                     f"Instrument specification symbol '{instrument_spec.symbol}' does not match order symbol '{order.symbol}'"
                 )
+            if (
+                order.symbol in self._instrument_specs
+                and self._instrument_specs[order.symbol] != instrument_spec
+            ):
+                if order_id in self._orders:
+                    raise DuplicateOrderError(
+                        f"Order ID '{order_id}' has conflicting instrument specification for symbol '{order.symbol}'"
+                    )
+                raise ValueError(
+                    f"Conflicting instrument specification for symbol '{order.symbol}' already registered"
+                )
+            candidate_spec = instrument_spec
+        else:
+            candidate_spec = self._instrument_specs.get(order.symbol)
+
+        # Pre-validate order and bracket parameters against candidate spec before ANY state mutation
+        if candidate_spec is not None:
+            order.validate_against_instrument(candidate_spec)
+
+        if order.stop_loss_price is not None and order.take_profit_price is not None:
+            self._validate_bracket_prices(order, order.stop_loss_price, order.take_profit_price)
+            if candidate_spec is not None:
+                candidate_spec.validate_price(order.stop_loss_price)
+                candidate_spec.validate_price(order.take_profit_price)
 
         # Handle duplicate registration
         if order_id in self._orders:
@@ -258,20 +285,13 @@ class OrderManager:
                 f"Order ID '{order_id}' is already registered with conflicting order parameters"
             )
 
-        # New order registration: resolve and register instrument spec
+        # Register instrument spec in registry if new spec was provided
         spec: InstrumentSpecification | None
         if instrument_spec is not None:
-            if (
-                order.symbol in self._instrument_specs
-                and self._instrument_specs[order.symbol] != instrument_spec
-            ):
-                raise ValueError(
-                    f"Conflicting instrument specification for symbol '{order.symbol}' already registered"
-                )
             self.register_instrument(instrument_spec)
             spec = instrument_spec
         else:
-            spec = self._instrument_specs.get(order.symbol)
+            spec = candidate_spec
 
         # Protect original input order by creating a deep copy for manager ownership
         managed_order = order.model_copy(deep=True)
@@ -285,23 +305,38 @@ class OrderManager:
             instrument_spec=spec,
         )
 
-        # Commit to internal registries
+        # Commit to internal registries with transactional rollback protection
         self._orders[order_id] = state
         self._order_sequence.append(order_id)
         self._seq_counter += 1
         self._registration_seq[order_id] = self._seq_counter
         self._active_order_ids.add(order_id)
 
-        # Auto-register bracket if both SL and TP are populated on the order
-        if (
-            managed_order.stop_loss_price is not None
-            and managed_order.take_profit_price is not None
-        ):
-            self.register_bracket(
-                parent_order_id=order_id,
-                stop_loss_price=managed_order.stop_loss_price,
-                take_profit_price=managed_order.take_profit_price,
-            )
+        try:
+            # Auto-register bracket if both SL and TP are populated on the order
+            if (
+                managed_order.stop_loss_price is not None
+                and managed_order.take_profit_price is not None
+            ):
+                self.register_bracket(
+                    parent_order_id=order_id,
+                    stop_loss_price=managed_order.stop_loss_price,
+                    take_profit_price=managed_order.take_profit_price,
+                )
+        except Exception:
+            # Atomic rollback: revert order registration if bracket creation fails
+            self._orders.pop(order_id, None)
+            if self._order_sequence and self._order_sequence[-1] == order_id:
+                self._order_sequence.pop()
+            self._registration_seq.pop(order_id, None)
+            self._active_order_ids.discard(order_id)
+            if order_id in self._order_to_bracket_id:
+                b_id = self._order_to_bracket_id.pop(order_id)
+                self._brackets.pop(b_id, None)
+                if self._bracket_sequence and self._bracket_sequence[-1] == b_id:
+                    self._bracket_sequence.pop()
+            self._order_roles.pop(order_id, None)
+            raise
 
         return state.to_snapshot()
 
@@ -328,7 +363,7 @@ class OrderManager:
 
         Raises:
             OrderNotFoundError: If parent_order_id is not registered.
-            InvalidOrderStateError: If parent order is cancelled without any fills.
+            InvalidBracketStateError: If parent order is cancelled without any fills.
             DuplicateBracketError: If bracket_id or parent_order_id is already registered with conflicting parameters.
             ValueError: If directional prices violate entry direction or instrument rules.
         """
@@ -432,11 +467,20 @@ class OrderManager:
         # If parent order already had fills before bracket registration, activate child orders immediately
         if parent_state.filled_quantity > Decimal(0):
             bracket.allocated_quantity = parent_state.filled_quantity
-            self._spawn_child_orders(
-                bracket,
-                quantity=bracket.residual_quantity,
-                timestamp=parent_state.last_update_time,
-            )
+            try:
+                self._spawn_child_orders(
+                    bracket,
+                    quantity=bracket.residual_quantity,
+                    timestamp=parent_state.last_update_time,
+                )
+            except Exception:
+                # Rollback bracket registration if child creation fails
+                self._brackets.pop(clean_bracket_id, None)
+                if self._bracket_sequence and self._bracket_sequence[-1] == clean_bracket_id:
+                    self._bracket_sequence.pop()
+                self._order_to_bracket_id.pop(parent_order_id, None)
+                self._order_roles.pop(parent_order_id, None)
+                raise
             bracket.status = BracketStatus.ACTIVE
 
         return bracket.to_snapshot()
@@ -520,6 +564,132 @@ class OrderManager:
         self._replace_single_child_leg(bracket, BracketOrderRole.STOP_LOSS, quantity, timestamp)
         self._replace_single_child_leg(bracket, BracketOrderRole.TAKE_PROFIT, quantity, timestamp)
 
+    def _reconcile_bracket_exit_exposure(
+        self,
+        bracket: Bracket,
+        filled_order_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Reconciles all active protective child legs and parent remainder against bracket residual exposure.
+
+        Enforces:
+        - When residual_quantity == 0:
+          - The bracket transitions to CLOSED.
+          - Every active child order in the bracket is cancelled.
+          - If the order that just filled still has executable leaves, its remaining leaves are cancelled.
+          - If the parent entry order still has executable leaves, the parent remainder is cancelled.
+          - Active child references are cleared only after orders are made non-executable.
+        - When residual_quantity > 0:
+          - Reconciles both STOP_LOSS and TAKE_PROFIT active legs.
+          - If an active child has leaves > residual_quantity, it is cancelled and replaced with residual_quantity.
+          - If an active child has reached a terminal state with 0 leaves, a replacement child is spawned for residual_quantity.
+          - Guarantees neither active leg has leaves > residual_quantity.
+          - Preserves all historical order records and fill history.
+        """
+        if bracket.residual_quantity == Decimal(0):
+            bracket.status = BracketStatus.CLOSED
+
+            # Cancel active stop loss if active
+            if (
+                bracket.active_stop_loss_order_id
+                and bracket.active_stop_loss_order_id in self._active_order_ids
+            ):
+                self.cancel_order(
+                    bracket.active_stop_loss_order_id,
+                    timestamp=timestamp,
+                    reason="Bracket fully closed by exit fill",
+                )
+
+            # Cancel active take profit if active
+            if (
+                bracket.active_take_profit_order_id
+                and bracket.active_take_profit_order_id in self._active_order_ids
+            ):
+                self.cancel_order(
+                    bracket.active_take_profit_order_id,
+                    timestamp=timestamp,
+                    reason="Bracket fully closed by exit fill",
+                )
+
+            # Cancel remaining leaves on filled order if any
+            filled_state = self._orders.get(filled_order_id)
+            if (
+                filled_state is not None
+                and not filled_state.is_terminal
+                and filled_state.leaves_quantity > Decimal(0)
+            ):
+                self.cancel_order(
+                    filled_order_id,
+                    timestamp=timestamp,
+                    reason="Bracket fully closed by exit fill",
+                )
+
+            # Cancel parent entry remainder if parent order still has executable leaves
+            parent_state = self._orders.get(bracket.parent_order_id)
+            if (
+                parent_state is not None
+                and not parent_state.is_terminal
+                and parent_state.leaves_quantity > Decimal(0)
+            ):
+                self.cancel_order(
+                    bracket.parent_order_id,
+                    timestamp=timestamp,
+                    reason="Bracket fully closed by exit fill",
+                )
+
+            bracket.active_stop_loss_order_id = None
+            bracket.active_take_profit_order_id = None
+            bracket.updated_at = timestamp
+            return
+
+        target_qty = bracket.residual_quantity
+
+        # 1. Reconcile Stop-Loss leg
+        sl_id = bracket.active_stop_loss_order_id
+        if sl_id is not None and sl_id in self._orders:
+            sl_state = self._orders[sl_id]
+            if sl_state.leaves_quantity > target_qty:
+                self.cancel_order(
+                    sl_id,
+                    timestamp=timestamp,
+                    reason=f"Bracket residual exposure reduction to {target_qty}",
+                )
+                self._replace_single_child_leg(
+                    bracket, BracketOrderRole.STOP_LOSS, target_qty, timestamp
+                )
+            elif sl_state.is_terminal and sl_state.leaves_quantity == Decimal(0):
+                self._replace_single_child_leg(
+                    bracket, BracketOrderRole.STOP_LOSS, target_qty, timestamp
+                )
+        else:
+            self._replace_single_child_leg(
+                bracket, BracketOrderRole.STOP_LOSS, target_qty, timestamp
+            )
+
+        # 2. Reconcile Take-Profit leg
+        tp_id = bracket.active_take_profit_order_id
+        if tp_id is not None and tp_id in self._orders:
+            tp_state = self._orders[tp_id]
+            if tp_state.leaves_quantity > target_qty:
+                self.cancel_order(
+                    tp_id,
+                    timestamp=timestamp,
+                    reason=f"Bracket residual exposure reduction to {target_qty}",
+                )
+                self._replace_single_child_leg(
+                    bracket, BracketOrderRole.TAKE_PROFIT, target_qty, timestamp
+                )
+            elif tp_state.is_terminal and tp_state.leaves_quantity == Decimal(0):
+                self._replace_single_child_leg(
+                    bracket, BracketOrderRole.TAKE_PROFIT, target_qty, timestamp
+                )
+        else:
+            self._replace_single_child_leg(
+                bracket, BracketOrderRole.TAKE_PROFIT, target_qty, timestamp
+            )
+
+        bracket.updated_at = timestamp
+
     def record_fill(
         self,
         fill: FillRecord,
@@ -533,7 +703,7 @@ class OrderManager:
 
         Args:
             fill: The immutable FillRecord to record.
-            allow_late_fill: Whether to record late fills arriving on cancelled orders.
+            allow_late_fill: Whether to explicitly permit recording late fills arriving on cancelled orders.
             ignore_duplicate: If True, duplicate fill delivery returns existing snapshot idempotently.
 
         Returns:
@@ -544,6 +714,7 @@ class OrderManager:
             OrderNotFoundError: If the fill references an unknown order ID.
             DuplicateFillError: If the fill ID was previously recorded.
             InvalidOrderStateError: If the order is already in a terminal state or cannot transition.
+            InvalidBracketStateError: If an entry fill is submitted against a closed bracket.
             BracketExposureBreachError: If exit fills exceed the bracket's allocated entry exposure.
             ValueError: If fill parameters (symbol, side, quantity, price, etc.) fail validation.
         """
@@ -566,15 +737,17 @@ class OrderManager:
         bracket = self._brackets.get(bracket_id) if bracket_id else None
 
         state = self._orders[fill.order_id]
-        is_bracket_exit = bracket is not None and role in (
-            BracketOrderRole.STOP_LOSS,
-            BracketOrderRole.TAKE_PROFIT,
-        )
-        effective_allow_late = allow_late_fill or is_bracket_exit
 
-        if state.is_terminal and not (effective_allow_late and state.is_cancelled):
+        # Explicit late-fill permission: cancelled orders reject fills unless caller explicitly permits
+        if state.is_terminal and not (allow_late_fill and state.is_cancelled):
             raise InvalidOrderStateError(
                 f"Cannot record fill on terminal order '{fill.order_id}' with status '{state.status.value}'"
+            )
+
+        # Do not allow additional ordinary parent fills to create new exposure under a closed bracket
+        if role == BracketOrderRole.PARENT_ENTRY and bracket is not None and bracket.is_closed:
+            raise InvalidBracketStateError(
+                f"Cannot record parent entry fill for closed bracket '{bracket.bracket_id}'"
             )
 
         if fill.symbol != state.order.symbol:
@@ -612,7 +785,7 @@ class OrderManager:
                 )
 
         # Delegate execution state calculations and validations atomically.
-        state.record_fill(fill, allow_late_fill=effective_allow_late)
+        state.record_fill(fill, allow_late_fill=allow_late_fill)
 
         # Commit fill index
         self._fill_to_order_id[fill.fill_id] = fill.order_id
@@ -688,72 +861,11 @@ class OrderManager:
             elif role in (BracketOrderRole.STOP_LOSS, BracketOrderRole.TAKE_PROFIT):
                 bracket.closed_quantity += fill.fill_quantity
                 bracket.updated_at = fill.timestamp
-                sibling_id = (
-                    bracket.active_take_profit_order_id
-                    if role == BracketOrderRole.STOP_LOSS
-                    else bracket.active_stop_loss_order_id
+                self._reconcile_bracket_exit_exposure(
+                    bracket,
+                    filled_order_id=fill.order_id,
+                    timestamp=fill.timestamp,
                 )
-                filled_leg_id = fill.order_id
-
-                if bracket.residual_quantity == Decimal(0):
-                    # Full exit fill completely closes bracket exposure
-                    bracket.status = BracketStatus.CLOSED
-                    if sibling_id and sibling_id in self._active_order_ids:
-                        self.cancel_order(
-                            sibling_id,
-                            timestamp=fill.timestamp,
-                            reason="OCO sibling leg fully closed bracket",
-                        )
-                    bracket.active_stop_loss_order_id = None
-                    bracket.active_take_profit_order_id = None
-                else:
-                    # Partial exit fill: sibling must be cancelled and replaced with residual_quantity
-                    if sibling_id and sibling_id in self._active_order_ids:
-                        self.cancel_order(
-                            sibling_id,
-                            timestamp=fill.timestamp,
-                            reason=f"OCO sibling partial fill reduction to {bracket.residual_quantity}",
-                        )
-
-                    sibling_role = (
-                        BracketOrderRole.TAKE_PROFIT
-                        if role == BracketOrderRole.STOP_LOSS
-                        else BracketOrderRole.STOP_LOSS
-                    )
-                    self._replace_single_child_leg(
-                        bracket,
-                        sibling_role,
-                        bracket.residual_quantity,
-                        fill.timestamp,
-                    )
-
-                    # Inspect the filled leg
-                    filled_state = self._orders[filled_leg_id]
-                    if filled_state.is_filled or filled_state.is_cancelled:
-                        if (
-                            role == BracketOrderRole.STOP_LOSS
-                            and bracket.active_stop_loss_order_id == filled_leg_id
-                        ):
-                            bracket.active_stop_loss_order_id = None
-                        elif (
-                            role == BracketOrderRole.TAKE_PROFIT
-                            and bracket.active_take_profit_order_id == filled_leg_id
-                        ):
-                            bracket.active_take_profit_order_id = None
-                    else:
-                        # If filled leg leaves exceed residual_quantity, adjust it via cancel-and-replace
-                        if filled_state.leaves_quantity > bracket.residual_quantity:
-                            self.cancel_order(
-                                filled_leg_id,
-                                timestamp=fill.timestamp,
-                                reason=f"OCO filled leg adjustment to {bracket.residual_quantity}",
-                            )
-                            self._replace_single_child_leg(
-                                bracket,
-                                role,
-                                bracket.residual_quantity,
-                                fill.timestamp,
-                            )
 
         return state.to_snapshot()
 
@@ -768,7 +880,7 @@ class OrderManager:
         Preserves all historical fills and executed quantities. Sets executable leaves to zero.
         Transitions the managed core Order to OrderStatus.CANCELLED and removes it from active collections.
         If a parent entry order is cancelled before any fills, the attached bracket is marked CANCELLED.
-        If a parent entry order is cancelled after partial fills, protective child orders remain active.
+        If a parent entry order is cancelled after partial fills or after bracket closure, bracket status is preserved.
 
         Args:
             order_id: Unique ID of the order to cancel.
@@ -827,7 +939,10 @@ class OrderManager:
 
         if bracket is not None:
             if role == BracketOrderRole.PARENT_ENTRY:
-                if state.filled_quantity == Decimal(0):
+                if bracket.status == BracketStatus.CLOSED:
+                    # Bracket was already CLOSED: preserve CLOSED status!
+                    bracket.updated_at = cancel_time
+                elif state.filled_quantity == Decimal(0):
                     bracket.status = BracketStatus.CANCELLED
                     bracket.updated_at = cancel_time
                     if (
@@ -974,13 +1089,8 @@ class OrderManager:
             BracketNotFoundError: If bracket_id is not registered.
             ValueError: If bracket_id contains invalid whitespace.
         """
-        if not bracket_id or not isinstance(bracket_id, str) or not bracket_id.strip():
-            raise ValueError("bracket_id must be a non-empty string")
-        if bracket_id != bracket_id.strip():
-            raise ValueError(
-                f"Bracket ID cannot contain leading or trailing whitespace: '{bracket_id}'"
-            )
-
+        if not bracket_id or not isinstance(bracket_id, str) or bracket_id != bracket_id.strip():
+            raise ValueError(f"Invalid bracket_id '{bracket_id}'")
         if bracket_id not in self._brackets:
             raise BracketNotFoundError(f"Bracket '{bracket_id}' not found in registry")
         return self._brackets[bracket_id].to_snapshot()
