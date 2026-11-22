@@ -71,10 +71,11 @@ It does not contain a `PARTIALLY_FILLED` status. An order in modern electronic m
 
 ## 3. OrderManager Specification
 
-> **Implementation Boundary Note (Milestone 3B.4.2)**:
-> - **Implemented in Milestone 3B.4.2**: Core `OrderManager` registry and lifecycle, permanent vs. active order tracking, idempotent order registration, atomic fill-record routing, remainder cancellation, macro `OrderStatus` synchronization, and read-only `OrderExecutionSnapshot` / `OrderSnapshot` encapsulation isolating manager state from external mutation.
-> - **Pending in Future Stages**: Parent-child OCO bracket relationships, take-profit / stop-loss child order generation, and dynamic child order scaling on partial fills (deferred to subsequent milestone).
-> - **Pending**: `FillEngine` price matching and execution logic (deferred to Milestone 3B.4.4).
+> **Implementation Boundary Note (Milestone 3B.4.3)**:
+> - **Implemented in Milestone 3B.4.1**: Foundational `OrderExecutionState`, `FillRecord`, `ExecutionStatus`, strict Decimal calculations, immutable fill records.
+> - **Implemented in Milestone 3B.4.2**: Core `OrderManager` registry, dual-registry permanent vs. active order tracking, atomic fill-record routing, remainder cancellation, macro `OrderStatus` synchronization, and read-only `OrderExecutionSnapshot` / `OrderSnapshot` encapsulation isolating manager state from external mutation.
+> - **Implemented in Milestone 3B.4.3**: Deterministic OCO bracket lifecycle (`BracketStatus`, `BracketOrderRole`, `BracketSnapshot`), pre-fill protection invariant (zero child orders on market before entry fill), dynamic child order scaling on partial entry fills via audited cancel-and-replace, OCO sibling cancellation and reduction on exit fills, exposure overrun and cancellation race breach tracking (`BracketExposureBreachError`), and complete portfolio accounting separation.
+> - **Pending in Future Stages**: `FillEngine` price matching, quote consumption, and intrabar execution logic (deferred to Milestone 3B.4.4).
 
 ### 3.1 Responsibilities
 - Registers risk-approved orders from `OrderSubmittedEvent` (Priority 4).

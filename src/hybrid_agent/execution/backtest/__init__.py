@@ -1,6 +1,16 @@
 """Native backtest execution engine infrastructure."""
 
 from hybrid_agent.core.constants import TemporalOrderViolationError
+from hybrid_agent.execution.backtest.bracket import (
+    BracketError,
+    BracketExposureBreachError,
+    BracketNotFoundError,
+    BracketOrderRole,
+    BracketSnapshot,
+    BracketStatus,
+    DuplicateBracketError,
+    InvalidBracketStateError,
+)
 from hybrid_agent.execution.backtest.clock import SimulationClock
 from hybrid_agent.execution.backtest.event_queue import (
     MAX_SEQUENCE_ID,
@@ -70,9 +80,16 @@ __all__ = [
     "AccountingLedger",
     "BacktestCompletedEvent",
     "BacktestCurrencyAdapter",
+    "BracketError",
+    "BracketExposureBreachError",
+    "BracketNotFoundError",
+    "BracketOrderRole",
+    "BracketSnapshot",
+    "BracketStatus",
     "CashBook",
     "ClockNotInitializedError",
     "ConversionResult",
+    "DuplicateBracketError",
     "DuplicateFXObservationError",
     "DuplicateFillError",
     "DuplicateOrderError",
@@ -84,6 +101,7 @@ __all__ = [
     "FillRecord",
     "InstrumentAccountingIdentity",
     "InsufficientFundsError",
+    "InvalidBracketStateError",
     "InvalidEventPriorityError",
     "InvalidOrderStateError",
     "LedgerEntry",

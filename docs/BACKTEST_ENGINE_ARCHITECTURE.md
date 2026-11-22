@@ -333,9 +333,9 @@ The `record_fill(fill: FillRecord)` method applies strict pre-flight validation 
 - **Executed Position Preservation**: All executed fills and `filled_quantity` are retained intact. Cancelling an order remainder never invalidates or reverses previously executed positions in `Portfolio`.
 - If an order is already completed (`leaves_quantity == 0`), cancellation is rejected.
 
-#### 6. Dynamic OCO Bracket Scaling (Preview for 3B.4.3)
+#### 6. Dynamic OCO Bracket Scaling (Milestone 3B.4.3)
 - When an entry order partially fills, linked exit child orders (Take-Profit / Stop-Loss) are activated and scaled strictly to the cumulative executed quantity ($Q_{\text{child}} = Q_{\text{filled}}$).
-- Cancelling the remaining entry quantity leaves the child bracket actively protecting the executed inventory without premature termination.
+- Cancelling the remaining entry quantity leaves the child bracket actively protecting the executed inventory without premature termination (see Section 6.4).
 
 ### 6.3 OrderManager Core Lifecycle and Registry (Milestone 3B.4.2)
 
@@ -388,7 +388,57 @@ Milestone 3B.4.2 implements the central `OrderManager` coordinator responsible f
   - Rejects order IDs with surrounding whitespace on registration, retrieval, and cancellation.
   - Rejects orders where `created_at` or `updated_at` postdates the supplied `submission_time`.
 
-### 6.4 CFD Financing & Overnight Holding Model
+### 6.4 OCO Brackets and Contingent Order Management (Milestone 3B.4.3)
+
+Milestone 3B.4.3 implements deterministic OCO (One-Cancels-the-Other) bracket and contingent order lifecycle management within the native execution engine:
+
+#### 1. Parent-Child Order Relationships & Pre-Fill Invariant
+- **Bracket Topology**: A bracket group links a parent entry order to two contingent protective exit legs:
+  - **Stop-Loss Child**: Placed on the market to cap downside loss opposing the entry direction (`OrderType.STOP_LOSS`).
+  - **Take-Profit Child**: Placed on the market to lock in target gains opposing the entry direction (`OrderType.LIMIT`).
+- **Directional Price Invariants**:
+  - For BUY entry: $P_{\text{stop\_loss}} < P_{\text{limit\_price}} < P_{\text{take\_profit}}$ (and $P_{\text{stop\_loss}} < P_{\text{take\_profit}}$).
+  - For SELL entry: $P_{\text{take\_profit}} < P_{\text{limit\_price}} < P_{\text{stop\_loss}}$ (and $P_{\text{take\_profit}} < P_{\text{stop\_loss}}$).
+  - Both stop-loss and take-profit prices must be strictly positive ($> 0.0$). Violations fail closed at registration with `ValueError`.
+- **Pre-Fill Protection Invariant**: Protective child orders are **never placed or registered on the market** before the parent entry order receives fills. While the parent remains pending on the order book, the bracket status is `BracketStatus.PENDING_ENTRY`.
+
+#### 2. Partial Entry Fills & Cancel-and-Replace Scaling
+- **Protection of Actual Executed Exposure**: The bracket protects only the actual executed exposure, not the requested entry quantity.
+- **Audited Cancel-and-Replace**: When multiple entry fills occur (e.g. 30 then 20):
+  1. The bracket's `allocated_quantity` is updated incrementally ($30 \to 50$).
+  2. Rather than silently mutating existing child order quantities, the active protective child legs (sized at 30) are cancelled with explicit audit reason (`"Bracket scale-up replacement to 50.0"`).
+  3. New child orders sized to the new residual exposure (50) are spawned and registered into active collections.
+  4. Preserves the strict immutability of `OrderExecutionState.original_quantity` and append-only fill history.
+
+#### 3. Parent Order Cancellation Semantics
+- **Unfilled Parent Cancellation**: If a parent entry order is cancelled before receiving any fills, the attached bracket transitions to `BracketStatus.CANCELLED`. Zero protective child orders are spawned.
+- **Partially Filled Parent Cancellation**: If an entry order is cancelled after partial execution, the cancellation releases only the unfilled entry remainder. The active protective child orders remain active on the market protecting the already-filled position inventory.
+
+#### 4. OCO Mutual Exclusivity on Exit Fills
+- **Full Exit Fill**: When either the stop-loss or take-profit leg fills completely ($Q_{\text{fill}} = Q_{\text{residual}}$):
+  1. The bracket status transitions to `BracketStatus.CLOSED`.
+  2. The unexecuted sibling exit leg is immediately cancelled with audit reason (`"OCO sibling leg fully closed bracket"`).
+  3. Active leg IDs are cleared; no further child orders can be created or reactivated for that closed exposure.
+- **Partial Exit Fill**: When an exit leg partially fills:
+  1. The bracket's `closed_quantity` increases and `residual_quantity` decreases proportionally.
+  2. The sibling order is cancelled and replaced with reduced quantity matching the residual exposure.
+  3. If the filled leg's executable leaves exceed the new residual quantity, it is also adjusted so both legs protect exactly the residual inventory.
+
+#### 5. Idempotent Events, Cancellation Races & Exposure Breach
+- **Duplicate Fill Events**: Duplicate fill event delivery is detected via `fill_id` indexing and rejected with `DuplicateFillError` (or handled idempotently without double-counting closed quantity or duplicating child protection).
+- **Cancellation Race Limitations**: In deterministic backtests, cancellation takes effect instantaneously. In future live trading or asynchronous broker adapters, cancellation requests do not guarantee an in-flight fill has not already occurred.
+- **Exposure Overrun Protocol (`BracketExposureBreachError`)**: If late reported exit fills on cancelled sibling legs cause cumulative closed quantity to exceed allocated entry exposure ($Q_{\text{closed}} > Q_{\text{allocated}}$):
+  1. The fill record is preserved in the audit log.
+  2. `bracket.has_exposure_breach` is set to `True`.
+  3. `bracket.status` transitions to `BracketStatus.BREACHED`.
+  4. Remaining active legs are cancelled to halt ordinary trading on the affected bracket.
+  5. A clear `BracketExposureBreachError` is raised with full diagnostic details.
+
+#### 6. Authoritative Portfolio Accounting Boundary
+- **Single Source of Truth**: `Portfolio` remains the single authoritative accounting engine for cash balances, positions, margin, and realized/unrealized P&L.
+- **Group-Level Quantity Allocation**: `Bracket` and `OrderManager` maintain strictly group-level quantity metrics (`allocated_quantity`, `closed_quantity`, `residual_quantity`) derived from executed fills. They contain **zero** cash, position, or margin logic.
+
+### 6.5 CFD Financing & Overnight Holding Model
 - **Intraday Holding**: CFD positions opened and closed within the same trading session incur **zero** financing charges.
 - **Overnight Financing Model**: For positions held past the daily rollover cutoff (e.g. 22:00 UTC):
   $$\text{Daily Financing Charge} = \text{Notional} \times \frac{R_{\text{benchmark}} \pm \text{Spread}_{\text{financing}}}{360} \times \text{DaysHeld}$$

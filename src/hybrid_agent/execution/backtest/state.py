@@ -411,13 +411,13 @@ class OrderExecutionState:
         """Whether the execution state has reached a terminal state (FILLED or CANCELLED)."""
         return self._status in (ExecutionStatus.FILLED, ExecutionStatus.CANCELLED)
 
-    def record_fill(self, fill: FillRecord) -> None:
+    def record_fill(self, fill: FillRecord, allow_late_fill: bool = False) -> None:
         """Atomically records an execution fill slice.
 
         Validates all preconditions before mutating state. If any validation fails,
         every state field remains unchanged.
         """
-        if self.is_terminal:
+        if self.is_terminal and not (allow_late_fill and self._status == ExecutionStatus.CANCELLED):
             raise ValueError(
                 f"Cannot record fill on terminal execution state '{self._status.value}'"
             )
@@ -476,11 +476,12 @@ class OrderExecutionState:
                 )
 
         # Check leaves and cumulative boundaries
-        current_leaves = self.leaves_quantity
-        if fill.fill_quantity > current_leaves:
-            raise ValueError(
-                f"Fill quantity {fill.fill_quantity} exceeds executable leaves quantity {current_leaves}"
-            )
+        if not (allow_late_fill and self._status == ExecutionStatus.CANCELLED):
+            current_leaves = self.leaves_quantity
+            if fill.fill_quantity > current_leaves:
+                raise ValueError(
+                    f"Fill quantity {fill.fill_quantity} exceeds executable leaves quantity {current_leaves}"
+                )
 
         new_filled = self._filled_quantity + fill.fill_quantity
         if new_filled > self._original_quantity:
@@ -499,11 +500,14 @@ class OrderExecutionState:
             ccy = fill.commission_currency
             new_fees[ccy] = new_fees.get(ccy, Decimal(0)) + fill.fee
 
-        new_status = (
-            ExecutionStatus.FILLED
-            if new_filled == self._original_quantity
-            else ExecutionStatus.PARTIALLY_FILLED
-        )
+        if self._status != ExecutionStatus.CANCELLED:
+            new_status = (
+                ExecutionStatus.FILLED
+                if new_filled == self._original_quantity
+                else ExecutionStatus.PARTIALLY_FILLED
+            )
+        else:
+            new_status = ExecutionStatus.CANCELLED
 
         # Atomic commit
         self._fills.append(fill)
@@ -513,6 +517,10 @@ class OrderExecutionState:
         self._cumulative_fees = new_fees
         self._status = new_status
         self._last_update_time = fill_time
+        if self._status == ExecutionStatus.CANCELLED and self._cancelled_remainder is not None:
+            self._cancelled_remainder = max(
+                Decimal(0), self._cancelled_remainder - fill.fill_quantity
+            )
 
     def transition_order_status(self, new_status: OrderStatus, timestamp: datetime) -> None:
         """Transitions the wrapped domain Order lifecycle status.
