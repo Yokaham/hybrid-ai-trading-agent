@@ -376,10 +376,17 @@ Milestone 3B.4.2 implements the central `OrderManager` coordinator responsible f
 - **Event Emission**: Emits `OrderCancelledEvent` containing the managed order snapshot, timestamp, and reason.
 - **Zero Portfolio Corruption**: Cancellation does not interact with or reverse existing positions in `Portfolio`.
 
-#### 6. Deterministic Retrieval
-- `get_active_orders(symbol=None)`: Returns active orders sorted deterministically by `(submission_time, registration_sequence, order_id)`.
-- `get_all_orders(symbol=None)`: Returns all orders preserving registration order.
-- Returned collections are defensive list copies, protecting internal manager registries from external mutation.
+#### 6. Deterministic Retrieval & Read-Only Snapshot Isolation
+- **Public API Snapshot Encapsulation**: All inspection and retrieval methods (`register_order()`, `record_fill()`, `get_execution_state()`, `get_active_orders()`, `get_all_orders()`, `get_order_by_fill_id()`) strictly return immutable `OrderExecutionSnapshot` objects containing frozen `OrderSnapshot` representations.
+- **Zero Registry Corruption**: External callers cannot invoke mutation methods (`record_fill`, `cancel_remaining`, `transition_order_status`) on returned objects or mutate fields on underlying order entities (`FrozenInstanceError`), cumulative fee maps (`MappingProxyType`), or fill sequences (`tuple`).
+- **Defensive Boundary**: `OrderExecutionState.order` and `OrderCancelledEvent.order` return independent deep copies of the internal order entity, preventing external mutations from modifying internal records.
+- **Deterministic Ordering**: `get_active_orders(symbol=None)` sorts active orders by `(submission_time, registration_sequence, order_id)`.
+- **Edge-Case Hardening**:
+  - Validates order lifecycle status prior to duplicate-registration handling.
+  - Enforces `order.created_at` equality during duplicate intent matching.
+  - Supports safe, validated attachment of late-supplied `InstrumentSpecification` on re-registration.
+  - Rejects order IDs with surrounding whitespace on registration, retrieval, and cancellation.
+  - Rejects orders where `created_at` or `updated_at` postdates the supplied `submission_time`.
 
 ### 6.4 CFD Financing & Overnight Holding Model
 - **Intraday Holding**: CFD positions opened and closed within the same trading session incur **zero** financing charges.

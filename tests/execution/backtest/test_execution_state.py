@@ -275,7 +275,13 @@ class TestOrderExecutionStateInit:
         state = OrderExecutionState(
             sample_order, submission_time=base_time, instrument_spec=sample_spec
         )
-        assert state.order is sample_order
+        assert state.order == sample_order
+        assert state.order is not sample_order
+        # Verify defensive copy isolation
+        order_copy = state.order
+        order_copy.quantity = 999.0
+        assert state.order.quantity == 100.0
+        assert state.original_quantity == Decimal("100.0")
         assert state.submission_time == base_time
         assert state.original_quantity == Decimal("100.0")
         assert state.filled_quantity == Decimal(0)

@@ -1,5 +1,6 @@
-"""Comprehensive unit test suite for OrderManager core lifecycle and registry."""
+"""Comprehensive unit test suite for OrderManager core lifecycle, registry, and snapshot isolation."""
 
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -23,6 +24,8 @@ from hybrid_agent.execution.backtest.order_manager import (
 from hybrid_agent.execution.backtest.state import (
     ExecutionStatus,
     FillRecord,
+    OrderExecutionSnapshot,
+    OrderSnapshot,
 )
 
 
@@ -100,12 +103,14 @@ class TestOrderRegistration:
             submission_time=base_time,
         )
 
-        state = manager.register_order(event, instrument_spec=sample_spec)
+        snapshot = manager.register_order(event, instrument_spec=sample_spec)
 
-        assert state.order.id == "ord-001"
-        assert state.order.status == OrderStatus.SUBMITTED
-        assert state.status == ExecutionStatus.ACTIVE
-        assert state.leaves_quantity == Decimal(100)
+        assert isinstance(snapshot, OrderExecutionSnapshot)
+        assert isinstance(snapshot.order, OrderSnapshot)
+        assert snapshot.order.id == "ord-001"
+        assert snapshot.order.status == OrderStatus.SUBMITTED
+        assert snapshot.status == ExecutionStatus.ACTIVE
+        assert snapshot.leaves_quantity == Decimal(100)
         assert manager.has_order("ord-001")
         assert manager.active_order_count == 1
         assert manager.total_order_count == 1
@@ -123,12 +128,12 @@ class TestOrderRegistration:
             submission_time=base_time,
         )
 
-        state = manager.register_order(event, instrument_spec=sample_spec)
+        snapshot = manager.register_order(event, instrument_spec=sample_spec)
 
-        assert state.order.id == "ord-002"
-        assert state.order.status == OrderStatus.SUBMITTED
-        assert state.status == ExecutionStatus.ACTIVE
-        assert state.leaves_quantity == Decimal(50)
+        assert snapshot.order.id == "ord-002"
+        assert snapshot.order.status == OrderStatus.SUBMITTED
+        assert snapshot.status == ExecutionStatus.ACTIVE
+        assert snapshot.leaves_quantity == Decimal(50)
 
     def test_reject_pending_risk_order(
         self, base_time: datetime, sample_spec: InstrumentSpecification
@@ -274,6 +279,53 @@ class TestOrderRegistration:
         with pytest.raises(ValueError, match="must match event.submission_time"):
             manager.register_order(event)
 
+    def test_reject_backward_lifecycle_timestamps(
+        self, base_time: datetime, sample_approved_order: Order
+    ) -> None:
+        manager = OrderManager()
+        # created_at in future relative to submission_time
+        order_future_created = sample_approved_order.model_copy(deep=True)
+        object.__setattr__(order_future_created, "created_at", base_time + timedelta(seconds=5))
+        with pytest.raises(
+            ValueError, match="order.created_at .* cannot be later than submission_time"
+        ):
+            manager.register_order(
+                OrderSubmittedEvent(
+                    timestamp=base_time,
+                    order=order_future_created,
+                    submission_time=base_time,
+                )
+            )
+
+        # updated_at in future relative to submission_time
+        order_future_updated = sample_approved_order.model_copy(deep=True)
+        object.__setattr__(order_future_updated, "updated_at", base_time + timedelta(seconds=5))
+        with pytest.raises(
+            ValueError, match="order.updated_at .* cannot be later than submission_time"
+        ):
+            manager.register_order(
+                OrderSubmittedEvent(
+                    timestamp=base_time,
+                    order=order_future_updated,
+                    submission_time=base_time,
+                )
+            )
+
+    def test_reject_whitespace_in_order_id(
+        self, base_time: datetime, sample_approved_order: Order
+    ) -> None:
+        manager = OrderManager()
+        order_space = sample_approved_order.model_copy(deep=True)
+        object.__setattr__(order_space, "id", " ord-001 ")
+        with pytest.raises(ValueError, match="cannot contain leading or trailing whitespace"):
+            manager.register_order(
+                OrderSubmittedEvent(
+                    timestamp=base_time,
+                    order=order_space,
+                    submission_time=base_time,
+                )
+            )
+
     def test_original_input_order_is_not_mutated(
         self,
         base_time: datetime,
@@ -287,17 +339,17 @@ class TestOrderRegistration:
             submission_time=base_time,
         )
 
-        state = manager.register_order(event, instrument_spec=sample_spec)
+        snapshot = manager.register_order(event, instrument_spec=sample_spec)
 
         # Manager's copy must be SUBMITTED
-        assert state.order.status == OrderStatus.SUBMITTED
+        assert snapshot.order.status == OrderStatus.SUBMITTED
         # Original input order remains APPROVED
         assert sample_approved_order.status == OrderStatus.APPROVED
 
         # Subsequent mutation of input order must not alter manager's state
         sample_approved_order.quantity = 999.0
-        assert state.original_quantity == Decimal(100)
-        assert state.order.quantity == 100.0
+        assert snapshot.original_quantity == Decimal(100)
+        assert snapshot.order.quantity == 100.0
 
     def test_duplicate_registration_idempotency(
         self,
@@ -311,7 +363,7 @@ class TestOrderRegistration:
             order=sample_approved_order,
             submission_time=base_time,
         )
-        state1 = manager.register_order(event1, instrument_spec=sample_spec)
+        snap1 = manager.register_order(event1, instrument_spec=sample_spec)
 
         # Re-register identical order and submission timestamp
         event2 = OrderSubmittedEvent(
@@ -319,11 +371,101 @@ class TestOrderRegistration:
             order=sample_approved_order,
             submission_time=base_time,
         )
-        state2 = manager.register_order(event2, instrument_spec=sample_spec)
+        snap2 = manager.register_order(event2, instrument_spec=sample_spec)
 
-        assert state1 is state2
+        assert snap1 == snap2
+        assert snap1.order.id == snap2.order.id
         assert manager.active_order_count == 1
         assert manager.total_order_count == 1
+
+    def test_duplicate_delivery_with_invalid_status_rejected_before_idempotency(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event1 = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=sample_approved_order,
+            submission_time=base_time,
+        )
+        manager.register_order(event1, instrument_spec=sample_spec)
+
+        # Re-registering with invalid status CANCELLED must fail before duplicate handling
+        order_invalid = sample_approved_order.model_copy(deep=True)
+        object.__setattr__(order_invalid, "status", OrderStatus.CANCELLED)
+        event_invalid = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=order_invalid,
+            submission_time=base_time,
+        )
+        with pytest.raises(InvalidOrderStateError, match="APPROVED or SUBMITTED"):
+            manager.register_order(event_invalid, instrument_spec=sample_spec)
+
+    def test_duplicate_order_id_with_different_creation_time_rejected(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event1 = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=sample_approved_order,
+            submission_time=base_time,
+        )
+        manager.register_order(event1, instrument_spec=sample_spec)
+
+        # Same order ID but different created_at
+        diff_order = sample_approved_order.model_copy(deep=True)
+        object.__setattr__(diff_order, "created_at", base_time - timedelta(seconds=20))
+        event2 = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=diff_order,
+            submission_time=base_time,
+        )
+        with pytest.raises(DuplicateOrderError, match="conflicting order parameters"):
+            manager.register_order(event2, instrument_spec=sample_spec)
+
+    def test_late_instrument_specification_attachment(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        # Initial registration without instrument spec
+        event1 = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=sample_approved_order,
+            submission_time=base_time,
+        )
+        snap1 = manager.register_order(event1, instrument_spec=None)
+        assert snap1.order.id == "ord-001"
+
+        # Subsequent idempotent registration with spec attaches spec safely
+        event2 = OrderSubmittedEvent(
+            timestamp=base_time,
+            order=sample_approved_order,
+            submission_time=base_time,
+        )
+        snap2 = manager.register_order(event2, instrument_spec=sample_spec)
+        assert snap2.order.id == "ord-001"
+
+        # Conflicting late spec must be rejected
+        conflicting_spec = InstrumentSpecification(
+            symbol="AAPL",
+            tick_size=0.10,
+            contract_size=1.0,
+            min_volume=1.0,
+            volume_step=1.0,
+            profit_currency="USD",
+            quote_currency="USD",
+            base_currency="USD",
+        )
+        with pytest.raises(DuplicateOrderError, match="conflicting instrument specification"):
+            manager.register_order(event2, instrument_spec=conflicting_spec)
 
     def test_reject_duplicate_order_id_with_conflicting_parameters(
         self,
@@ -385,7 +527,25 @@ class TestOrderRetrieval:
 
         assert manager.has_order("ord-001")
         retrieved = manager.get_execution_state("ord-001")
-        assert retrieved is registered
+        assert retrieved == registered
+        assert isinstance(retrieved, OrderExecutionSnapshot)
+
+    def test_whitespace_order_id_lookup_rejected(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        manager.register_order(event, instrument_spec=sample_spec)
+
+        with pytest.raises(ValueError, match="cannot contain leading or trailing whitespace"):
+            manager.get_execution_state(" ord-001 ")
+
+        assert not manager.has_order(" ord-001 ")
 
     def test_get_active_orders_and_all_orders_with_symbol_filter(
         self, base_time: datetime, sample_spec: InstrumentSpecification
@@ -518,16 +678,17 @@ class TestOrderFillRecording:
             commission_currency="USD",
         )
 
-        state = manager.record_fill(fill)
+        snapshot = manager.record_fill(fill)
 
-        assert state.status == ExecutionStatus.PARTIALLY_FILLED
-        assert state.order.status == OrderStatus.SUBMITTED
-        assert state.filled_quantity == Decimal(40)
-        assert state.leaves_quantity == Decimal(60)
-        assert state.unfilled_quantity == Decimal(60)
-        assert state.average_fill_price == Decimal("150.25")
+        assert isinstance(snapshot, OrderExecutionSnapshot)
+        assert snapshot.status == ExecutionStatus.PARTIALLY_FILLED
+        assert snapshot.order.status == OrderStatus.SUBMITTED
+        assert snapshot.filled_quantity == Decimal(40)
+        assert snapshot.leaves_quantity == Decimal(60)
+        assert snapshot.unfilled_quantity == Decimal(60)
+        assert snapshot.average_fill_price == Decimal("150.25")
         assert manager.active_order_count == 1
-        assert manager.get_order_by_fill_id("fill-001") is state
+        assert manager.get_order_by_fill_id("fill-001") == snapshot
 
     def test_multiple_partial_fills_and_full_fill_completion(
         self,
@@ -569,18 +730,17 @@ class TestOrderFillRecording:
             )
         )
 
-        state = manager.get_execution_state("ord-001")
-        assert state.status == ExecutionStatus.PARTIALLY_FILLED
-        assert state.filled_quantity == Decimal(70)
-        assert state.leaves_quantity == Decimal(30)
-        # Avg price = (40*150 + 30*152) / 70 = (6000 + 4560) / 70 = 10560 / 70 = 150.857142857...
+        snapshot = manager.get_execution_state("ord-001")
+        assert snapshot.status == ExecutionStatus.PARTIALLY_FILLED
+        assert snapshot.filled_quantity == Decimal(70)
+        assert snapshot.leaves_quantity == Decimal(30)
         expected_avg = Decimal(10560) / Decimal(70)
-        assert state.average_fill_price == expected_avg
+        assert snapshot.average_fill_price == expected_avg
         assert manager.active_order_count == 1
 
         # Fill 3: final 30 shares @ 151.0 (completing order)
         t3 = base_time + timedelta(seconds=3)
-        completed_state = manager.record_fill(
+        completed_snapshot = manager.record_fill(
             FillRecord(
                 fill_id="f-3",
                 order_id="ord-001",
@@ -592,11 +752,11 @@ class TestOrderFillRecording:
             )
         )
 
-        assert completed_state.status == ExecutionStatus.FILLED
-        assert completed_state.order.status == OrderStatus.FILLED
-        assert completed_state.order.updated_at == t3
-        assert completed_state.filled_quantity == Decimal(100)
-        assert completed_state.leaves_quantity == Decimal(0)
+        assert completed_snapshot.status == ExecutionStatus.FILLED
+        assert completed_snapshot.order.status == OrderStatus.FILLED
+        assert completed_snapshot.order.updated_at == t3
+        assert completed_snapshot.filled_quantity == Decimal(100)
+        assert completed_snapshot.leaves_quantity == Decimal(0)
         assert manager.active_order_count == 0
         assert manager.total_order_count == 1
         assert len(manager.get_active_orders()) == 0
@@ -726,7 +886,6 @@ class TestOrderFillRecording:
         )
         manager.register_order(event, instrument_spec=sample_spec)
 
-        # Mismatched symbol
         fill_wrong_symbol = FillRecord(
             fill_id="f-sym",
             order_id="ord-001",
@@ -739,7 +898,6 @@ class TestOrderFillRecording:
         with pytest.raises(ValueError, match="does not match order symbol"):
             manager.record_fill(fill_wrong_symbol)
 
-        # Mismatched side
         fill_wrong_side = FillRecord(
             fill_id="f-side",
             order_id="ord-001",
@@ -764,7 +922,6 @@ class TestOrderFillRecording:
         )
         manager.register_order(event, instrument_spec=sample_spec)
 
-        # Complete fill of 100
         manager.record_fill(
             FillRecord(
                 fill_id="f-complete",
@@ -777,7 +934,6 @@ class TestOrderFillRecording:
             )
         )
 
-        # Subsequent fill attempt
         fill_after = FillRecord(
             fill_id="f-after",
             order_id="ord-001",
@@ -802,7 +958,6 @@ class TestOrderFillRecording:
         )
         manager.register_order(event, instrument_spec=sample_spec)
 
-        # Valid initial partial fill of 40
         manager.record_fill(
             FillRecord(
                 fill_id="f-good",
@@ -815,11 +970,10 @@ class TestOrderFillRecording:
             )
         )
 
-        state_before = manager.get_execution_state("ord-001")
-        assert state_before.filled_quantity == Decimal(40)
-        assert state_before.leaves_quantity == Decimal(60)
+        snap_before = manager.get_execution_state("ord-001")
+        assert snap_before.filled_quantity == Decimal(40)
+        assert snap_before.leaves_quantity == Decimal(60)
 
-        # Overfill attempt: remaining is 60, attempt 70
         bad_fill = FillRecord(
             fill_id="f-bad-overfill",
             order_id="ord-001",
@@ -833,11 +987,10 @@ class TestOrderFillRecording:
         with pytest.raises(ValueError, match="exceeds executable leaves quantity"):
             manager.record_fill(bad_fill)
 
-        # Verify manager indexes and execution state are completely untouched
-        state_after = manager.get_execution_state("ord-001")
-        assert state_after.filled_quantity == Decimal(40)
-        assert state_after.leaves_quantity == Decimal(60)
-        assert state_after.status == ExecutionStatus.PARTIALLY_FILLED
+        snap_after = manager.get_execution_state("ord-001")
+        assert snap_after.filled_quantity == Decimal(40)
+        assert snap_after.leaves_quantity == Decimal(60)
+        assert snap_after.status == ExecutionStatus.PARTIALLY_FILLED
         assert manager.get_order_by_fill_id("f-bad-overfill") is None
         assert manager.active_order_count == 1
 
@@ -873,17 +1026,16 @@ class TestOrderCancellation:
         assert cancelled_event.order.status == OrderStatus.CANCELLED
         assert cancelled_event.reason == "User cancelled resting order"
 
-        state = manager.get_execution_state("ord-001")
-        assert state.status == ExecutionStatus.CANCELLED
-        assert state.order.status == OrderStatus.CANCELLED
-        assert state.filled_quantity == Decimal(0)
-        assert state.leaves_quantity == Decimal(0)
-        assert state.cancelled_quantity == Decimal(100)
-        assert state.unfilled_quantity == Decimal(100)
-        assert state.cancellation_timestamp == t_cancel
-        assert state.cancellation_reason == "User cancelled resting order"
+        snapshot = manager.get_execution_state("ord-001")
+        assert snapshot.status == ExecutionStatus.CANCELLED
+        assert snapshot.order.status == OrderStatus.CANCELLED
+        assert snapshot.filled_quantity == Decimal(0)
+        assert snapshot.leaves_quantity == Decimal(0)
+        assert snapshot.cancelled_quantity == Decimal(100)
+        assert snapshot.unfilled_quantity == Decimal(100)
+        assert snapshot.cancellation_timestamp == t_cancel
+        assert snapshot.cancellation_reason == "User cancelled resting order"
 
-        # Active vs total accounting
         assert manager.active_order_count == 0
         assert manager.total_order_count == 1
         assert len(manager.get_active_orders()) == 0
@@ -901,7 +1053,6 @@ class TestOrderCancellation:
         )
         manager.register_order(event, instrument_spec=sample_spec)
 
-        # 30 shares filled
         manager.record_fill(
             FillRecord(
                 fill_id="f-partial",
@@ -914,23 +1065,19 @@ class TestOrderCancellation:
             )
         )
 
-        # Cancel remaining 70 shares
         t_cancel = base_time + timedelta(seconds=5)
         manager.cancel_order("ord-001", timestamp=t_cancel, reason="Partial remainder cancelled")
 
-        state = manager.get_execution_state("ord-001")
-        assert state.status == ExecutionStatus.CANCELLED
-        assert state.order.status == OrderStatus.CANCELLED
-        # Executed fill preserved
-        assert state.filled_quantity == Decimal(30)
-        assert len(state.fills) == 1
-        assert state.average_fill_price == Decimal("150.50")
-        # Leaves zeroed out
-        assert state.leaves_quantity == Decimal(0)
-        # Cancelled remainder recorded
-        assert state.cancelled_quantity == Decimal(70)
-        assert state.unfilled_quantity == Decimal(70)
-        assert state.cancellation_timestamp == t_cancel
+        snapshot = manager.get_execution_state("ord-001")
+        assert snapshot.status == ExecutionStatus.CANCELLED
+        assert snapshot.order.status == OrderStatus.CANCELLED
+        assert snapshot.filled_quantity == Decimal(30)
+        assert len(snapshot.fills) == 1
+        assert snapshot.average_fill_price == Decimal("150.50")
+        assert snapshot.leaves_quantity == Decimal(0)
+        assert snapshot.cancelled_quantity == Decimal(70)
+        assert snapshot.unfilled_quantity == Decimal(70)
+        assert snapshot.cancellation_timestamp == t_cancel
 
         assert manager.active_order_count == 0
         assert manager.total_order_count == 1
@@ -939,6 +1086,11 @@ class TestOrderCancellation:
         manager = OrderManager()
         with pytest.raises(OrderNotFoundError, match="not found in registry"):
             manager.cancel_order("ord-missing", timestamp=base_time, reason="cancel")
+
+    def test_reject_cancel_with_whitespace_order_id(self, base_time: datetime) -> None:
+        manager = OrderManager()
+        with pytest.raises(ValueError, match="cannot contain leading or trailing whitespace"):
+            manager.cancel_order(" ord-001 ", timestamp=base_time, reason="cancel")
 
     def test_reject_repeated_cancellation(
         self,
@@ -1025,7 +1177,181 @@ class TestOrderCancellation:
 
 
 # ==============================================================================
-# 5. Determinism & Lifecycle Rules Tests
+# 5. Adversarial Encapsulation & Snapshot Isolation Tests
+# ==============================================================================
+
+
+class TestAdversarialEncapsulation:
+    def test_snapshot_mutation_is_strictly_impossible(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        snapshot = manager.register_order(event, instrument_spec=sample_spec)
+
+        # Mutating frozen snapshot fields directly must raise FrozenInstanceError
+        with pytest.raises(FrozenInstanceError):
+            snapshot.leaves_quantity = Decimal(0)  # type: ignore[misc]
+
+        with pytest.raises(FrozenInstanceError):
+            snapshot.filled_quantity = Decimal(100)  # type: ignore[misc]
+
+        with pytest.raises(FrozenInstanceError):
+            snapshot.status = ExecutionStatus.FILLED  # type: ignore[misc]
+
+        # Mutating nested OrderSnapshot must raise FrozenInstanceError
+        with pytest.raises(FrozenInstanceError):
+            snapshot.order.quantity = 999.0  # type: ignore[misc]
+
+        with pytest.raises(FrozenInstanceError):
+            snapshot.order.status = OrderStatus.CANCELLED  # type: ignore[misc]
+
+        with pytest.raises(FrozenInstanceError):
+            snapshot.order.limit_price = 50.0  # type: ignore[misc]
+
+    def test_snapshot_fees_and_fills_cannot_be_mutated(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        manager.register_order(event, instrument_spec=sample_spec)
+
+        fill = FillRecord(
+            fill_id="f-fee",
+            order_id="ord-001",
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            fill_price=Decimal(150),
+            fill_quantity=Decimal(10),
+            fee=Decimal(2),
+            commission_currency="USD",
+            timestamp=base_time + timedelta(seconds=1),
+        )
+        snapshot = manager.record_fill(fill)
+
+        # Cumulative fees proxy rejects mutation
+        with pytest.raises(TypeError):
+            snapshot.cumulative_fees["USD"] = Decimal(999)  # type: ignore[index]
+
+        # Fills tuple rejects mutation
+        with pytest.raises(AttributeError):
+            snapshot.fills.append(fill)  # type: ignore[attr-defined]
+
+    def test_direct_execution_state_mutation_methods_do_not_exist_on_snapshot(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        snapshot = manager.register_order(event, instrument_spec=sample_spec)
+
+        # record_fill does not exist on snapshot
+        assert not hasattr(snapshot, "record_fill")
+
+        # cancel_remaining does not exist on snapshot
+        assert not hasattr(snapshot, "cancel_remaining")
+
+        # transition_order_status does not exist on snapshot
+        assert not hasattr(snapshot, "transition_order_status")
+
+    def test_mutating_cancelled_event_order_does_not_modify_manager(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        manager.register_order(event, instrument_spec=sample_spec)
+
+        cancelled_event = manager.cancel_order(
+            "ord-001", timestamp=base_time + timedelta(seconds=1), reason="cancel"
+        )
+
+        # Mutate the order entity returned in the event
+        cancelled_event.order.quantity = 999.0
+        cancelled_event.order.limit_price = 1.0
+
+        # Manager's internal state must remain completely unaltered
+        snapshot = manager.get_execution_state("ord-001")
+        assert snapshot.original_quantity == Decimal(100)
+        assert snapshot.order.quantity == 100.0
+        assert snapshot.order.limit_price == 150.0
+
+    def test_mutating_items_from_returned_lists_is_impossible(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        manager.register_order(event, instrument_spec=sample_spec)
+
+        active_orders = manager.get_active_orders()
+        assert len(active_orders) == 1
+        with pytest.raises(FrozenInstanceError):
+            active_orders[0].leaves_quantity = Decimal(0)  # type: ignore[misc]
+
+        all_orders = manager.get_all_orders()
+        assert len(all_orders) == 1
+        with pytest.raises(FrozenInstanceError):
+            all_orders[0].order.quantity = 0.0  # type: ignore[misc]
+
+    def test_active_order_count_and_state_consistency(
+        self,
+        base_time: datetime,
+        sample_approved_order: Order,
+        sample_spec: InstrumentSpecification,
+    ) -> None:
+        manager = OrderManager()
+        event = OrderSubmittedEvent(
+            timestamp=base_time, order=sample_approved_order, submission_time=base_time
+        )
+        manager.register_order(event, instrument_spec=sample_spec)
+
+        assert manager.active_order_count == len(manager.get_active_orders()) == 1
+
+        # Partial fill
+        manager.record_fill(
+            FillRecord(
+                fill_id="f-1",
+                order_id="ord-001",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                fill_price=Decimal(150),
+                fill_quantity=Decimal(50),
+                timestamp=base_time + timedelta(seconds=1),
+            )
+        )
+        assert manager.active_order_count == len(manager.get_active_orders()) == 1
+
+        # Cancellation of remainder
+        manager.cancel_order("ord-001", timestamp=base_time + timedelta(seconds=2), reason="done")
+        assert manager.active_order_count == len(manager.get_active_orders()) == 0
+        assert manager.total_order_count == len(manager.get_all_orders()) == 1
+
+
+# ==============================================================================
+# 6. Determinism Tests
 # ==============================================================================
 
 
@@ -1036,7 +1362,6 @@ class TestOrderManagerDeterminism:
         manager = OrderManager()
         manager.register_instrument(sample_spec)
 
-        # Register 3 orders at identical submission time
         for i in [3, 1, 2]:
             order = Order(
                 id=f"ord-{i}",
@@ -1054,7 +1379,6 @@ class TestOrderManagerDeterminism:
             )
 
         active = manager.get_active_orders()
-        # Insertion order was ord-3, ord-1, ord-2. Registration sequence breaks ties deterministically.
         assert [s.order.id for s in active] == ["ord-3", "ord-1", "ord-2"]
 
     def test_terminal_orders_never_reenter_active_registry(
@@ -1069,16 +1393,13 @@ class TestOrderManagerDeterminism:
         )
         manager.register_order(event, instrument_spec=sample_spec)
 
-        # Cancel order
         manager.cancel_order(
             "ord-001", timestamp=base_time + timedelta(seconds=1), reason="cancelled"
         )
         assert manager.active_order_count == 0
 
-        # Attempt to re-register the same order idempotently
         reregistered = manager.register_order(event, instrument_spec=sample_spec)
         assert reregistered.status == ExecutionStatus.CANCELLED
-        # It must NOT re-enter active orders!
         assert manager.active_order_count == 0
         assert len(manager.get_active_orders()) == 0
         assert manager.total_order_count == 1

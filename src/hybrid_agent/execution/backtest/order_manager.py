@@ -9,6 +9,7 @@ from hybrid_agent.execution.backtest.events import OrderCancelledEvent, OrderSub
 from hybrid_agent.execution.backtest.state import (
     ExecutionStatus,
     FillRecord,
+    OrderExecutionSnapshot,
     OrderExecutionState,
 )
 
@@ -43,6 +44,7 @@ class OrderManager:
     - Maintains ZERO independent cash balances, position inventories, or margin collateral.
     - Performs NO price matching or fill calculation (delegated to FillEngine).
     - Delegates all authoritative accounting to Portfolio.apply_fill().
+    - Returns read-only OrderExecutionSnapshot instances to prevent external mutation of internal registries.
     """
 
     def __init__(self) -> None:
@@ -83,22 +85,23 @@ class OrderManager:
         self,
         event: OrderSubmittedEvent,
         instrument_spec: InstrumentSpecification | None = None,
-    ) -> OrderExecutionState:
+    ) -> OrderExecutionSnapshot:
         """Registers an approved or submitted order into the execution engine.
 
         Creates an OrderExecutionState snapshot using the explicit simulation submission timestamp.
         Guarantees that external mutations to the input order object do not alter the managed state.
+        Returns an immutable OrderExecutionSnapshot.
 
         Args:
             event: The OrderSubmittedEvent containing the order and submission timestamp.
             instrument_spec: Optional InstrumentSpecification override or registration.
 
         Returns:
-            The newly created or idempotently retrieved OrderExecutionState.
+            An immutable OrderExecutionSnapshot of the newly registered or idempotently retrieved order.
 
         Raises:
             TypeError: If event or order are of invalid types.
-            ValueError: If timestamps are invalid or do not agree, or specifications conflict.
+            ValueError: If timestamps are invalid, out of chronological order, or specifications conflict.
             InvalidOrderStateError: If the order is not in APPROVED or SUBMITTED status.
             DuplicateOrderError: If the order ID is already registered with conflicting parameters.
         """
@@ -118,10 +121,30 @@ class OrderManager:
 
         if not order.id or not isinstance(order.id, str) or not order.id.strip():
             raise ValueError("order.id must be a non-empty string")
-        order_id = order.id.strip()
+        if order.id != order.id.strip():
+            raise ValueError(
+                f"Order ID cannot contain leading or trailing whitespace: '{order.id}'"
+            )
+        order_id = order.id
 
-        # Resolve and validate instrument specification
-        spec: InstrumentSpecification | None
+        # Validate chronological order creation/update vs submission timestamp
+        if order.created_at > sub_time:
+            raise ValueError(
+                f"order.created_at ({order.created_at.isoformat()}) cannot be later than submission_time ({sub_time.isoformat()})"
+            )
+        if order.updated_at > sub_time:
+            raise ValueError(
+                f"order.updated_at ({order.updated_at.isoformat()}) cannot be later than submission_time ({sub_time.isoformat()})"
+            )
+
+        # Validate order lifecycle status first (before duplicate handling)
+        if order.status not in (OrderStatus.APPROVED, OrderStatus.SUBMITTED):
+            raise InvalidOrderStateError(
+                f"Cannot register order '{order_id}' in lifecycle status '{order.status.value}'. "
+                f"Order must be in APPROVED or SUBMITTED status."
+            )
+
+        # Validate instrument specification type and symbol if provided
         if instrument_spec is not None:
             if not isinstance(instrument_spec, InstrumentSpecification):
                 raise TypeError(
@@ -131,6 +154,52 @@ class OrderManager:
                 raise ValueError(
                     f"Instrument specification symbol '{instrument_spec.symbol}' does not match order symbol '{order.symbol}'"
                 )
+
+        # Handle duplicate registration
+        if order_id in self._orders:
+            existing_state = self._orders[order_id]
+            existing_order = existing_state.order
+
+            if instrument_spec is not None:
+                if (
+                    existing_state.instrument_spec is not None
+                    and existing_state.instrument_spec != instrument_spec
+                ):
+                    raise DuplicateOrderError(
+                        f"Order ID '{order_id}' is already registered with a conflicting instrument specification"
+                    )
+                if (
+                    order.symbol in self._instrument_specs
+                    and self._instrument_specs[order.symbol] != instrument_spec
+                ):
+                    raise DuplicateOrderError(
+                        f"Order ID '{order_id}' is already registered with a conflicting instrument specification"
+                    )
+
+            is_identical = (
+                existing_order.symbol == order.symbol
+                and existing_order.side == order.side
+                and existing_order.order_type == order.order_type
+                and Decimal(str(existing_order.quantity)) == Decimal(str(order.quantity))
+                and existing_order.limit_price == order.limit_price
+                and existing_order.stop_loss_price == order.stop_loss_price
+                and existing_order.take_profit_price == order.take_profit_price
+                and existing_order.created_at == order.created_at
+                and existing_state.submission_time == sub_time
+            )
+            if is_identical:
+                # Safe validated attachment of late instrument specification
+                if instrument_spec is not None and existing_state.instrument_spec is None:
+                    existing_state.attach_instrument_spec(instrument_spec)
+                    self.register_instrument(instrument_spec)
+                return existing_state.to_snapshot()
+            raise DuplicateOrderError(
+                f"Order ID '{order_id}' is already registered with conflicting order parameters"
+            )
+
+        # New order registration: resolve and register instrument spec
+        spec: InstrumentSpecification | None
+        if instrument_spec is not None:
             if (
                 order.symbol in self._instrument_specs
                 and self._instrument_specs[order.symbol] != instrument_spec
@@ -142,33 +211,6 @@ class OrderManager:
             spec = instrument_spec
         else:
             spec = self._instrument_specs.get(order.symbol)
-
-        # Handle duplicate registration
-        if order_id in self._orders:
-            existing_state = self._orders[order_id]
-            existing_order = existing_state.order
-            is_identical = (
-                existing_order.symbol == order.symbol
-                and existing_order.side == order.side
-                and existing_order.order_type == order.order_type
-                and Decimal(str(existing_order.quantity)) == Decimal(str(order.quantity))
-                and existing_order.limit_price == order.limit_price
-                and existing_order.stop_loss_price == order.stop_loss_price
-                and existing_order.take_profit_price == order.take_profit_price
-                and existing_state.submission_time == sub_time
-            )
-            if is_identical:
-                return existing_state
-            raise DuplicateOrderError(
-                f"Order ID '{order_id}' is already registered with conflicting order parameters"
-            )
-
-        # Validate order lifecycle status
-        if order.status not in (OrderStatus.APPROVED, OrderStatus.SUBMITTED):
-            raise InvalidOrderStateError(
-                f"Cannot register order '{order_id}' in lifecycle status '{order.status.value}'. "
-                f"Order must be in APPROVED or SUBMITTED status."
-            )
 
         # Protect original input order by creating a deep copy for manager ownership
         managed_order = order.model_copy(deep=True)
@@ -189,16 +231,16 @@ class OrderManager:
         self._registration_seq[order_id] = self._seq_counter
         self._active_order_ids.add(order_id)
 
-        return state
+        return state.to_snapshot()
 
-    def record_fill(self, fill: FillRecord) -> OrderExecutionState:
+    def record_fill(self, fill: FillRecord) -> OrderExecutionSnapshot:
         """Records an execution fill against the owning order atomically.
 
         Args:
             fill: The immutable FillRecord to record.
 
         Returns:
-            The updated OrderExecutionState.
+            An immutable OrderExecutionSnapshot reflecting the updated state.
 
         Raises:
             TypeError: If fill is not a FillRecord.
@@ -254,7 +296,7 @@ class OrderManager:
             state.transition_order_status(OrderStatus.FILLED, timestamp=fill.timestamp)
             self._active_order_ids.discard(fill.order_id)
 
-        return state
+        return state.to_snapshot()
 
     def cancel_order(
         self,
@@ -273,13 +315,20 @@ class OrderManager:
             reason: Non-empty description explaining the cancellation reason.
 
         Returns:
-            The OrderCancelledEvent for downstream dispatch.
+            The OrderCancelledEvent for downstream dispatch, containing an independent order copy.
 
         Raises:
             OrderNotFoundError: If order_id is not registered.
             InvalidOrderStateError: If the order is already in a terminal state (FILLED or CANCELLED).
             ValueError: If reason is empty or timestamp violates temporal monotonicity.
         """
+        if not order_id or not isinstance(order_id, str) or not order_id.strip():
+            raise ValueError("order_id must be a non-empty string")
+        if order_id != order_id.strip():
+            raise ValueError(
+                f"Order ID cannot contain leading or trailing whitespace: '{order_id}'"
+            )
+
         if order_id not in self._orders:
             raise OrderNotFoundError(f"Order '{order_id}' not found in registry")
 
@@ -312,41 +361,51 @@ class OrderManager:
 
         return OrderCancelledEvent(
             timestamp=cancel_time,
-            order=state.order,
+            order=state.order,  # state.order returns a defensive deep copy
             reason=clean_reason,
         )
 
-    def get_execution_state(self, order_id: str) -> OrderExecutionState:
-        """Retrieves the OrderExecutionState for a registered order.
+    def get_execution_state(self, order_id: str) -> OrderExecutionSnapshot:
+        """Retrieves an immutable OrderExecutionSnapshot for a registered order.
 
         Args:
             order_id: The order ID to look up.
 
         Returns:
-            The registered OrderExecutionState.
+            The immutable OrderExecutionSnapshot.
 
         Raises:
             OrderNotFoundError: If the order ID is not registered.
+            ValueError: If order_id contains invalid whitespace.
         """
+        if not order_id or not isinstance(order_id, str) or not order_id.strip():
+            raise ValueError("order_id must be a non-empty string")
+        if order_id != order_id.strip():
+            raise ValueError(
+                f"Order ID cannot contain leading or trailing whitespace: '{order_id}'"
+            )
+
         if order_id not in self._orders:
             raise OrderNotFoundError(f"Order '{order_id}' not found in registry")
-        return self._orders[order_id]
+        return self._orders[order_id].to_snapshot()
 
     def has_order(self, order_id: str) -> bool:
         """Returns True if the order ID has been registered, False otherwise."""
+        if not order_id or not isinstance(order_id, str) or order_id != order_id.strip():
+            return False
         return order_id in self._orders
 
-    def get_active_orders(self, symbol: str | None = None) -> list[OrderExecutionState]:
-        """Returns all currently active and partially filled orders.
+    def get_active_orders(self, symbol: str | None = None) -> list[OrderExecutionSnapshot]:
+        """Returns immutable snapshots of all currently active and partially filled orders.
 
         Ordered deterministically by submission_time, registration sequence, and order ID tie-breaker.
-        Returned collection is a newly constructed list; modifying it does not alter internal state.
+        Returned collection is a newly constructed list of immutable snapshots.
 
         Args:
             symbol: Optional symbol filter.
 
         Returns:
-            A list of active OrderExecutionState instances.
+            A list of active OrderExecutionSnapshot instances.
         """
         active = [
             self._orders[oid]
@@ -359,31 +418,32 @@ class OrderManager:
         active.sort(
             key=lambda s: (s.submission_time, self._registration_seq[s.order.id], s.order.id)
         )
-        return active
+        return [s.to_snapshot() for s in active]
 
-    def get_all_orders(self, symbol: str | None = None) -> list[OrderExecutionState]:
-        """Returns all registered orders including completed and cancelled orders.
+    def get_all_orders(self, symbol: str | None = None) -> list[OrderExecutionSnapshot]:
+        """Returns immutable snapshots of all registered orders including completed and cancelled orders.
 
         Preserves chronological registration sequence.
-        Returned collection is a newly constructed list; modifying it does not alter internal state.
+        Returned collection is a newly constructed list of immutable snapshots.
 
         Args:
             symbol: Optional symbol filter.
 
         Returns:
-            A list of all OrderExecutionState instances.
+            A list of all OrderExecutionSnapshot instances.
         """
         all_orders = [self._orders[oid] for oid in self._order_sequence]
         if symbol is not None:
             all_orders = [s for s in all_orders if s.order.symbol == symbol]
-        return all_orders
+        return [s.to_snapshot() for s in all_orders]
 
-    def get_order_by_fill_id(self, fill_id: str) -> OrderExecutionState | None:
-        """Looks up the owning OrderExecutionState by fill ID for historical traceability."""
+    def get_order_by_fill_id(self, fill_id: str) -> OrderExecutionSnapshot | None:
+        """Looks up the owning OrderExecutionSnapshot by fill ID for historical traceability."""
         order_id = self._fill_to_order_id.get(fill_id)
         if order_id is None:
             return None
-        return self._orders.get(order_id)
+        state = self._orders.get(order_id)
+        return state.to_snapshot() if state is not None else None
 
     @property
     def active_order_count(self) -> int:

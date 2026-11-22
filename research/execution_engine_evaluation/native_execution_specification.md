@@ -72,7 +72,7 @@ It does not contain a `PARTIALLY_FILLED` status. An order in modern electronic m
 ## 3. OrderManager Specification
 
 > **Implementation Boundary Note (Milestone 3B.4.2)**:
-> - **Implemented in Milestone 3B.4.2**: Core `OrderManager` registry and lifecycle, permanent vs. active order tracking, idempotent order registration, atomic fill-record routing, remainder cancellation, and macro `OrderStatus` synchronization.
+> - **Implemented in Milestone 3B.4.2**: Core `OrderManager` registry and lifecycle, permanent vs. active order tracking, idempotent order registration, atomic fill-record routing, remainder cancellation, macro `OrderStatus` synchronization, and read-only `OrderExecutionSnapshot` / `OrderSnapshot` encapsulation isolating manager state from external mutation.
 > - **Pending in Future Stages**: Parent-child OCO bracket relationships, take-profit / stop-loss child order generation, and dynamic child order scaling on partial fills (deferred to subsequent milestone).
 > - **Pending**: `FillEngine` price matching and execution logic (deferred to Milestone 3B.4.4).
 

@@ -7,14 +7,17 @@ Provides:
   partial fills, remaining quantities, weighted-average prices, and cancellations.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 
 from hybrid_agent.core.constants import (
     OrderSide,
     OrderStatus,
+    OrderType,
     OrderValidationError,
 )
 from hybrid_agent.core.models import (
@@ -132,6 +135,95 @@ class FillRecord:
         object.__setattr__(self, "timestamp", ts)
 
 
+@dataclass(frozen=True)
+class OrderSnapshot:
+    """Immutable public snapshot of an order's contract specification and lifecycle status."""
+
+    id: str
+    symbol: str
+    side: OrderSide
+    order_type: OrderType
+    quantity: float
+    limit_price: float | None
+    stop_loss_price: float | None
+    take_profit_price: float | None
+    status: OrderStatus
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_order(cls, order: Order) -> "OrderSnapshot":
+        """Constructs an immutable snapshot from a domain Order."""
+        return cls(
+            id=order.id,
+            symbol=order.symbol,
+            side=order.side,
+            order_type=order.order_type,
+            quantity=order.quantity,
+            limit_price=order.limit_price,
+            stop_loss_price=order.stop_loss_price,
+            take_profit_price=order.take_profit_price,
+            status=order.status,
+            created_at=order.created_at,
+            updated_at=order.updated_at,
+        )
+
+
+@dataclass(frozen=True)
+class OrderExecutionSnapshot:
+    """Immutable public snapshot of an order's execution state and progress.
+
+    Protects OrderManager's internal registries from external mutation while
+    exposing all execution telemetry, quantities, prices, fees, and lifecycle states.
+    """
+
+    order: OrderSnapshot
+    submission_time: datetime
+    original_quantity: Decimal
+    filled_quantity: Decimal
+    unfilled_quantity: Decimal
+    leaves_quantity: Decimal
+    cancelled_quantity: Decimal
+    average_fill_price: Decimal
+    cumulative_fees: Mapping[str, Decimal]
+    status: ExecutionStatus
+    fills: tuple[FillRecord, ...]
+    last_update_time: datetime
+    cancellation_timestamp: datetime | None = None
+    cancellation_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cumulative_fees, MappingProxyType):
+            object.__setattr__(
+                self, "cumulative_fees", MappingProxyType(dict(self.cumulative_fees))
+            )
+
+    @property
+    def is_active(self) -> bool:
+        """Whether the order is currently active without any fills."""
+        return self.status == ExecutionStatus.ACTIVE
+
+    @property
+    def is_partially_filled(self) -> bool:
+        """Whether the order has received one or more fills but has remaining executable quantity."""
+        return self.status == ExecutionStatus.PARTIALLY_FILLED
+
+    @property
+    def is_filled(self) -> bool:
+        """Whether the order has been completely executed."""
+        return self.status == ExecutionStatus.FILLED
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Whether the unfilled remainder was cancelled."""
+        return self.status == ExecutionStatus.CANCELLED
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the execution state has reached a terminal state (FILLED or CANCELLED)."""
+        return self.status in (ExecutionStatus.FILLED, ExecutionStatus.CANCELLED)
+
+
 class OrderExecutionState:
     """State wrapper around domain Order managing execution matching, partial fills, and residuals.
 
@@ -211,8 +303,8 @@ class OrderExecutionState:
 
     @property
     def order(self) -> Order:
-        """The original wrapped domain Order entity."""
-        return self._order
+        """Defensive copy of the wrapped domain Order entity."""
+        return self._order.model_copy(deep=True)
 
     @property
     def submission_time(self) -> datetime:
@@ -459,3 +551,49 @@ class OrderExecutionState:
         self._cancellation_timestamp = cancel_time
         self._cancellation_reason = reason.strip()
         self._last_update_time = cancel_time
+
+    def attach_instrument_spec(self, spec: InstrumentSpecification) -> None:
+        """Safely attaches an instrument specification to an unassigned execution state."""
+        if not isinstance(spec, InstrumentSpecification):
+            raise TypeError(f"spec must be an InstrumentSpecification, got {type(spec).__name__}")
+        if spec.symbol != self._order.symbol:
+            raise ValueError(
+                f"Instrument specification symbol '{spec.symbol}' does not match order symbol '{self._order.symbol}'"
+            )
+        min_vol = _to_decimal(spec.min_volume, "min_volume")
+        step_vol = _to_decimal(spec.volume_step, "volume_step")
+        if self._original_quantity < min_vol:
+            raise OrderValidationError(
+                f"Quantity {self._original_quantity} is below minimum allowed volume {min_vol} for {self._order.symbol}"
+            )
+        if self._original_quantity % step_vol != Decimal(0):
+            raise OrderValidationError(
+                f"Quantity {self._original_quantity} does not align with volume_step {step_vol} for {self._order.symbol}"
+            )
+        if self._order.limit_price is not None:
+            spec.validate_price(self._order.limit_price)
+        if self._order.stop_loss_price is not None:
+            spec.validate_price(self._order.stop_loss_price)
+        if self._order.take_profit_price is not None:
+            spec.validate_price(self._order.take_profit_price)
+
+        self._instrument_spec = spec
+
+    def to_snapshot(self) -> OrderExecutionSnapshot:
+        """Creates an immutable public snapshot of the current execution state."""
+        return OrderExecutionSnapshot(
+            order=OrderSnapshot.from_order(self._order),
+            submission_time=self._submission_time,
+            original_quantity=self._original_quantity,
+            filled_quantity=self._filled_quantity,
+            unfilled_quantity=self.unfilled_quantity,
+            leaves_quantity=self.leaves_quantity,
+            cancelled_quantity=self.cancelled_quantity,
+            average_fill_price=self._average_fill_price,
+            cumulative_fees=dict(self._cumulative_fees),
+            status=self._status,
+            fills=tuple(self._fills),
+            last_update_time=self._last_update_time,
+            cancellation_timestamp=self._cancellation_timestamp,
+            cancellation_reason=self._cancellation_reason,
+        )

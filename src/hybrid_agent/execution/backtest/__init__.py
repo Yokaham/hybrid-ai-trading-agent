@@ -59,7 +59,9 @@ from hybrid_agent.execution.backtest.portfolio import (
 from hybrid_agent.execution.backtest.state import (
     ExecutionStatus,
     FillRecord,
+    OrderExecutionSnapshot,
     OrderExecutionState,
+    OrderSnapshot,
 )
 
 __all__ = [
@@ -90,12 +92,14 @@ __all__ = [
     "MarketBarOpenedEvent",
     "MissingFXRateError",
     "OrderCancelledEvent",
+    "OrderExecutionSnapshot",
     "OrderExecutionState",
     "OrderFilledEvent",
     "OrderManager",
     "OrderManagerError",
     "OrderNotFoundError",
     "OrderPartiallyFilledEvent",
+    "OrderSnapshot",
     "OrderSubmittedEvent",
     "OversellingError",
     "Portfolio",
