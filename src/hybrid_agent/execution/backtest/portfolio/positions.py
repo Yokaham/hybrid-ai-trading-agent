@@ -29,12 +29,13 @@ PositionAccountingModel = AccountingClassification
 
 @dataclass(frozen=True)
 class InstrumentAccountingIdentity:
-    """Immutable accounting identity establishing classification and currency configuration for an instrument."""
+    """Immutable accounting identity establishing classification, currency configuration, and contract size for an instrument."""
 
     symbol: str
     accounting_classification: AccountingClassification
     quote_currency: str
     profit_currency: str
+    contract_size: Decimal
 
 
 class OversellingError(ValueError):
@@ -161,10 +162,14 @@ class PositionTracker:
         accounting_classification: AccountingClassification,
         quote_currency: str,
         profit_currency: str,
+        contract_size: Decimal | float | str = Decimal("1.0"),
     ) -> InstrumentAccountingIdentity:
         """Register or validate the immutable accounting identity for an instrument."""
         norm_quote = CashBook.normalize_currency(quote_currency)
         norm_profit = CashBook.normalize_currency(profit_currency)
+        dec_contract_size = CashBook.validate_amount(contract_size)
+        if dec_contract_size <= Decimal("0.0"):
+            raise ValueError(f"Contract size must be positive, got {dec_contract_size}")
 
         if isinstance(accounting_classification, str):
             val = accounting_classification.strip().upper()
@@ -196,6 +201,11 @@ class PositionTracker:
                     f"Instrument '{symbol}' has established profit currency "
                     f"'{existing.profit_currency}' and cannot be redefined with '{norm_profit}'."
                 )
+            if existing.contract_size != dec_contract_size:
+                raise ValueError(
+                    f"Instrument '{symbol}' has established contract size "
+                    f"'{existing.contract_size}' and cannot be redefined with '{dec_contract_size}'."
+                )
             return existing
 
         identity = InstrumentAccountingIdentity(
@@ -203,6 +213,7 @@ class PositionTracker:
             accounting_classification=acct,
             quote_currency=norm_quote,
             profit_currency=norm_profit,
+            contract_size=dec_contract_size,
         )
         self._instrument_identities[symbol] = identity
         return identity
@@ -312,6 +323,12 @@ class PositionTracker:
         Returns:
             PositionFillResult containing closed quantities, realized P&L, and core domain Position.
         """
+        # Validate symbol consistency
+        if symbol != spec.symbol:
+            raise ValueError(
+                f"Target symbol '{symbol}' does not match instrument specification symbol '{spec.symbol}'."
+            )
+
         # Validate valuation model
         if spec.valuation_model != ValuationModel.LINEAR:
             raise UnsupportedValuationModelError(
@@ -339,6 +356,16 @@ class PositionTracker:
             raise ValueError(f"Fill price must be positive, got {p_dec}")
         if q_dec <= Decimal("0.0"):
             raise ValueError(f"Fill quantity must be positive, got {q_dec}")
+        if contract_size <= Decimal("0.0"):
+            raise ValueError(f"Contract size must be positive, got {contract_size}")
+
+        # Enforce fill timestamp causality against existing record (open or closed)
+        pos = self._positions.get(symbol)
+        if pos is not None and pos.last_updated is not None and utc_time < pos.last_updated:
+            raise TemporalOrderViolationError(
+                f"Backward fill timestamp for {symbol}: fill timestamp {utc_time.isoformat()} "
+                f"is earlier than existing position record timestamp {pos.last_updated.isoformat()}."
+            )
 
         norm_quote = CashBook.normalize_currency(spec.quote_currency)
         norm_profit = CashBook.normalize_currency(spec.profit_currency)
@@ -361,15 +388,12 @@ class PositionTracker:
                     f"Symbol '{symbol}' profit currency mismatch: established identity uses "
                     f"'{identity.profit_currency}', fill specified '{norm_profit}'."
                 )
-        else:
-            self.register_instrument(
-                symbol=symbol,
-                accounting_classification=acct_model,
-                quote_currency=norm_quote,
-                profit_currency=norm_profit,
-            )
+            if identity.contract_size != contract_size:
+                raise ValueError(
+                    f"Symbol '{symbol}' contract size mismatch: established identity uses "
+                    f"'{identity.contract_size}', fill specified '{contract_size}'."
+                )
 
-        pos = self._positions.get(symbol)
         if pos is not None and not pos.is_closed:
             # Classification consistency check
             if pos.accounting_classification != acct_model:
@@ -389,6 +413,46 @@ class PositionTracker:
                     f"Symbol '{symbol}' profit currency mismatch: open position uses "
                     f"'{pos.profit_currency}', fill specified '{norm_profit}'."
                 )
+            # Contract size consistency check
+            if pos.contract_size != contract_size:
+                raise ValueError(
+                    f"Symbol '{symbol}' contract size mismatch: open position uses "
+                    f"'{pos.contract_size}', fill specified '{contract_size}'."
+                )
+
+        # Pre-validate side-specific conditions before establishing identity
+        if acct_model == AccountingClassification.CASH_EQUITY:
+            if side == OrderSide.SELL:
+                if pos is None or pos.is_closed or pos.side != OrderSide.BUY:
+                    raise ValueError(
+                        f"Short cash equities are prohibited. Cannot sell {symbol} without existing long position."
+                    )
+                assert pos is not None
+                if q_dec > pos.quantity:
+                    raise OversellingError(
+                        f"Cannot sell {q_dec} of {symbol}: exceeds open position quantity of {pos.quantity}"
+                    )
+        elif (
+            acct_model == AccountingClassification.LINEAR_CFD
+            and pos is not None
+            and not pos.is_closed
+            and pos.side != side
+            and q_dec > pos.quantity
+        ):
+            raise PositionReversalError(
+                f"Opposing fill of {q_dec} exceeds open position size of {pos.quantity} for {symbol}. "
+                "Auto-reversal is prohibited; close and re-open in separate orders."
+            )
+
+        # Establish immutable accounting identity upon first validated fill
+        if identity is None:
+            self.register_instrument(
+                symbol=symbol,
+                accounting_classification=acct_model,
+                quote_currency=norm_quote,
+                profit_currency=norm_profit,
+                contract_size=contract_size,
+            )
 
         # ----------------------------------------------------------------------
         # Case A: Cash Equity (Long-only)

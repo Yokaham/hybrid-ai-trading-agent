@@ -1350,3 +1350,470 @@ def test_mark_portfolio_atomic_rollback_on_valuation_failure(
     assert ger_rec is not None
     assert ger_rec.current_price == Decimal("18000.0")
     assert ger_rec.last_updated == t0
+
+
+# ==============================================================================
+# 6. Hardening Regression Tests for Explicit Consistency, Commission, and Causality
+# ==============================================================================
+
+
+def test_nonzero_commission_without_currency_rejected_without_mutation(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    portfolio.initialize_cash("USD", Decimal("10000.00"), t0)
+
+    order = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-fee-missing",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill = OrderFilledEvent(
+        order=order, fill_price=150.0, fill_quantity=10.0, fee=5.0, timestamp=t0
+    )
+
+    # Missing commission_currency with fee > 0 MUST raise ValueError
+    with pytest.raises(ValueError, match="commission_currency must be explicitly provided"):
+        portfolio.apply_fill(
+            fill, equity_spec, AccountingClassification.CASH_EQUITY, commission_currency=None
+        )
+
+    # Empty string commission_currency also rejected
+    with pytest.raises(ValueError, match="commission_currency must be explicitly provided"):
+        portfolio.apply_fill(
+            fill, equity_spec, AccountingClassification.CASH_EQUITY, commission_currency="   "
+        )
+
+    # State must be completely unmutated
+    assert portfolio.cashbook.get_balance("USD") == Decimal("10000.00")
+    assert portfolio.ledger.entry_count == 1
+    assert portfolio.positions.get_position("AAPL") is None
+    assert portfolio.get_instrument_identity("AAPL") is None
+
+
+def test_zero_commission_can_omit_currency(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    portfolio.initialize_cash("USD", Decimal("10000.00"), t0)
+
+    order = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-zero-fee",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill = OrderFilledEvent(
+        order=order, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
+
+    # Calling without commission_currency succeeds when fee is 0.0
+    evt = portfolio.apply_fill(fill, equity_spec, AccountingClassification.CASH_EQUITY)
+    assert evt.position.quantity == 10.0
+    assert portfolio.cashbook.get_balance("USD") == Decimal("8500.00")  # 10,000 - 1,500 notional
+    assert (
+        portfolio.ledger.entry_count == 2
+    )  # Opening balance + CASH_EQUITY_BUY (no commission entry)
+
+
+def test_omitting_accounting_classification_is_rejected(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    portfolio.initialize_cash("USD", Decimal("10000.00"), t0)
+
+    order = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-no-class",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill = OrderFilledEvent(
+        order=order, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
+
+    # Calling without accounting_type is a TypeError because there is no default value
+    with pytest.raises(TypeError):
+        portfolio.apply_fill(fill, equity_spec)  # type: ignore[call-arg]
+
+    # Passing unsupported string or type raises ValueError/TypeError
+    with pytest.raises(ValueError, match="Unsupported accounting classification"):
+        portfolio.apply_fill(fill, equity_spec, "INVALID_CLASSIFICATION")  # type: ignore[arg-type]
+
+
+def test_order_specification_symbol_mismatch_rejected(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    portfolio.initialize_cash("USD", Decimal("10000.00"), t0)
+
+    # Order has symbol MSFT, but spec is for AAPL
+    order = Order(
+        symbol="MSFT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-mismatch",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill = OrderFilledEvent(
+        order=order, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
+
+    with pytest.raises(ValueError, match="symbol 'AAPL' does not match order symbol 'MSFT'"):
+        portfolio.apply_fill(fill, equity_spec, AccountingClassification.CASH_EQUITY)
+
+    # PositionTracker directly rejects mismatch between symbol parameter and spec.symbol
+    tracker = PositionTracker()
+    with pytest.raises(
+        ValueError,
+        match="Target symbol 'MSFT' does not match instrument specification symbol 'AAPL'",
+    ):
+        tracker.apply_fill(
+            symbol="MSFT",
+            side=OrderSide.BUY,
+            fill_price=150.0,
+            fill_quantity=10.0,
+            spec=equity_spec,
+            accounting_model=AccountingClassification.CASH_EQUITY,
+            timestamp=t0,
+        )
+
+    assert portfolio.cashbook.get_balance("USD") == Decimal("10000.00")
+    assert portfolio.get_instrument_identity("MSFT") is None
+    assert portfolio.get_instrument_identity("AAPL") is None
+
+
+def test_contract_size_consistency_enforced_while_open_and_after_closed(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    t3 = datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # 1. Open AAPL with contract_size = 1.0 (from equity_spec)
+    order_open = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-open",
+        created_at=t0,
+        updated_at=t0,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_open, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+    identity = portfolio.get_instrument_identity("AAPL")
+    assert identity is not None
+    assert identity.contract_size == Decimal("1.0")
+
+    # Inconsistent contract size spec (10.0 instead of 1.0)
+    spec_cs10 = InstrumentSpecification(
+        symbol="AAPL",
+        tick_size=0.01,
+        contract_size=10.0,
+        min_volume=1.0,
+        volume_step=1.0,
+        price_precision=2,
+        profit_currency="USD",
+        quote_currency="USD",
+        base_currency="USD",
+        valuation_model=ValuationModel.LINEAR,
+    )
+    order_cs10 = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-cs10",
+        created_at=t1,
+        updated_at=t1,
+    )
+    fill_cs10 = OrderFilledEvent(
+        order=order_cs10, fill_price=150.0, fill_quantity=5.0, fee=0.0, timestamp=t1
+    )
+
+    # 2. Inconsistent contract size while position is OPEN -> MUST be rejected
+    with pytest.raises(ValueError, match="contract size mismatch"):
+        portfolio.apply_fill(fill_cs10, spec_cs10, AccountingClassification.CASH_EQUITY)
+
+    # 3. Close the position fully
+    order_close = Order(
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-close",
+        created_at=t2,
+        updated_at=t2,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_close, fill_price=155.0, fill_quantity=10.0, fee=0.0, timestamp=t2
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+    assert portfolio.positions.get_position("AAPL") is None  # Position is now closed
+
+    # 4. Inconsistent contract size when reopening a CLOSED position -> MUST be rejected
+    order_reopen_bad = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-reopen-bad",
+        created_at=t3,
+        updated_at=t3,
+    )
+    fill_reopen_bad = OrderFilledEvent(
+        order=order_reopen_bad, fill_price=150.0, fill_quantity=5.0, fee=0.0, timestamp=t3
+    )
+    with pytest.raises(ValueError, match="contract size mismatch"):
+        portfolio.apply_fill(fill_reopen_bad, spec_cs10, AccountingClassification.CASH_EQUITY)
+
+    # 5. Reopening with established contract size 1.0 -> MUST succeed
+    order_reopen_good = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-reopen-good",
+        created_at=t3,
+        updated_at=t3,
+    )
+    fill_reopen_good = OrderFilledEvent(
+        order=order_reopen_good, fill_price=150.0, fill_quantity=5.0, fee=0.0, timestamp=t3
+    )
+    evt_reopen = portfolio.apply_fill(
+        fill_reopen_good, equity_spec, AccountingClassification.CASH_EQUITY
+    )
+    assert evt_reopen.position.quantity == 5.0
+
+
+def test_fill_timestamp_causality_enforced_open_and_closed(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    t1 = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+    t_past = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
+    t2 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    t_between = datetime(2026, 1, 1, 11, 30, tzinfo=UTC)
+    t3 = datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
+
+    portfolio.initialize_cash("USD", Decimal("50000.00"), t0)
+
+    # 1. Fill at t1
+    order1 = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-1",
+        created_at=t1,
+        updated_at=t1,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(order=order1, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t1),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+
+    # Attempt fill at t_past (earlier than t1) while position is open
+    order_backward = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-back",
+        created_at=t_past,
+        updated_at=t_past,
+    )
+    fill_backward = OrderFilledEvent(
+        order=order_backward, fill_price=150.0, fill_quantity=5.0, fee=0.0, timestamp=t_past
+    )
+    with pytest.raises(TemporalOrderViolationError, match="Backward fill timestamp"):
+        portfolio.apply_fill(fill_backward, equity_spec, AccountingClassification.CASH_EQUITY)
+
+    # Position remains 10.0 shares at t1
+    pos1 = portfolio.positions.get_record("AAPL")
+    assert pos1 is not None and pos1.quantity == Decimal("10.0")
+    assert pos1.last_updated == t1
+
+    # 2. Close position at t2
+    order_close = Order(
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-close",
+        created_at=t2,
+        updated_at=t2,
+    )
+    portfolio.apply_fill(
+        OrderFilledEvent(
+            order=order_close, fill_price=155.0, fill_quantity=10.0, fee=0.0, timestamp=t2
+        ),
+        equity_spec,
+        AccountingClassification.CASH_EQUITY,
+    )
+    assert portfolio.positions.get_position("AAPL") is None  # Closed
+    pos_closed = portfolio.positions.get_record("AAPL")
+    assert pos_closed is not None and pos_closed.last_updated == t2
+
+    # Attempt reopening fill at t_between (11:30, earlier than closure at 12:00)
+    order_reopen_backward = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-reopen-back",
+        created_at=t_between,
+        updated_at=t_between,
+    )
+    fill_reopen_backward = OrderFilledEvent(
+        order=order_reopen_backward,
+        fill_price=150.0,
+        fill_quantity=5.0,
+        fee=0.0,
+        timestamp=t_between,
+    )
+    with pytest.raises(TemporalOrderViolationError, match="Backward fill timestamp"):
+        portfolio.apply_fill(
+            fill_reopen_backward, equity_spec, AccountingClassification.CASH_EQUITY
+        )
+
+    # Reopening fill at t3 (13:00, causal) MUST succeed
+    order_reopen_good = Order(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=5.0,
+        id="ord-reopen-good",
+        created_at=t3,
+        updated_at=t3,
+    )
+    fill_reopen_good = OrderFilledEvent(
+        order=order_reopen_good, fill_price=150.0, fill_quantity=5.0, fee=0.0, timestamp=t3
+    )
+    evt_good = portfolio.apply_fill(
+        fill_reopen_good, equity_spec, AccountingClassification.CASH_EQUITY
+    )
+    assert evt_good.position.quantity == 5.0
+
+
+def test_rejected_first_fill_does_not_leave_registered_identity_behind(
+    equity_spec: InstrumentSpecification, converter: TimestampedCurrencyConverter
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+    t0 = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    portfolio.initialize_cash("USD", Decimal("100.00"), t0)  # Only $100 cash
+
+    # Spec for NVDA
+    nvda_spec = InstrumentSpecification(
+        symbol="NVDA",
+        tick_size=0.01,
+        contract_size=1.0,
+        min_volume=1.0,
+        volume_step=1.0,
+        price_precision=2,
+        profit_currency="USD",
+        quote_currency="USD",
+        base_currency="USD",
+        valuation_model=ValuationModel.LINEAR,
+    )
+
+    # Attempt a fill that fails due to InsufficientFunds ($1,500 required, only $100 available)
+    order_fail = Order(
+        symbol="NVDA",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=10.0,
+        id="ord-nvda-fail",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill_fail = OrderFilledEvent(
+        order=order_fail, fill_price=150.0, fill_quantity=10.0, fee=0.0, timestamp=t0
+    )
+
+    with pytest.raises(InsufficientFundsError):
+        portfolio.apply_fill(fill_fail, nvda_spec, AccountingClassification.CASH_EQUITY)
+
+    # CRITICAL INVARIANT: The rejected first fill MUST NOT leave behind a registered identity
+    assert portfolio.positions.get_instrument_identity("NVDA") is None
+    assert portfolio.get_instrument_identity("NVDA") is None
+    assert portfolio.positions.get_position("NVDA") is None
+
+    # Now, an alternative fill (e.g. as LINEAR_CFD, which doesn't debit notional) can establish identity cleanly
+    order_cfd = Order(
+        symbol="NVDA",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=1.0,
+        id="ord-nvda-cfd",
+        created_at=t0,
+        updated_at=t0,
+    )
+    fill_cfd = OrderFilledEvent(
+        order=order_cfd, fill_price=150.0, fill_quantity=1.0, fee=0.0, timestamp=t0
+    )
+    evt = portfolio.apply_fill(fill_cfd, nvda_spec, AccountingClassification.LINEAR_CFD)
+    assert evt.position.quantity == 1.0
+
+    # Identity is now registered as LINEAR_CFD
+    id_nvda = portfolio.get_instrument_identity("NVDA")
+    assert id_nvda is not None
+    assert id_nvda.accounting_classification == AccountingClassification.LINEAR_CFD
+    assert id_nvda.contract_size == Decimal("1.0")
+
+
+def test_manual_register_instrument_establishes_contract_size(
+    converter: TimestampedCurrencyConverter,
+) -> None:
+    portfolio = Portfolio(account_currency="USD", currency_converter=converter)
+
+    # Manually register instrument with contract size 100.0
+    identity = portfolio.register_instrument(
+        symbol="SPX_FUT",
+        accounting_classification=AccountingClassification.LINEAR_CFD,
+        quote_currency="USD",
+        profit_currency="USD",
+        contract_size=Decimal("100.0"),
+    )
+    assert identity.contract_size == Decimal("100.0")
+
+    # Inconsistent manual re-registration attempt is rejected
+    with pytest.raises(ValueError, match="established contract size '100.0'"):
+        portfolio.register_instrument(
+            symbol="SPX_FUT",
+            accounting_classification=AccountingClassification.LINEAR_CFD,
+            quote_currency="USD",
+            profit_currency="USD",
+            contract_size=Decimal("50.0"),
+        )

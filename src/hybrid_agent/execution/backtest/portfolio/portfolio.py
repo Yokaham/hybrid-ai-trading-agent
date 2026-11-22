@@ -65,6 +65,7 @@ class Portfolio:
         accounting_classification: AccountingClassification,
         quote_currency: str,
         profit_currency: str,
+        contract_size: Decimal | float | str = Decimal("1.0"),
     ) -> InstrumentAccountingIdentity:
         """Register established accounting identity for an instrument."""
         return self.positions.register_instrument(
@@ -72,6 +73,7 @@ class Portfolio:
             accounting_classification=accounting_classification,
             quote_currency=quote_currency,
             profit_currency=profit_currency,
+            contract_size=contract_size,
         )
 
     def get_instrument_identity(self, symbol: str) -> InstrumentAccountingIdentity | None:
@@ -116,7 +118,7 @@ class Portfolio:
         self,
         event: OrderFilledEvent | OrderPartiallyFilledEvent,
         spec: InstrumentSpecification,
-        accounting_type: AccountingClassification = AccountingClassification.CASH_EQUITY,
+        accounting_type: AccountingClassification,
         commission_currency: str | None = None,
     ) -> PositionUpdatedEvent:
         """Process an executed order fill using the authoritative OrderFilledEvent / OrderPartiallyFilledEvent.
@@ -130,8 +132,8 @@ class Portfolio:
         Args:
             event: Authoritative OrderFilledEvent or OrderPartiallyFilledEvent.
             spec: InstrumentSpecification for tick size, contract size, and currency metadata.
-            accounting_type: CASH_EQUITY or LINEAR_CFD.
-            commission_currency: Currency of the commission fee (defaults to quote_currency if omitted).
+            accounting_type: Explicit CASH_EQUITY or LINEAR_CFD (never defaulted or inferred).
+            commission_currency: Currency of the commission fee (required if fee > 0; optional if fee == 0).
 
         Returns:
             PositionUpdatedEvent containing the updated Position domain model.
@@ -140,6 +142,12 @@ class Portfolio:
         if not isinstance(event, (OrderFilledEvent, OrderPartiallyFilledEvent)):
             raise TypeError(
                 f"event must be OrderFilledEvent or OrderPartiallyFilledEvent, got {type(event).__name__}"
+            )
+
+        symbol = event.order.symbol
+        if spec.symbol != symbol:
+            raise ValueError(
+                f"Instrument specification symbol '{spec.symbol}' does not match order symbol '{symbol}'."
             )
 
         # Normalize accounting model
@@ -151,10 +159,13 @@ class Portfolio:
                 acct_type = AccountingClassification.CASH_EQUITY
             else:
                 raise ValueError(f"Unsupported accounting classification: {accounting_type}")
-        else:
+        elif isinstance(accounting_type, AccountingClassification):
             acct_type = accounting_type
+        else:
+            raise TypeError(
+                f"accounting_type must be AccountingClassification or string, got {type(accounting_type).__name__}"
+            )
 
-        symbol = event.order.symbol
         side = event.order.side
         fill_price = CashBook.validate_amount(event.fill_price)
         fill_quantity = CashBook.validate_amount(event.fill_quantity)
@@ -162,6 +173,36 @@ class Portfolio:
         commission = CashBook.validate_amount(event.fee)
         timestamp = validate_utc_timestamp(event.timestamp)
         ref_id = event.order.id or f"fill-{timestamp.isoformat()}"
+
+        if fill_price <= Decimal("0.0"):
+            raise ValueError(f"Fill price must be positive, got {fill_price}")
+        if fill_quantity <= Decimal("0.0"):
+            raise ValueError(f"Fill quantity must be positive, got {fill_quantity}")
+        if contract_size <= Decimal("0.0"):
+            raise ValueError(f"Contract size must be positive, got {contract_size}")
+        if commission < Decimal("0.0"):
+            raise ValueError(f"Commission fee cannot be negative, got {commission}")
+
+        # Enforce explicit commission currency when fee > 0; zero commission can omit currency
+        fee_currency: str | None = None
+        if commission > Decimal("0.0"):
+            if commission_currency is None or not str(commission_currency).strip():
+                raise ValueError(
+                    f"commission_currency must be explicitly provided when fee is greater than zero, got {commission_currency!r}."
+                )
+            fee_currency = CashBook.normalize_currency(commission_currency)
+
+        # Enforce fill timestamp causality against existing record (open or closed)
+        existing_pos = self.positions.get_record(symbol)
+        if (
+            existing_pos is not None
+            and existing_pos.last_updated is not None
+            and timestamp < existing_pos.last_updated
+        ):
+            raise TemporalOrderViolationError(
+                f"Backward fill timestamp for {symbol}: fill timestamp {timestamp.isoformat()} "
+                f"is earlier than existing position record timestamp {existing_pos.last_updated.isoformat()}."
+            )
 
         # 1. Upfront consistency validation against established instrument identity or open position
         norm_quote = CashBook.normalize_currency(spec.quote_currency)
@@ -184,30 +225,32 @@ class Portfolio:
                     f"Symbol '{symbol}' profit currency mismatch: established identity uses "
                     f"'{identity.profit_currency}', fill specified '{norm_profit}'."
                 )
-        else:
-            existing_pos = self.positions.get_record(symbol)
-            if existing_pos is not None:
-                if existing_pos.accounting_classification != acct_type:
-                    raise ValueError(
-                        f"Symbol '{symbol}' has an open position with classification "
-                        f"'{existing_pos.accounting_classification.value}' and cannot accept fills with '{acct_type.value}'."
-                    )
-                if existing_pos.quote_currency != norm_quote:
-                    raise ValueError(
-                        f"Symbol '{symbol}' quote currency mismatch: open position uses "
-                        f"'{existing_pos.quote_currency}', fill specified '{norm_quote}'."
-                    )
-                if existing_pos.profit_currency != norm_profit:
-                    raise ValueError(
-                        f"Symbol '{symbol}' profit currency mismatch: open position uses "
-                        f"'{existing_pos.profit_currency}', fill specified '{norm_profit}'."
-                    )
-
-        # Determine fee currency
-        fee_currency: str | None = None
-        if commission > Decimal("0.0"):
-            fee_curr_raw = commission_currency or spec.quote_currency
-            fee_currency = CashBook.normalize_currency(fee_curr_raw)
+            if identity.contract_size != contract_size:
+                raise ValueError(
+                    f"Symbol '{symbol}' contract size mismatch: established identity uses "
+                    f"'{identity.contract_size}', fill specified '{contract_size}'."
+                )
+        elif existing_pos is not None:
+            if existing_pos.accounting_classification != acct_type:
+                raise ValueError(
+                    f"Symbol '{symbol}' has an open position with classification "
+                    f"'{existing_pos.accounting_classification.value}' and cannot accept fills with '{acct_type.value}'."
+                )
+            if existing_pos.quote_currency != norm_quote:
+                raise ValueError(
+                    f"Symbol '{symbol}' quote currency mismatch: open position uses "
+                    f"'{existing_pos.quote_currency}', fill specified '{norm_quote}'."
+                )
+            if existing_pos.profit_currency != norm_profit:
+                raise ValueError(
+                    f"Symbol '{symbol}' profit currency mismatch: open position uses "
+                    f"'{existing_pos.profit_currency}', fill specified '{norm_profit}'."
+                )
+            if existing_pos.contract_size != contract_size:
+                raise ValueError(
+                    f"Symbol '{symbol}' contract size mismatch: open position uses "
+                    f"'{existing_pos.contract_size}', fill specified '{contract_size}'."
+                )
 
         # Snapshot state across CashBook, Ledger, and PositionTracker for atomic rollback
         cb_snapshot = dict(self.cashbook._balances)
