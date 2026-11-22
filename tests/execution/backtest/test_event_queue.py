@@ -13,7 +13,10 @@ from hybrid_agent.core.constants import (
 from hybrid_agent.core.events import BaseEvent, SignalEvent
 from hybrid_agent.core.models import Bar, Order
 from hybrid_agent.execution.backtest.clock import SimulationClock
-from hybrid_agent.execution.backtest.event_queue import EventQueue
+from hybrid_agent.execution.backtest.event_queue import (
+    MAX_SEQUENCE_ID,
+    EventQueue,
+)
 from hybrid_agent.execution.backtest.events import (
     EventPriority,
     MarketBarClosedEvent,
@@ -26,6 +29,7 @@ from hybrid_agent.execution.backtest.exceptions import (
     EmptyQueueError,
     InvalidEventPriorityError,
     RetroactiveEventError,
+    SequenceIdOverflowError,
 )
 
 
@@ -150,75 +154,149 @@ def test_non_base_event_rejected(queue: EventQueue) -> None:
         queue.enqueue("not an event", priority=1)  # type: ignore
 
 
-def test_event_generation_during_dispatch_higher_or_equal_priority(queue: EventQueue) -> None:
-    """Demonstrates that events generated during dispatch at timestamp T are scheduled deterministically."""
+# ==============================================================================
+# Same-Priority Dispatch Contract Tests
+# ==============================================================================
+
+def test_same_priority_downstream_event_acceptance(queue: EventQueue) -> None:
+    """Same-timestamp events generated at the currently executing priority are accepted."""
     t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
 
-    # Initial event at priority 2 (Strategy Evaluation)
-    queue.enqueue(DummyCustomEvent(timestamp=t0, name="strategy_eval"), priority=EventPriority.STRATEGY_EVALUATION)
+    # Dispatch Priority 2
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="eval_initial"), priority=EventPriority.STRATEGY_EVALUATION)
+    popped = queue.pop()
+    assert popped.priority == EventPriority.STRATEGY_EVALUATION
 
-    dispatched = queue.pop()
-    assert dispatched.priority == EventPriority.STRATEGY_EVALUATION
+    # During Priority 2 dispatch, generate another Priority 2 event at timestamp t0
+    downstream = queue.enqueue(
+        DummyCustomEvent(timestamp=t0, name="eval_followup"),
+        priority=EventPriority.STRATEGY_EVALUATION,
+    )
+    assert downstream.priority == EventPriority.STRATEGY_EVALUATION
+    # Sequence ID must be strictly greater than the executing event's sequence ID
+    assert downstream.sequence_id > popped.sequence_id
 
-    # During strategy evaluation at t0, strategy generates an Order Proposal at Priority 3
-    # Same timestamp, higher priority number (3 >= 2) -> Allowed!
-    p3 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="order_proposal"), priority=EventPriority.ORDER_PROPOSAL_RISK)
-    assert p3.priority == EventPriority.ORDER_PROPOSAL_RISK
-
-    # Pop Priority 3
-    dispatched_p3 = queue.pop()
-    assert isinstance(dispatched_p3.event, DummyCustomEvent)
-    assert dispatched_p3.event.name == "order_proposal"
-
-    # During Priority 3, order is approved and submitted at Priority 4 -> Allowed!
-    p4 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="order_submit"), priority=EventPriority.ORDER_SUBMISSION_RESERVATION)
-    assert p4.priority == EventPriority.ORDER_SUBMISSION_RESERVATION
-
-    dispatched_p4 = queue.pop()
-    assert isinstance(dispatched_p4.event, DummyCustomEvent)
-    assert dispatched_p4.event.name == "order_submit"
+    # Downstream event pops next
+    next_popped = queue.pop()
+    assert isinstance(next_popped.event, DummyCustomEvent)
+    assert next_popped.event.name == "eval_followup"
+    assert next_popped.priority == EventPriority.STRATEGY_EVALUATION
 
 
-def test_rejection_of_retroactive_lower_priority_events(queue: EventQueue) -> None:
-    """Verifies that an event cannot be injected retroactively at an earlier priority stage at the current timestamp."""
+def test_fifo_ordering_preexisting_and_dispatch_generated_same_priority(queue: EventQueue) -> None:
+    """Pre-existing events at priority P execute before dispatch-generated events at priority P."""
     t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
 
-    queue.enqueue(DummyCustomEvent(timestamp=t0, name="opened"), priority=EventPriority.MARKET_BAR_OPENED)
+    # Pre-enqueue two events at Priority 3
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="p3_preexisting_A"), priority=EventPriority.ORDER_PROPOSAL_RISK)
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="p3_preexisting_B"), priority=EventPriority.ORDER_PROPOSAL_RISK)
 
-    # Pop priority 5
+    # Pop event A
+    pop_a = queue.pop()
+    assert isinstance(pop_a.event, DummyCustomEvent) and pop_a.event.name == "p3_preexisting_A"
+
+    # During dispatch of A, enqueue a new Priority 3 event C
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="p3_generated_C"), priority=EventPriority.ORDER_PROPOSAL_RISK)
+
+    # Strict FIFO: pre-existing B must execute before dispatch-generated C
+    pop_b = queue.pop()
+    assert isinstance(pop_b.event, DummyCustomEvent) and pop_b.event.name == "p3_preexisting_B"
+
+    pop_c = queue.pop()
+    assert isinstance(pop_c.event, DummyCustomEvent) and pop_c.event.name == "p3_generated_C"
+
+    assert pop_a.sequence_id < pop_b.sequence_id < pop_c.sequence_id
+
+
+def test_multiple_same_priority_events_generated_during_one_dispatch(queue: EventQueue) -> None:
+    """Multiple events generated at the current priority during dispatch are ordered by monotonic sequence IDs."""
+    t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
+
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="trigger"), priority=EventPriority.ORDER_SUBMISSION_RESERVATION)
+    trigger = queue.pop()
+    assert trigger.priority == EventPriority.ORDER_SUBMISSION_RESERVATION
+
+    # Generate 3 events at Priority 4 during dispatch
+    d1 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="sub_1"), priority=EventPriority.ORDER_SUBMISSION_RESERVATION)
+    d2 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="sub_2"), priority=EventPriority.ORDER_SUBMISSION_RESERVATION)
+    d3 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="sub_3"), priority=EventPriority.ORDER_SUBMISSION_RESERVATION)
+
+    assert trigger.sequence_id < d1.sequence_id < d2.sequence_id < d3.sequence_id
+
+    # Pop in strict sequential order
+    p1 = queue.pop()
+    p2 = queue.pop()
+    p3 = queue.pop()
+    assert isinstance(p1.event, DummyCustomEvent) and p1.event.name == "sub_1"
+    assert isinstance(p2.event, DummyCustomEvent) and p2.event.name == "sub_2"
+    assert isinstance(p3.event, DummyCustomEvent) and p3.event.name == "sub_3"
+
+
+def test_rejection_of_lower_priority_retroactive_events(queue: EventQueue) -> None:
+    """When priority P is active at timestamp T, all priorities < P are rejected; priorities >= P are accepted."""
+    t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
+
+    queue.enqueue(DummyCustomEvent(timestamp=t0, name="opened"), priority=EventPriority.MARKET_BAR_OPENED)  # Priority 5
     popped = queue.pop()
     assert popped.priority == EventPriority.MARKET_BAR_OPENED
 
-    # Attempting to enqueue an order proposal (Priority 3) at timestamp t0 after Priority 5 has already executed
-    # must fail closed with RetroactiveEventError!
-    retroactive_evt = DummyCustomEvent(timestamp=t0, name="late_proposal")
-    with pytest.raises(RetroactiveEventError, match="Retroactive event violation"):
-        queue.enqueue(retroactive_evt, priority=EventPriority.ORDER_PROPOSAL_RISK)
+    # Lower priorities (1, 2, 3, 4) must all be rejected at timestamp t0
+    for lower_p in [1, 2, 3, 4]:
+        with pytest.raises(RetroactiveEventError, match="Retroactive event violation"):
+            queue.enqueue(DummyCustomEvent(timestamp=t0, name=f"retro_{lower_p}"), priority=lower_p)
 
-    # But an event at Priority 5 or Priority 6 at t0 is accepted:
-    p6 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="fill_matching"), priority=EventPriority.ORDER_MATCHING_FILL)
-    assert p6.priority == EventPriority.ORDER_MATCHING_FILL
+    # Equal and higher priorities (5, 6, 7, 8) must all be accepted at timestamp t0
+    for higher_p in [5, 6, 7, 8]:
+        item = queue.enqueue(DummyCustomEvent(timestamp=t0, name=f"valid_{higher_p}"), priority=higher_p)
+        assert item.priority == higher_p
 
 
-def test_dispatch_advances_to_next_timestamp_resets_priority_check(queue: EventQueue) -> None:
-    """When the queue moves to timestamp T+1, Priority 1 is allowed again for T+1."""
+def test_priority_reset_at_next_timestamp_allows_full_priority_range(queue: EventQueue) -> None:
+    """When the queue moves to timestamp T+1, the full priority range (1 to 8) is available again."""
     t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
     t1 = datetime(2026, 1, 1, 9, 35, tzinfo=UTC)
 
-    # Priority 8 at t0
+    # Run up to Priority 8 at t0
     queue.enqueue(DummyCustomEvent(timestamp=t0, name="p8_t0"), priority=EventPriority.PORTFOLIO_MARK_TO_MARKET)
-    # Priority 1 at t1
+    # Enqueue Priority 1 for next timestamp t1
     queue.enqueue(DummyCustomEvent(timestamp=t1, name="p1_t1"), priority=EventPriority.MARKET_BAR_CLOSED)
 
-    # Pop t0
+    # Pop t0 Priority 8
     item0 = queue.pop()
     assert item0.timestamp == t0
     assert item0.priority == EventPriority.PORTFOLIO_MARK_TO_MARKET
 
-    # Pop t1
+    # Now pop t1 Priority 1
     item1 = queue.pop()
     assert item1.timestamp == t1
     assert item1.priority == EventPriority.MARKET_BAR_CLOSED
+
+    # While at t1 Priority 1, any priority from 1 to 8 is allowed for t1
+    for p in range(1, 9):
+        valid_item = queue.enqueue(DummyCustomEvent(timestamp=t1, name=f"t1_p{p}"), priority=p)
+        assert valid_item.priority == p
+
+
+# ==============================================================================
+# Sequence ID Bounds & Overflow Protection Tests
+# ==============================================================================
+
+def test_sequence_id_bounds_and_overflow_protection(queue: EventQueue) -> None:
+    """Sequence IDs must be strictly bounded in [0, 2**64 - 1] and raise on overflow."""
+    t0 = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
+
+    # Normal sequence assignment starts at 0
+    e0 = queue.enqueue(DummyCustomEvent(timestamp=t0, name="first"), priority=1)
+    assert e0.sequence_id == 0
+
+    # Advance sequence counter to MAX_SEQUENCE_ID (2**64 - 1)
+    queue._sequence_counter = MAX_SEQUENCE_ID
+    e_max = queue.enqueue(DummyCustomEvent(timestamp=t0, name="max_seq"), priority=1)
+    assert e_max.sequence_id == MAX_SEQUENCE_ID
+
+    # Next enqueue must fail closed with SequenceIdOverflowError rather than wrapping or overflowing
+    with pytest.raises(SequenceIdOverflowError, match="exceeded unsigned 64-bit integer maximum"):
+        queue.enqueue(DummyCustomEvent(timestamp=t0, name="overflow_attempt"), priority=1)
 
 
 # ==============================================================================

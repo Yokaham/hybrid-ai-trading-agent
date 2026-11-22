@@ -13,7 +13,11 @@ from hybrid_agent.execution.backtest.exceptions import (
     EmptyQueueError,
     InvalidEventPriorityError,
     RetroactiveEventError,
+    SequenceIdOverflowError,
 )
+
+# Unsigned 64-bit integer limit: 2**64 - 1
+MAX_SEQUENCE_ID: int = (1 << 64) - 1
 
 
 @dataclass(order=True, frozen=True)
@@ -39,8 +43,18 @@ class EventQueue:
     3. Events with identical timestamps and priorities follow strict FIFO ordering via monotonic sequence IDs.
     4. Past-dated events (timestamp < clock.now()) are strictly rejected.
     5. Retroactive events (timestamp == current_timestamp and priority < current_priority) are rejected.
-    6. Downstream events generated during dispatch at the current timestamp with priority >= current_priority
-       are accepted and scheduled deterministically with incremented sequence IDs.
+    6. Same-Priority & Downstream Dispatch Contract:
+       - Same-timestamp events generated during dispatch at the current priority (priority == current_priority)
+         are accepted. Their sequence IDs are strictly greater than previously enqueued events, ensuring they
+         execute after pre-existing events at that priority (preserving FIFO).
+       - Higher-priority-number downstream events (priority > current_priority) are accepted and execute after
+         earlier priority stages.
+       - Lower-priority-number retroactive events (priority < current_priority) at the current timestamp are rejected.
+       - Events scheduled at future timestamps (timestamp > current_timestamp) may freely use the entire priority
+         range (1 to 8), as the priority constraint resets at each new timestamp.
+    7. Sequence ID Bounds:
+       - Sequence IDs are strictly bounded in the range 0 <= sequence_id <= 2**64 - 1.
+       - Reaching the maximum limit raises SequenceIdOverflowError rather than wrapping or overflowing.
     """
 
     def __init__(self, clock: SimulationClock | None = None) -> None:
@@ -65,7 +79,15 @@ class EventQueue:
         return len(self._heap) == 0
 
     def enqueue(self, event: BaseEvent, priority: EventPriority | int) -> PrioritizedEvent:
-        """Enqueue an event with a validated priority.
+        """Enqueue an event with a validated priority and assign an unsigned 64-bit sequence ID.
+
+        Dispatch Rules for Events Generated During Processing:
+        - At timestamp T, if current dispatch priority is P:
+          * priority == P: Accepted. Assigned an incremented sequence ID, executing after pre-existing events at P.
+          * priority > P: Accepted. Executes in downstream stages (P+1 .. 8).
+          * priority < P: Rejected with RetroactiveEventError. Retroactive injection is strictly prohibited.
+        - At timestamp T_future > T:
+          * Full priority range (1 .. 8) is valid.
 
         Args:
             event: A valid BaseEvent instance with a timezone-aware UTC timestamp.
@@ -81,6 +103,7 @@ class EventQueue:
             TemporalOrderViolationError: If event.timestamp is earlier than current clock time.
             RetroactiveEventError: If event.timestamp matches current dispatch time but priority is lower
                 than the currently executing priority stage.
+            SequenceIdOverflowError: If the 64-bit sequence ID counter exceeds 2**64 - 1.
         """
         if not isinstance(event, BaseEvent):
             raise TypeError(f"Expected BaseEvent instance, got {type(event).__name__}")
@@ -121,7 +144,12 @@ class EventQueue:
                 f"has already been dispatched or is currently executing."
             )
 
-        # Generate monotonically increasing sequence ID
+        # Enforce unsigned 64-bit sequence ID bounds
+        if self._sequence_counter > MAX_SEQUENCE_ID:
+            raise SequenceIdOverflowError(
+                f"EventQueue sequence ID counter exceeded unsigned 64-bit integer maximum ({MAX_SEQUENCE_ID})"
+            )
+
         seq_id = self._sequence_counter
         self._sequence_counter += 1
 

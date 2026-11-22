@@ -2,7 +2,11 @@
 
 from hybrid_agent.core.constants import TemporalOrderViolationError
 from hybrid_agent.execution.backtest.clock import SimulationClock
-from hybrid_agent.execution.backtest.event_queue import EventQueue, PrioritizedEvent
+from hybrid_agent.execution.backtest.event_queue import (
+    MAX_SEQUENCE_ID,
+    EventQueue,
+    PrioritizedEvent,
+)
 from hybrid_agent.execution.backtest.events import (
     BacktestCompletedEvent,
     EventPriority,
@@ -20,9 +24,11 @@ from hybrid_agent.execution.backtest.exceptions import (
     EmptyQueueError,
     InvalidEventPriorityError,
     RetroactiveEventError,
+    SequenceIdOverflowError,
 )
 
 __all__ = [
+    "MAX_SEQUENCE_ID",
     "BacktestCompletedEvent",
     "ClockNotInitializedError",
     "EmptyQueueError",
@@ -39,6 +45,7 @@ __all__ = [
     "PositionUpdatedEvent",
     "PrioritizedEvent",
     "RetroactiveEventError",
+    "SequenceIdOverflowError",
     "SimulationClock",
     "TemporalOrderViolationError",
 ]

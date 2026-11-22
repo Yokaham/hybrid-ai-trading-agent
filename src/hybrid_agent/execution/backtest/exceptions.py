@@ -17,3 +17,7 @@ class RetroactiveEventError(TemporalOrderViolationError):
 
 class InvalidEventPriorityError(ValueError):
     """Raised when an event is enqueued with an unrecognized or out-of-range priority."""
+
+
+class SequenceIdOverflowError(OverflowError):
+    """Raised when the EventQueue sequence ID counter reaches the maximum unsigned 64-bit integer limit (2**64 - 1)."""
