@@ -250,14 +250,17 @@ To avoid adding backtest-specific bloat to core production domain models (`Order
 ```python
 class ExecutionOrderType(str, Enum):
     """Fine-grained matching classifications."""
+
     MARKET = "MARKET"
     LIMIT = "LIMIT"
     STOP_MARKET = "STOP_MARKET"
     STOP_LIMIT = "STOP_LIMIT"
 
+
 @dataclass
 class OrderExecutionState:
     """Wraps domain Order with institutional execution tracking."""
+
     order: Order
     execution_type: ExecutionOrderType
     original_quantity: float
@@ -276,27 +279,63 @@ class OrderExecutionState:
     reserved_risk: Decimal = Decimal("0.0")
     reserved_notional: Decimal = Decimal("0.0")
 
+
 @dataclass(frozen=True)
 class InstrumentBacktestProfile:
     """Wraps InstrumentSpecification with backtest margin and financing metadata."""
+
     specification: InstrumentSpecification
     settlement_currency: str
-    initial_margin_rate: Decimal = Decimal("1.0")       # 1.0 = 100% cash; 0.05 = 20:1 leverage
-    maintenance_margin_rate: Decimal = Decimal("1.0")   # Equity maintenance boundary
-    financing_spread: Decimal = Decimal("0.025")        # Annualized financing spread (2.5%)
+    initial_margin_rate: Decimal = Decimal("1.0")  # 1.0 = 100% cash; 0.05 = 20:1 leverage
+    maintenance_margin_rate: Decimal = Decimal("1.0")  # Equity maintenance boundary
+    financing_spread: Decimal = Decimal("0.025")  # Annualized financing spread (2.5%)
 ```
 
-### 6.2 Partial Order Lifecycle & Execution Records
-- **Quantity Tracking**: Enforces $0 \le Q_{\text{filled}} \le Q_{\text{original}}$ at all times. $Q_{\text{filled}}$ must **never** exceed $Q_{\text{original}}$.
-- **Immutable Execution Records**: Every fill generates an `ExecutionRecord`:
-  $$\text{ExecutionRecord} = (\text{exec\_id}, \text{order\_id}, \text{timestamp}, P_{\text{fill}}, Q_{\text{fill}}, \text{Commission}, \text{Slippage}, \text{LiquidityRole})$$
-- **Position & Ledger Updates**: Each execution record immediately updates position inventory, recalculates the weighted average entry price, and posts a transaction to `AccountingLedger`.
-- **Cancellation of Remainder**: Cancelling a partially filled order transitions status to `OrderStatus.CANCELLED`.
-  - **Position Preservation**: The accounting system must **never** erase or invalidate an existing partial position merely because the remainder of its parent order is cancelled.
-  - **Reservation Release**: Cancellation releases only the reservations associated with $Q_{\text{remaining}}$.
-- **OCO Partial Scaling**:
-  - If a bracket entry partially fills, child exit orders (TP/SL) are sized strictly to the filled quantity.
-  - If a bracket exit order partially fills, its sibling exit order is reduced by the partial fill quantity rather than cancelled prematurely.
+### 6.2 Partial Order Lifecycle & Decimal Execution State (Milestone 3B.4.1)
+
+Milestone 3B.4.1 establishes the foundational execution-state data structures (`OrderExecutionState`, `FillRecord`, and `ExecutionStatus`) bridging domain orders and the native matching engine:
+
+#### 1. Macro Order Lifecycle vs. Micro Execution Lifecycle
+- **Macro Order Lifecycle (`OrderStatus`)**: Enforces risk-approval and broker/client lifecycle boundaries (`PENDING_RISK -> APPROVED -> SUBMITTED -> [FILLED | CANCELLED]`). The domain `Order` model represents the immutable contract intent of the trader/strategy.
+- **Micro Execution Lifecycle (`ExecutionStatus`)**: Tracks granular execution state (`ACTIVE -> PARTIALLY_FILLED -> FILLED` or `CANCELLED`). An order receives fills without modifying or mutating `OrderStatus` until final completion. `PARTIALLY_FILLED` is intentionally excluded from `OrderStatus` to avoid breaking existing risk state machines.
+
+#### 2. Strict Decimal Execution Precision
+To prevent IEEE-754 binary floating-point roundoff errors (e.g. `0.1 + 0.2 != 0.3` or fractional Satoshi inaccuracies in crypto/equities):
+- All quantities (`original_quantity`, `filled_quantity`, `unfilled_quantity`, `leaves_quantity`, `cancelled_remainder`), prices (`price`, `average_fill_price`), fees, and slippage in `OrderExecutionState` and `FillRecord` are stored and calculated strictly using Python `Decimal`.
+- Floating-point quantities on domain `Order` instances are converted losslessly via string representation (`Decimal(str(order.quantity))`).
+- Volume step alignment is validated using exact modulo arithmetic: `fill_quantity % volume_step == Decimal(0)`. Partial fills do not require `min_volume` constraints, only `volume_step` alignment.
+
+#### 3. Execution Quantity Semantics
+Five distinct quantity metrics are maintained unambiguously:
+- **`original_quantity`**: The initial submitted order quantity ($Q_{\text{orig}}$). Immutable.
+- **`filled_quantity`**: Cumulative executed volume across all recorded fills ($\sum Q_{\text{fill}}$).
+- **`unfilled_quantity`**: Cumulative unexecuted volume ($Q_{\text{orig}} - Q_{\text{filled}}$). This quantity is permanently preserved even after order cancellation for historical post-trade analysis.
+- **`leaves_quantity`**: Active executable quantity remaining on the simulated market book. Returns $Q_{\text{orig}} - Q_{\text{filled}}$ while status is `ACTIVE` or `PARTIALLY_FILLED`; strictly returns `Decimal(0)` once status transitions to `FILLED` or `CANCELLED`.
+- **`cancelled_remainder`**: The quantity cancelled upon calling `cancel_remaining()`. Returns `Decimal(0)` if the order executed in full.
+
+#### 4. Atomic Fill Recording & Failure Invariance
+The `record_fill(fill: FillRecord)` method applies strict pre-flight validation before mutating any internal state:
+1. Rejects fills on terminal orders (`FILLED` or `CANCELLED`).
+2. Validates positive fill price ($P_{\text{fill}} > 0$).
+3. Validates positive fill quantity ($Q_{\text{fill}} > 0$).
+4. Enforces $Q_{\text{fill}} \le \text{leaves\_quantity}$ (rejects overfills).
+5. Enforces volume step alignment against `InstrumentSpecification` when provided.
+6. Enforces non-negative commission fee ($\ge 0$).
+7. Requires explicit `fee_currency` whenever `fee > 0`.
+8. Enforces non-negative slippage ($\ge 0$).
+9. Requires UTC timezone-aware fill timestamp.
+10. Enforces temporal monotonicity ($T_{\text{fill}} \ge T_{\text{submission}}$ and $T_{\text{fill}} \ge T_{\text{last\_fill}}$).
+
+**Failure Atomicity**: If any validation check fails or an exception occurs during recording, `OrderExecutionState` guarantees zero state mutation—`fills`, `filled_quantity`, `leaves_quantity`, `average_fill_price`, cumulative fees, and status remain completely untouched.
+
+#### 5. Cancellation Semantics & Position Invariance
+- Calling `cancel_remaining(timestamp, reason)` snapshots the remaining unfilled quantity into `cancelled_remainder`, transitions `ExecutionStatus` to `CANCELLED`, and sets `leaves_quantity` to `0`.
+- **Executed Position Preservation**: All executed fills and `filled_quantity` are retained intact. Cancelling an order remainder never invalidates or reverses previously executed positions in `Portfolio`.
+- If an order is already completed (`leaves_quantity == 0`), cancellation is rejected.
+
+#### 6. Dynamic OCO Bracket Scaling (Preview for 3B.4.2)
+- When an entry order partially fills, linked exit child orders (Take-Profit / Stop-Loss) are activated and scaled strictly to the cumulative executed quantity ($Q_{\text{child}} = Q_{\text{filled}}$).
+- Cancelling the remaining entry quantity leaves the child bracket actively protecting the executed inventory without premature termination.
 
 ### 6.3 CFD Financing & Overnight Holding Model
 - **Intraday Holding**: CFD positions opened and closed within the same trading session incur **zero** financing charges.
@@ -422,11 +461,13 @@ class TimestampedCurrencyConverter(Protocol):
         from_currency: str,
         to_currency: str,
         as_of: datetime,
-        max_age: timedelta | None = None
+        max_age: timedelta | None = None,
     ) -> ConversionResult: ...
+
 
 class BacktestCurrencyAdapter:
     """Adapts TimestampedCurrencyConverter to the synchronous CurrencyConverter interface expected by RiskEngine."""
+
     def __init__(self, converter: TimestampedCurrencyConverter, clock: SimulationClock):
         self._converter = converter
         self._clock = clock

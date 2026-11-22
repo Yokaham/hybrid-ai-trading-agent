@@ -48,6 +48,11 @@ from hybrid_agent.execution.backtest.portfolio import (
     StaleFXRateError,
     TimestampedCurrencyConverter,
 )
+from hybrid_agent.execution.backtest.state import (
+    ExecutionStatus,
+    FillRecord,
+    OrderExecutionState,
+)
 
 __all__ = [
     "MAX_SEQUENCE_ID",
@@ -62,7 +67,9 @@ __all__ = [
     "EmptyQueueError",
     "EventPriority",
     "EventQueue",
+    "ExecutionStatus",
     "FXRateObservation",
+    "FillRecord",
     "InstrumentAccountingIdentity",
     "InsufficientFundsError",
     "InvalidEventPriorityError",
@@ -72,6 +79,7 @@ __all__ = [
     "MarketBarOpenedEvent",
     "MissingFXRateError",
     "OrderCancelledEvent",
+    "OrderExecutionState",
     "OrderFilledEvent",
     "OrderPartiallyFilledEvent",
     "OrderSubmittedEvent",

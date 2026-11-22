@@ -44,7 +44,7 @@ It does not contain a `PARTIALLY_FILLED` status. An order in modern electronic m
 
 ### Architectural Options Evaluated
 - **Option 1: Mutate `OrderStatus` enum directly**: Add `PARTIALLY_FILLED` to `OrderStatus` and modify `ALLOWED_ORDER_TRANSITIONS` to permit `SUBMITTED -> PARTIALLY_FILLED -> PARTIALLY_FILLED -> FILLED`.
-  - *Drawback*: `Order` is a frozen Pydantic model (`frozen=True`). Mutating status requires copying the model repeatedly. Furthermore, `Order` represents the client's static contract intent, not dynamic exchange state.
+  - *Drawback*: While `Order` in `hybrid_agent.core.models` is an unfrozen Pydantic `BaseModel` with guarded `transition_to` lifecycle mutations, mutating macro `OrderStatus` on each fill conflates the client/risk contract intent with dynamic exchange micro-execution telemetry. It would also break existing state machines and risk validation checks across the codebase that rely on `OrderStatus`.
 - **Option 2: Dedicated `OrderExecutionState` Wrapper (RECOMMENDED)**: Retain `OrderStatus` for macro lifecycle intent (`SUBMITTED -> [FILLED | CANCELLED]`), and manage execution progress inside a mutable, stateful wrapper:
   ```python
   @dataclass
