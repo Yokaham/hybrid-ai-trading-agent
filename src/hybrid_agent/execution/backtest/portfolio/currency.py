@@ -151,6 +151,10 @@ class TimestampedCurrencyConverter:
                 break
         return latest
 
+    def _pair_exists(self, base: str, quote: str) -> bool:
+        """Check whether direct or inverse rate observations exist for the given pair."""
+        return bool(self._rates.get((base, quote)) or self._rates.get((quote, base)))
+
     def convert(
         self,
         amount: Decimal,
@@ -257,7 +261,12 @@ class TimestampedCurrencyConverter:
 
         # 5. Deterministic pivot triangulation (src -> pivot -> dst)
         if src != self.pivot_currency and dst != self.pivot_currency:
-            try:
+            leg1_exists = self._pair_exists(src, self.pivot_currency)
+            leg2_exists = self._pair_exists(self.pivot_currency, dst)
+
+            if leg1_exists and leg2_exists:
+                # Both legs are known currency pairs in the registry.
+                # Stale rates on either leg must raise StaleFXRateError rather than being masked as MissingFXRateError.
                 step1 = self.convert(
                     amount=amount,
                     from_currency=src,
@@ -289,8 +298,6 @@ class TimestampedCurrencyConverter:
                         "step2": step2.metadata,
                     },
                 )
-            except (MissingFXRateError, StaleFXRateError):
-                pass  # Fall through to missing rate error
 
         raise MissingFXRateError(
             f"No valid historical exchange rate found for {src}/{dst} as of {as_of_utc.isoformat()} "

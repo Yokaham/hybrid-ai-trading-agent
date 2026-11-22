@@ -7,6 +7,7 @@ from enum import Enum
 
 from hybrid_agent.core.constants import (
     OrderSide,
+    TemporalOrderViolationError,
     UnsupportedValuationModelError,
     ValuationModel,
 )
@@ -170,11 +171,17 @@ class PositionTracker:
         """Update the latest market price mark for an active position."""
         pos = self._positions.get(symbol)
         if pos is not None and not pos.is_closed:
+            utc_time = validate_utc_timestamp(timestamp)
+            if pos.last_updated is not None and utc_time < pos.last_updated:
+                raise TemporalOrderViolationError(
+                    f"Backward mark timestamp for {symbol}: attempted mark at {utc_time.isoformat()} "
+                    f"is earlier than existing mark at {pos.last_updated.isoformat()}."
+                )
             dec_price = CashBook.validate_amount(price)
             if dec_price <= Decimal("0.0"):
                 raise ValueError(f"Mark price must be positive, got {dec_price}")
             pos.current_price = dec_price
-            pos.last_updated = validate_utc_timestamp(timestamp)
+            pos.last_updated = utc_time
 
     def get_position_event(self, symbol: str, timestamp: datetime) -> PositionUpdatedEvent:
         """Construct a PositionUpdatedEvent for the current state of a symbol."""
@@ -250,6 +257,27 @@ class PositionTracker:
             raise ValueError(f"Fill quantity must be positive, got {q_dec}")
 
         pos = self._positions.get(symbol)
+        if pos is not None and not pos.is_closed:
+            # Classification consistency check
+            if pos.accounting_classification != acct_model:
+                raise ValueError(
+                    f"Symbol '{symbol}' has an open position with classification "
+                    f"'{pos.accounting_classification.value}' and cannot accept fills with '{acct_model.value}'."
+                )
+            # Quote currency consistency check
+            norm_quote = CashBook.normalize_currency(spec.quote_currency)
+            if pos.quote_currency != norm_quote:
+                raise ValueError(
+                    f"Symbol '{symbol}' quote currency mismatch: open position uses "
+                    f"'{pos.quote_currency}', fill specified '{norm_quote}'."
+                )
+            # Profit currency consistency check
+            norm_profit = CashBook.normalize_currency(spec.profit_currency)
+            if pos.profit_currency != norm_profit:
+                raise ValueError(
+                    f"Symbol '{symbol}' profit currency mismatch: open position uses "
+                    f"'{pos.profit_currency}', fill specified '{norm_profit}'."
+                )
 
         # ----------------------------------------------------------------------
         # Case A: Cash Equity (Long-only)

@@ -129,6 +129,51 @@ def test_deterministic_pivot_triangulation(converter: TimestampedCurrencyConvert
     assert res.converted_amount == Decimal("16500.0000")
 
 
+def test_triangulation_stale_first_leg_raises_stale_error(
+    converter: TimestampedCurrencyConverter,
+) -> None:
+    t0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    t_stale = t0 + timedelta(days=2)  # Exceeds max_age of 1 day
+
+    # Leg 1 (EUR/USD) observed at t0 (will be stale at t_stale)
+    converter.add_rate(FXRateObservation("EUR", "USD", Decimal("1.1000"), t0))
+    # Leg 2 (USD/JPY) observed freshly at t_stale
+    converter.add_rate(FXRateObservation("USD", "JPY", Decimal("150.00"), t_stale))
+
+    # Triangulating EUR -> JPY at t_stale must raise StaleFXRateError for the stale leg, not MissingFXRateError
+    with pytest.raises(StaleFXRateError, match="FX rate for EUR/USD .* is stale"):
+        converter.convert(Decimal(100), "EUR", "JPY", as_of=t_stale)
+
+
+def test_triangulation_stale_second_leg_raises_stale_error(
+    converter: TimestampedCurrencyConverter,
+) -> None:
+    t0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    t_stale = t0 + timedelta(days=2)  # Exceeds max_age of 1 day
+
+    # Leg 1 (EUR/USD) observed freshly at t_stale
+    converter.add_rate(FXRateObservation("EUR", "USD", Decimal("1.1000"), t_stale))
+    # Leg 2 (USD/JPY) observed at t0 (will be stale at t_stale)
+    converter.add_rate(FXRateObservation("USD", "JPY", Decimal("150.00"), t0))
+
+    # Triangulating EUR -> JPY at t_stale must raise StaleFXRateError for the stale leg, not MissingFXRateError
+    with pytest.raises(StaleFXRateError, match="FX rate for USD/JPY .* is stale"):
+        converter.convert(Decimal(100), "EUR", "JPY", as_of=t_stale)
+
+
+def test_triangulation_missing_leg_raises_missing_error(
+    converter: TimestampedCurrencyConverter,
+) -> None:
+    t0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    # Leg 1 exists (EUR/USD)
+    converter.add_rate(FXRateObservation("EUR", "USD", Decimal("1.1000"), t0))
+    # Leg 2 (USD/CHF) has NEVER been observed
+
+    # Triangulating EUR -> CHF must raise MissingFXRateError
+    with pytest.raises(MissingFXRateError, match="No valid historical exchange rate found"):
+        converter.convert(Decimal(100), "EUR", "CHF", as_of=t0)
+
+
 def test_stale_rate_rejection(converter: TimestampedCurrencyConverter) -> None:
     t0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
     converter.add_rate(FXRateObservation("EUR", "USD", Decimal("1.0800"), t0))

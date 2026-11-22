@@ -65,6 +65,11 @@ class AccountingLedger:
         """Return the total number of ledger entries recorded."""
         return len(self._entries)
 
+    @property
+    def last_sequence_id(self) -> int:
+        """Return the sequence ID of the most recently recorded entry, or 0 if empty."""
+        return self._entries[-1].sequence_id if self._entries else 0
+
     def record(
         self,
         timestamp: datetime,
