@@ -19,11 +19,10 @@ from hybrid_agent.execution.backtest.portfolio.ledger import (
     LedgerEntryType,
 )
 from hybrid_agent.execution.backtest.portfolio.portfolio import (
-    OrderFill,
     Portfolio,
 )
 from hybrid_agent.execution.backtest.portfolio.positions import (
-    BacktestPosition,
+    AccountingClassification,
     OversellingError,
     PositionAccountingModel,
     PositionFillResult,
@@ -32,9 +31,9 @@ from hybrid_agent.execution.backtest.portfolio.positions import (
 )
 
 __all__ = [
+    "AccountingClassification",
     "AccountingLedger",
     "BacktestCurrencyAdapter",
-    "BacktestPosition",
     "CashBook",
     "ConversionResult",
     "DuplicateFXObservationError",
@@ -43,7 +42,6 @@ __all__ = [
     "LedgerEntry",
     "LedgerEntryType",
     "MissingFXRateError",
-    "OrderFill",
     "OversellingError",
     "Portfolio",
     "PositionAccountingModel",

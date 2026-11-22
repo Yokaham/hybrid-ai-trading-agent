@@ -1,16 +1,17 @@
 """Minimal Portfolio coordinator integrating CashBook, AccountingLedger, and PositionTracker."""
 
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from hybrid_agent.core.constants import (
-    OrderSide,
-    UnsupportedValuationModelError,
-    ValuationModel,
-)
+from hybrid_agent.core.constants import OrderSide
 from hybrid_agent.core.models import InstrumentSpecification, validate_utc_timestamp
+from hybrid_agent.execution.backtest.events import (
+    OrderFilledEvent,
+    OrderPartiallyFilledEvent,
+    PortfolioMarkedEvent,
+    PositionUpdatedEvent,
+)
 from hybrid_agent.execution.backtest.portfolio.cashbook import CashBook
 from hybrid_agent.execution.backtest.portfolio.currency import (
     ConversionResult,
@@ -21,42 +22,9 @@ from hybrid_agent.execution.backtest.portfolio.ledger import (
     LedgerEntryType,
 )
 from hybrid_agent.execution.backtest.portfolio.positions import (
-    PositionAccountingModel,
-    PositionFillResult,
+    AccountingClassification,
     PositionTracker,
 )
-
-
-@dataclass(frozen=True)
-class OrderFill:
-    """Execution fill payload submitted to the portfolio coordinator."""
-
-    symbol: str
-    side: OrderSide
-    fill_price: Decimal
-    fill_quantity: Decimal
-    spec: InstrumentSpecification
-    accounting_model: PositionAccountingModel
-    timestamp: datetime
-    commission: Decimal = Decimal("0.0")
-    commission_currency: str | None = None
-    order_id: str | None = None
-    fill_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.fill_price, Decimal):
-            object.__setattr__(self, "fill_price", CashBook.validate_amount(self.fill_price))
-        if not isinstance(self.fill_quantity, Decimal):
-            object.__setattr__(self, "fill_quantity", CashBook.validate_amount(self.fill_quantity))
-        if not isinstance(self.commission, Decimal):
-            object.__setattr__(self, "commission", CashBook.validate_amount(self.commission))
-
-        if self.commission > Decimal("0.0"):
-            if self.commission_currency is None or not self.commission_currency.strip():
-                raise ValueError("Non-zero commission must have an explicitly supplied currency")
-            object.__setattr__(self, "commission_currency", CashBook.normalize_currency(self.commission_currency))
-
-        object.__setattr__(self, "timestamp", validate_utc_timestamp(self.timestamp))
 
 
 class Portfolio:
@@ -70,6 +38,7 @@ class Portfolio:
     5. Actual FX conversion produces paired debit/credit ledger entries.
     6. Valuation translation calculates multi-currency equity without generating ledger entries.
     7. All valuation and conversion operations fail closed on missing or stale FX rates.
+    8. Exposes position changes via PositionUpdatedEvent and portfolio marks via PortfolioMarkedEvent.
     """
 
     def __init__(
@@ -98,7 +67,7 @@ class Portfolio:
         dec_amount = CashBook.validate_amount(amount)
         utc_time = validate_utc_timestamp(timestamp)
 
-        self.cashbook.deposit(norm_curr, dec_amount)
+        self.cashbook.apply_movement(norm_curr, dec_amount)
         self.ledger.record(
             timestamp=utc_time,
             entry_type=LedgerEntryType.OPENING_BALANCE,
@@ -106,165 +75,199 @@ class Portfolio:
             amount=dec_amount,
             reference_id=reference_id,
             affects_cash=True,
-            description=f"Initial opening cash in {norm_curr}",
+            description=f"Initial cash deposit in {norm_curr}",
         )
 
-    def apply_fill(self, fill: OrderFill) -> PositionFillResult:
-        """Process an executed fill, updating position inventory, cash balances, and ledger records."""
-        if fill.spec.valuation_model != ValuationModel.LINEAR:
-            raise UnsupportedValuationModelError(
-                f"Portfolio only supports LINEAR instruments, got {fill.spec.valuation_model}"
+    def apply_fill(
+        self,
+        event: OrderFilledEvent | OrderPartiallyFilledEvent,
+        spec: InstrumentSpecification,
+        accounting_type: AccountingClassification = AccountingClassification.CASH_EQUITY,
+        commission_currency: str | None = None,
+    ) -> PositionUpdatedEvent:
+        """Process an executed order fill using the authoritative OrderFilledEvent / OrderPartiallyFilledEvent.
+
+        Applies double-entry cash movements, records ledger entries, updates position inventory,
+        and returns a PositionUpdatedEvent containing the updated core domain Position.
+
+        Args:
+            event: Authoritative OrderFilledEvent or OrderPartiallyFilledEvent.
+            spec: InstrumentSpecification for tick size, contract size, and currency metadata.
+            accounting_type: CASH_EQUITY or LINEAR_CFD.
+            commission_currency: Currency of the commission fee (defaults to quote_currency if omitted).
+
+        Returns:
+            PositionUpdatedEvent containing the updated Position domain model.
+        """
+        # Validate event type
+        if not isinstance(event, (OrderFilledEvent, OrderPartiallyFilledEvent)):
+            raise TypeError(
+                f"event must be OrderFilledEvent or OrderPartiallyFilledEvent, got {type(event).__name__}"
             )
 
-        ref_id = fill.fill_id or fill.order_id or str(uuid.uuid4())
-        contract_size = CashBook.validate_amount(fill.spec.contract_size)
-        notional = fill.fill_quantity * fill.fill_price * contract_size
+        acct_type = AccountingClassification(accounting_type)
+        symbol = event.order.symbol
+        side = event.order.side
+        fill_price = CashBook.validate_amount(event.fill_price)
+        fill_quantity = CashBook.validate_amount(event.fill_quantity)
+        contract_size = CashBook.validate_amount(spec.contract_size)
+        commission = CashBook.validate_amount(event.fee)
+        timestamp = validate_utc_timestamp(event.timestamp)
+        ref_id = event.order.id or f"fill-{timestamp.isoformat()}"
+
+        # Determine fee currency
+        fee_currency: str | None = None
+        if commission > Decimal("0.0"):
+            fee_curr_raw = commission_currency or spec.quote_currency
+            fee_currency = CashBook.normalize_currency(fee_curr_raw)
 
         # ----------------------------------------------------------------------
-        # 1. Cash Equities Accounting
+        # 1. Cash Equities Accounting (Fully Funded Linear Long-only)
         # ----------------------------------------------------------------------
-        if fill.accounting_model == PositionAccountingModel.CASH_EQUITY:
-            trade_currency = CashBook.normalize_currency(fill.spec.quote_currency)
+        if acct_type == AccountingClassification.CASH_EQUITY:
+            trade_currency = CashBook.normalize_currency(spec.quote_currency)
+            notional = fill_quantity * fill_price * contract_size
 
-            if fill.side == OrderSide.BUY:
-                # Calculate total cash required upfront
-                total_required = notional
-                if fill.commission > Decimal("0.0") and fill.commission_currency == trade_currency:
-                    total_required += fill.commission
+            if side == OrderSide.BUY:
+                # Calculate required cash
+                required_cash = notional
+                if fee_currency == trade_currency:
+                    required_cash += commission
 
-                self.cashbook.check_sufficient_cash(trade_currency, total_required)
-                if fill.commission > Decimal("0.0") and fill.commission_currency != trade_currency:
-                    assert fill.commission_currency is not None
-                    self.cashbook.check_sufficient_cash(fill.commission_currency, fill.commission)
+                self.cashbook.check_sufficient_cash(trade_currency, required_cash)
+                if fee_currency and fee_currency != trade_currency:
+                    self.cashbook.check_sufficient_cash(fee_currency, commission)
 
                 # Debit trade notional
                 self.cashbook.apply_movement(trade_currency, -notional)
                 self.ledger.record(
-                    timestamp=fill.timestamp,
+                    timestamp=timestamp,
                     entry_type=LedgerEntryType.CASH_EQUITY_BUY,
                     currency=trade_currency,
                     amount=-notional,
                     reference_id=ref_id,
                     affects_cash=True,
-                    description=f"Buy {fill.fill_quantity} {fill.symbol} @ {fill.fill_price}",
+                    description=f"Buy {fill_quantity} {symbol} @ {fill_price}",
                 )
 
                 # Debit commission
-                if fill.commission > Decimal("0.0"):
-                    assert fill.commission_currency is not None
-                    self.cashbook.apply_movement(fill.commission_currency, -fill.commission)
+                if commission > Decimal("0.0"):
+                    assert fee_currency is not None
+                    self.cashbook.apply_movement(fee_currency, -commission)
                     self.ledger.record(
-                        timestamp=fill.timestamp,
+                        timestamp=timestamp,
                         entry_type=LedgerEntryType.COMMISSION,
-                        currency=fill.commission_currency,
-                        amount=-fill.commission,
+                        currency=fee_currency,
+                        amount=-commission,
                         reference_id=ref_id,
                         affects_cash=True,
-                        description=f"Commission for buy {fill.symbol}",
+                        description=f"Commission for buy {symbol}",
                     )
 
                 # Update position tracker
-                result = self.positions.apply_fill(
-                    symbol=fill.symbol,
-                    side=fill.side,
-                    fill_price=fill.fill_price,
-                    fill_quantity=fill.fill_quantity,
-                    spec=fill.spec,
-                    accounting_model=fill.accounting_model,
-                    timestamp=fill.timestamp,
+                fill_res = self.positions.apply_fill(
+                    symbol=symbol,
+                    side=side,
+                    fill_price=fill_price,
+                    fill_quantity=fill_quantity,
+                    spec=spec,
+                    accounting_model=acct_type,
+                    timestamp=timestamp,
                 )
-                return result
+                return PositionUpdatedEvent(position=fill_res.position, timestamp=timestamp)
 
             else:  # OrderSide.SELL
                 # Update position tracker first (validates long position quantity and guards against overselling)
-                result = self.positions.apply_fill(
-                    symbol=fill.symbol,
-                    side=fill.side,
-                    fill_price=fill.fill_price,
-                    fill_quantity=fill.fill_quantity,
-                    spec=fill.spec,
-                    accounting_model=fill.accounting_model,
-                    timestamp=fill.timestamp,
+                fill_res = self.positions.apply_fill(
+                    symbol=symbol,
+                    side=side,
+                    fill_price=fill_price,
+                    fill_quantity=fill_quantity,
+                    spec=spec,
+                    accounting_model=acct_type,
+                    timestamp=timestamp,
                 )
 
                 # Credit sale proceeds
                 proceeds = notional
                 self.cashbook.apply_movement(trade_currency, proceeds)
                 self.ledger.record(
-                    timestamp=fill.timestamp,
+                    timestamp=timestamp,
                     entry_type=LedgerEntryType.CASH_EQUITY_SELL,
                     currency=trade_currency,
                     amount=proceeds,
                     reference_id=ref_id,
                     affects_cash=True,
-                    description=f"Sell {fill.fill_quantity} {fill.symbol} @ {fill.fill_price}",
+                    description=f"Sell {fill_quantity} {symbol} @ {fill_price}",
                 )
 
                 # Debit commission
-                if fill.commission > Decimal("0.0"):
-                    assert fill.commission_currency is not None
-                    self.cashbook.apply_movement(fill.commission_currency, -fill.commission)
+                if commission > Decimal("0.0"):
+                    assert fee_currency is not None
+                    self.cashbook.apply_movement(fee_currency, -commission)
                     self.ledger.record(
-                        timestamp=fill.timestamp,
+                        timestamp=timestamp,
                         entry_type=LedgerEntryType.COMMISSION,
-                        currency=fill.commission_currency,
-                        amount=-fill.commission,
+                        currency=fee_currency,
+                        amount=-commission,
                         reference_id=ref_id,
                         affects_cash=True,
-                        description=f"Commission for sell {fill.symbol}",
+                        description=f"Commission for sell {symbol}",
                     )
 
-                # Note: Realized P&L is NOT credited to cash; sale proceeds already contain the economic outcome.
-                return result
+                # Realized P&L is NOT credited to cash; sale proceeds already capture the economic outcome.
+                return PositionUpdatedEvent(position=fill_res.position, timestamp=timestamp)
 
         # ----------------------------------------------------------------------
         # 2. Linear CFD Accounting
         # ----------------------------------------------------------------------
-        elif fill.accounting_model == PositionAccountingModel.CFD:
-            pnl_currency = CashBook.normalize_currency(fill.spec.profit_currency)
+        elif acct_type == AccountingClassification.LINEAR_CFD:
+            pnl_currency = CashBook.normalize_currency(spec.profit_currency)
 
             # Update position tracker (calculates realized P&L if closing/reducing)
-            result = self.positions.apply_fill(
-                symbol=fill.symbol,
-                side=fill.side,
-                fill_price=fill.fill_price,
-                fill_quantity=fill.fill_quantity,
-                spec=fill.spec,
-                accounting_model=fill.accounting_model,
-                timestamp=fill.timestamp,
+            fill_res = self.positions.apply_fill(
+                symbol=symbol,
+                side=side,
+                fill_price=fill_price,
+                fill_quantity=fill_quantity,
+                spec=spec,
+                accounting_model=acct_type,
+                timestamp=timestamp,
             )
 
             # CFDs do NOT debit/credit opening notional. Realized P&L is posted only upon closing.
-            if result.closed_quantity > Decimal("0.0") and result.realized_pnl != Decimal("0.0"):
-                self.cashbook.apply_movement(pnl_currency, result.realized_pnl)
+            if fill_res.closed_quantity > Decimal("0.0") and fill_res.realized_pnl != Decimal("0.0"):
+                self.cashbook.apply_movement(pnl_currency, fill_res.realized_pnl)
                 self.ledger.record(
-                    timestamp=fill.timestamp,
+                    timestamp=timestamp,
                     entry_type=LedgerEntryType.CFD_REALIZED_PNL,
                     currency=pnl_currency,
-                    amount=result.realized_pnl,
+                    amount=fill_res.realized_pnl,
                     reference_id=ref_id,
                     affects_cash=True,
-                    description=f"CFD closed {result.closed_quantity} {fill.symbol} Realized P&L",
+                    description=f"CFD closed {fill_res.closed_quantity} {symbol} Realized P&L",
                 )
 
             # Debit commission
-            if fill.commission > Decimal("0.0"):
-                assert fill.commission_currency is not None
-                self.cashbook.apply_movement(fill.commission_currency, -fill.commission)
+            if commission > Decimal("0.0"):
+                assert fee_currency is not None
+                self.cashbook.apply_movement(fee_currency, -commission)
                 self.ledger.record(
-                    timestamp=fill.timestamp,
+                    timestamp=timestamp,
                     entry_type=LedgerEntryType.COMMISSION,
-                    currency=fill.commission_currency,
-                    amount=-fill.commission,
+                    currency=fee_currency,
+                    amount=-commission,
                     reference_id=ref_id,
                     affects_cash=True,
-                    description=f"Commission for CFD {fill.side.value} {fill.symbol}",
+                    description=f"Commission for CFD {side.value} {symbol}",
                 )
 
-            return result
+            return PositionUpdatedEvent(position=fill_res.position, timestamp=timestamp)
 
         else:
-            raise ValueError(f"Unsupported accounting model: {fill.accounting_model}")
+            raise ValueError(f"Unsupported accounting classification: {accounting_type}")
+
+    process_fill = apply_fill  # Alias
 
     def record_financing(
         self,
@@ -376,29 +379,108 @@ class Portfolio:
                 total_equity += conv.converted_amount
 
         # 2. Add market value of held cash equities (converted to account_currency)
-        for pos in self.positions.get_open_positions():
-            if pos.accounting_model == PositionAccountingModel.CASH_EQUITY:
-                mv = pos.market_value
+        for rec in self.positions.get_open_records():
+            if rec.accounting_classification == AccountingClassification.CASH_EQUITY:
+                mv = rec.market_value
                 if mv != Decimal("0.0"):
                     conv = self.currency_converter.convert(
                         amount=mv,
-                        from_currency=pos.quote_currency,
+                        from_currency=rec.quote_currency,
                         to_currency=self.account_currency,
                         as_of=utc_as_of,
                     )
                     total_equity += conv.converted_amount
 
         # 3. Add unrealized P&L of open CFDs (converted to account_currency)
-        for pos in self.positions.get_open_positions():
-            if pos.accounting_model == PositionAccountingModel.CFD:
-                unrealized = pos.unrealized_pnl
+        for rec in self.positions.get_open_records():
+            if rec.accounting_classification == AccountingClassification.LINEAR_CFD:
+                unrealized = rec.unrealized_pnl
                 if unrealized != Decimal("0.0"):
                     conv = self.currency_converter.convert(
                         amount=unrealized,
-                        from_currency=pos.profit_currency,
+                        from_currency=rec.profit_currency,
                         to_currency=self.account_currency,
                         as_of=utc_as_of,
                     )
                     total_equity += conv.converted_amount
 
         return total_equity
+
+    def mark_portfolio(
+        self,
+        timestamp: datetime,
+        current_prices: dict[str, Decimal | float | str] | None = None,
+        peak_equity: Decimal | float | None = None,
+    ) -> PortfolioMarkedEvent:
+        """Mark portfolio to market and construct the authoritative PortfolioMarkedEvent.
+
+        Args:
+            timestamp: Point-in-time timestamp (UTC).
+            current_prices: Optional map of symbol -> latest market price.
+            peak_equity: Optional historical high-water-mark equity for drawdown calculation.
+
+        Returns:
+            Authoritative PortfolioMarkedEvent.
+        """
+        utc_time = validate_utc_timestamp(timestamp)
+
+        # Update market marks if provided
+        if current_prices:
+            for symbol, price in current_prices.items():
+                self.update_market_price(symbol, price, utc_time)
+
+        # 1. Total equity in account currency
+        equity_dec = self.get_total_equity(as_of=utc_time)
+
+        # 2. Total cash in account currency
+        total_cash_dec = Decimal("0.0")
+        for curr, balance in self.cashbook.get_all_balances().items():
+            if balance != Decimal("0.0"):
+                conv = self.currency_converter.convert(
+                    amount=balance,
+                    from_currency=curr,
+                    to_currency=self.account_currency,
+                    as_of=utc_time,
+                )
+                total_cash_dec += conv.converted_amount
+
+        # 3. Total unrealized P&L in account currency
+        total_unrealized_dec = Decimal("0.0")
+        for rec in self.positions.get_open_records():
+            unrealized = rec.unrealized_pnl
+            if unrealized != Decimal("0.0"):
+                conv = self.currency_converter.convert(
+                    amount=unrealized,
+                    from_currency=rec.profit_currency,
+                    to_currency=self.account_currency,
+                    as_of=utc_time,
+                )
+                total_unrealized_dec += conv.converted_amount
+
+        # 4. Total cumulative realized P&L in account currency
+        total_realized_dec = Decimal("0.0")
+        for curr, realized in self.positions.get_all_cumulative_realized_pnl().items():
+            if realized != Decimal("0.0"):
+                conv = self.currency_converter.convert(
+                    amount=realized,
+                    from_currency=curr,
+                    to_currency=self.account_currency,
+                    as_of=utc_time,
+                )
+                total_realized_dec += conv.converted_amount
+
+        # 5. Drawdown calculation
+        drawdown_pct = 0.0
+        if peak_equity is not None:
+            peak_dec = CashBook.validate_amount(peak_equity)
+            if peak_dec > Decimal("0.0") and equity_dec < peak_dec:
+                drawdown_pct = float((peak_dec - equity_dec) / peak_dec * Decimal("100.0"))
+
+        return PortfolioMarkedEvent(
+            equity=float(equity_dec),
+            cash=float(total_cash_dec),
+            unrealized_pnl=float(total_unrealized_dec),
+            realized_pnl=float(total_realized_dec),
+            drawdown_pct=max(0.0, drawdown_pct),
+            timestamp=utc_time,
+        )

@@ -27,9 +27,9 @@ from hybrid_agent.execution.backtest.exceptions import (
     SequenceIdOverflowError,
 )
 from hybrid_agent.execution.backtest.portfolio import (
+    AccountingClassification,
     AccountingLedger,
     BacktestCurrencyAdapter,
-    BacktestPosition,
     CashBook,
     ConversionResult,
     DuplicateFXObservationError,
@@ -38,7 +38,6 @@ from hybrid_agent.execution.backtest.portfolio import (
     LedgerEntry,
     LedgerEntryType,
     MissingFXRateError,
-    OrderFill,
     OversellingError,
     Portfolio,
     PositionAccountingModel,
@@ -51,10 +50,10 @@ from hybrid_agent.execution.backtest.portfolio import (
 
 __all__ = [
     "MAX_SEQUENCE_ID",
+    "AccountingClassification",
     "AccountingLedger",
     "BacktestCompletedEvent",
     "BacktestCurrencyAdapter",
-    "BacktestPosition",
     "CashBook",
     "ClockNotInitializedError",
     "ConversionResult",
@@ -71,7 +70,6 @@ __all__ = [
     "MarketBarOpenedEvent",
     "MissingFXRateError",
     "OrderCancelledEvent",
-    "OrderFill",
     "OrderFilledEvent",
     "OrderPartiallyFilledEvent",
     "OrderSubmittedEvent",

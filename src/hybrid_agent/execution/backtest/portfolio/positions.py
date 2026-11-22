@@ -10,15 +10,20 @@ from hybrid_agent.core.constants import (
     UnsupportedValuationModelError,
     ValuationModel,
 )
-from hybrid_agent.core.models import InstrumentSpecification, validate_utc_timestamp
+from hybrid_agent.core.models import InstrumentSpecification, Position, validate_utc_timestamp
+from hybrid_agent.execution.backtest.events import PositionUpdatedEvent
 from hybrid_agent.execution.backtest.portfolio.cashbook import CashBook
 
 
-class PositionAccountingModel(str, Enum):
-    """Accounting treatment models for position inventory."""
+class AccountingClassification(str, Enum):
+    """Minimal explicit classification distinguishing cash-equity accounting from CFD accounting."""
 
-    CASH_EQUITY = "CASH_EQUITY"  # Fully funded linear equity (long-only)
-    CFD = "CFD"                  # Linear margin derivative (long and short)
+    CASH_EQUITY = "CASH_EQUITY"
+    LINEAR_CFD = "LINEAR_CFD"
+
+
+# Backward-compatibility alias
+PositionAccountingModel = AccountingClassification
 
 
 class OversellingError(ValueError):
@@ -30,11 +35,11 @@ class PositionReversalError(ValueError):
 
 
 @dataclass
-class BacktestPosition:
-    """Internal position representation for backtesting calculations using exact Decimals."""
+class _PositionRecord:
+    """Internal Decimal-based accounting state narrowly scoped to PositionTracker for precision."""
 
     symbol: str
-    accounting_model: PositionAccountingModel
+    accounting_classification: AccountingClassification
     side: OrderSide
     quantity: Decimal = Decimal("0.0")
     average_entry_price: Decimal = Decimal("0.0")
@@ -43,6 +48,7 @@ class BacktestPosition:
     quote_currency: str = "USD"
     profit_currency: str = "USD"
     last_updated: datetime | None = None
+    realized_pnl: Decimal = Decimal("0.0")
 
     @property
     def is_closed(self) -> bool:
@@ -55,7 +61,7 @@ class BacktestPosition:
 
         CFDs have zero market value asset balance (they are margin contracts, not funded assets).
         """
-        if self.accounting_model == PositionAccountingModel.CASH_EQUITY:
+        if self.accounting_classification == AccountingClassification.CASH_EQUITY:
             return self.quantity * self.current_price * self.contract_size
         return Decimal("0.0")
 
@@ -77,13 +83,26 @@ class BacktestPosition:
         direction = Decimal("1.0") if self.side == OrderSide.BUY else Decimal("-1.0")
         return (self.current_price - self.average_entry_price) * self.quantity * self.contract_size * direction
 
+    def to_domain_position(self) -> Position:
+        """Convert internal Decimal state to the authoritative core domain Position model."""
+        return Position(
+            symbol=self.symbol,
+            side=self.side,
+            quantity=float(self.quantity),
+            average_entry_price=float(self.average_entry_price),
+            current_price=float(self.current_price),
+            contract_size=float(self.contract_size),
+            unrealized_pnl=float(self.unrealized_pnl),
+            realized_pnl=float(self.realized_pnl),
+        )
+
 
 @dataclass(frozen=True)
 class PositionFillResult:
     """Outcome of applying an executed fill to position inventory."""
 
     symbol: str
-    accounting_model: PositionAccountingModel
+    accounting_classification: AccountingClassification
     side: OrderSide
     fill_price: Decimal
     fill_quantity: Decimal
@@ -93,6 +112,12 @@ class PositionFillResult:
     remaining_quantity: Decimal
     new_average_entry_price: Decimal
     is_closed: bool
+    position: Position
+
+    @property
+    def accounting_model(self) -> AccountingClassification:
+        """Alias for backward compatibility."""
+        return self.accounting_classification
 
 
 class PositionTracker:
@@ -106,19 +131,31 @@ class PositionTracker:
     5. Realized P&L = (Exit - Entry) * Q * ContractSize * Direction.
     6. CFD opposing fills cannot auto-reverse; exceeding open quantity raises PositionReversalError.
     7. Tracks cumulative realized P&L per currency permanently across position lifecycles.
+    8. Exposes position state through the authoritative core domain Position model.
     """
 
     def __init__(self) -> None:
-        self._positions: dict[str, BacktestPosition] = {}
+        self._positions: dict[str, _PositionRecord] = {}
         self._cumulative_realized_pnl: dict[str, Decimal] = {}
 
-    def get_position(self, symbol: str) -> BacktestPosition | None:
-        """Retrieve the active position for a symbol, if it exists."""
-        return self._positions.get(symbol)
+    def get_position(self, symbol: str) -> Position | None:
+        """Retrieve the authoritative core domain Position for a symbol, if active."""
+        rec = self._positions.get(symbol)
+        if rec is None or rec.is_closed:
+            return None
+        return rec.to_domain_position()
 
-    def get_open_positions(self) -> list[BacktestPosition]:
-        """Return all open (non-closed) positions."""
-        return [p for p in self._positions.values() if not p.is_closed]
+    def get_open_positions(self) -> list[Position]:
+        """Return all open positions as authoritative core domain Position models."""
+        return [rec.to_domain_position() for rec in self._positions.values() if not rec.is_closed]
+
+    def get_open_records(self) -> list[_PositionRecord]:
+        """Internal helper returning open Decimal records for exact arithmetic in Portfolio."""
+        return [rec for rec in self._positions.values() if not rec.is_closed]
+
+    def get_record(self, symbol: str) -> _PositionRecord | None:
+        """Internal helper retrieving Decimal record for exact arithmetic in Portfolio."""
+        return self._positions.get(symbol)
 
     def get_cumulative_realized_pnl(self, currency: str) -> Decimal:
         """Return total realized P&L accumulated in a specific currency."""
@@ -139,6 +176,27 @@ class PositionTracker:
             pos.current_price = dec_price
             pos.last_updated = validate_utc_timestamp(timestamp)
 
+    def get_position_event(self, symbol: str, timestamp: datetime) -> PositionUpdatedEvent:
+        """Construct a PositionUpdatedEvent for the current state of a symbol."""
+        pos = self.get_position(symbol)
+        if pos is None:
+            # Flat position representation
+            rec = self._positions.get(symbol)
+            pnl = float(self.get_cumulative_realized_pnl(rec.profit_currency)) if rec is not None else 0.0
+            avg_px = float(rec.average_entry_price) if rec is not None and rec.average_entry_price > Decimal("0.0") else 1.0
+            curr_px = float(rec.current_price) if rec is not None and rec.current_price > Decimal("0.0") else 1.0
+            pos = Position(
+                symbol=symbol,
+                side=rec.side if rec is not None else OrderSide.BUY,
+                quantity=0.0,
+                average_entry_price=avg_px,
+                current_price=curr_px,
+                contract_size=float(rec.contract_size) if rec is not None else 1.0,
+                unrealized_pnl=0.0,
+                realized_pnl=pnl,
+            )
+        return PositionUpdatedEvent(position=pos, timestamp=validate_utc_timestamp(timestamp))
+
     def apply_fill(
         self,
         symbol: str,
@@ -146,7 +204,7 @@ class PositionTracker:
         fill_price: Decimal | float | str,
         fill_quantity: Decimal | float | str,
         spec: InstrumentSpecification,
-        accounting_model: PositionAccountingModel,
+        accounting_model: AccountingClassification,
         timestamp: datetime,
     ) -> PositionFillResult:
         """Apply a validated order fill to the position inventory.
@@ -157,17 +215,29 @@ class PositionTracker:
             fill_price: Execution price.
             fill_quantity: Execution quantity.
             spec: InstrumentSpecification for tick size, contract size, and currency metadata.
-            accounting_model: CASH_EQUITY or CFD.
+            accounting_model: CASH_EQUITY or LINEAR_CFD.
             timestamp: Execution timestamp (UTC).
 
         Returns:
-            PositionFillResult containing closed quantities and realized P&L.
+            PositionFillResult containing closed quantities, realized P&L, and core domain Position.
         """
         # Validate valuation model
         if spec.valuation_model != ValuationModel.LINEAR:
             raise UnsupportedValuationModelError(
                 f"PositionTracker only supports LINEAR valuation models, got {spec.valuation_model}"
             )
+
+        # Normalize accounting model
+        if isinstance(accounting_model, str):
+            val = accounting_model.strip().upper()
+            if val in ("CFD", "LINEAR_CFD"):
+                acct_model = AccountingClassification.LINEAR_CFD
+            elif val in ("CASH_EQUITY", "EQUITY", "CASH_EQUITIES"):
+                acct_model = AccountingClassification.CASH_EQUITY
+            else:
+                raise ValueError(f"Unsupported accounting classification: {accounting_model}")
+        else:
+            acct_model = accounting_model
 
         utc_time = validate_utc_timestamp(timestamp)
         p_dec = CashBook.validate_amount(fill_price)
@@ -184,16 +254,18 @@ class PositionTracker:
         # ----------------------------------------------------------------------
         # Case A: Cash Equity (Long-only)
         # ----------------------------------------------------------------------
-        if accounting_model == PositionAccountingModel.CASH_EQUITY:
+        if acct_model == AccountingClassification.CASH_EQUITY:
             if side == OrderSide.SELL and (pos is None or pos.is_closed or pos.side != OrderSide.BUY):
-                raise ValueError(f"Short cash equities are prohibited. Cannot sell {symbol} without existing long position.")
+                raise ValueError(
+                    f"Short cash equities are prohibited. Cannot sell {symbol} without existing long position."
+                )
 
             if side == OrderSide.BUY:
                 # Opening or adding to long cash equity
                 if pos is None or pos.is_closed:
-                    pos = BacktestPosition(
+                    pos = _PositionRecord(
                         symbol=symbol,
-                        accounting_model=accounting_model,
+                        accounting_classification=acct_model,
                         side=OrderSide.BUY,
                         quantity=q_dec,
                         average_entry_price=p_dec,
@@ -216,7 +288,7 @@ class PositionTracker:
 
                 return PositionFillResult(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     fill_price=p_dec,
                     fill_quantity=q_dec,
@@ -226,6 +298,7 @@ class PositionTracker:
                     remaining_quantity=pos.quantity,
                     new_average_entry_price=pos.average_entry_price,
                     is_closed=False,
+                    position=pos.to_domain_position(),
                 )
 
             else:  # side == OrderSide.SELL
@@ -241,6 +314,7 @@ class PositionTracker:
                 pos.quantity -= closed_qty
                 pos.current_price = p_dec
                 pos.last_updated = utc_time
+                pos.realized_pnl += realized_pnl
 
                 # Record cumulative realized P&L
                 pnl_curr = pos.profit_currency
@@ -251,9 +325,25 @@ class PositionTracker:
                 is_closed = pos.is_closed
                 avg_price = Decimal("0.0") if is_closed else pos.average_entry_price
 
+                # Expose domain position
+                domain_pos = (
+                    Position(
+                        symbol=symbol,
+                        side=pos.side,
+                        quantity=0.0,
+                        average_entry_price=float(pos.average_entry_price),
+                        current_price=float(p_dec),
+                        contract_size=float(contract_size),
+                        unrealized_pnl=0.0,
+                        realized_pnl=float(pos.realized_pnl),
+                    )
+                    if is_closed
+                    else pos.to_domain_position()
+                )
+
                 return PositionFillResult(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     fill_price=p_dec,
                     fill_quantity=q_dec,
@@ -263,17 +353,18 @@ class PositionTracker:
                     remaining_quantity=pos.quantity,
                     new_average_entry_price=avg_price,
                     is_closed=is_closed,
+                    position=domain_pos,
                 )
 
         # ----------------------------------------------------------------------
         # Case B: Linear CFD (Long and Short)
         # ----------------------------------------------------------------------
-        elif accounting_model == PositionAccountingModel.CFD:
+        elif acct_model == AccountingClassification.LINEAR_CFD:
             if pos is None or pos.is_closed:
                 # Open fresh CFD position
-                pos = BacktestPosition(
+                pos = _PositionRecord(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     quantity=q_dec,
                     average_entry_price=p_dec,
@@ -286,7 +377,7 @@ class PositionTracker:
                 self._positions[symbol] = pos
                 return PositionFillResult(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     fill_price=p_dec,
                     fill_quantity=q_dec,
@@ -296,6 +387,7 @@ class PositionTracker:
                     remaining_quantity=pos.quantity,
                     new_average_entry_price=pos.average_entry_price,
                     is_closed=False,
+                    position=pos.to_domain_position(),
                 )
 
             elif pos.side == side:
@@ -310,7 +402,7 @@ class PositionTracker:
 
                 return PositionFillResult(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     fill_price=p_dec,
                     fill_quantity=q_dec,
@@ -320,6 +412,7 @@ class PositionTracker:
                     remaining_quantity=pos.quantity,
                     new_average_entry_price=pos.average_entry_price,
                     is_closed=False,
+                    position=pos.to_domain_position(),
                 )
 
             else:
@@ -337,6 +430,7 @@ class PositionTracker:
                 pos.quantity -= closed_qty
                 pos.current_price = p_dec
                 pos.last_updated = utc_time
+                pos.realized_pnl += realized_pnl
 
                 # Record cumulative realized P&L
                 pnl_curr = pos.profit_currency
@@ -347,9 +441,25 @@ class PositionTracker:
                 is_closed = pos.is_closed
                 avg_price = Decimal("0.0") if is_closed else pos.average_entry_price
 
+                # Expose domain position
+                domain_pos = (
+                    Position(
+                        symbol=symbol,
+                        side=pos.side,
+                        quantity=0.0,
+                        average_entry_price=float(pos.average_entry_price),
+                        current_price=float(p_dec),
+                        contract_size=float(contract_size),
+                        unrealized_pnl=0.0,
+                        realized_pnl=float(pos.realized_pnl),
+                    )
+                    if is_closed
+                    else pos.to_domain_position()
+                )
+
                 return PositionFillResult(
                     symbol=symbol,
-                    accounting_model=accounting_model,
+                    accounting_classification=acct_model,
                     side=side,
                     fill_price=p_dec,
                     fill_quantity=q_dec,
@@ -359,7 +469,8 @@ class PositionTracker:
                     remaining_quantity=pos.quantity,
                     new_average_entry_price=avg_price,
                     is_closed=is_closed,
+                    position=domain_pos,
                 )
 
         else:
-            raise ValueError(f"Unsupported accounting model: {accounting_model}")
+            raise ValueError(f"Unsupported accounting classification: {accounting_model}")
