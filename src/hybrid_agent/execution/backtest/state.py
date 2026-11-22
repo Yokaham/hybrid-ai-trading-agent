@@ -422,6 +422,15 @@ class OrderExecutionState:
         self._status = new_status
         self._last_update_time = fill_time
 
+    def transition_order_status(self, new_status: OrderStatus, timestamp: datetime) -> None:
+        """Transitions the wrapped domain Order lifecycle status.
+
+        Args:
+            new_status: Target OrderStatus following ALLOWED_ORDER_TRANSITIONS.
+            timestamp: Explicit UTC simulation timestamp of the transition.
+        """
+        self._order.transition_to(new_status, timestamp=timestamp)
+
     def cancel_remaining(self, timestamp: datetime, reason: str) -> None:
         """Cancels the remaining unfilled quantity.
 

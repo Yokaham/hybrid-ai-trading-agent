@@ -71,11 +71,16 @@ It does not contain a `PARTIALLY_FILLED` status. An order in modern electronic m
 
 ## 3. OrderManager Specification
 
+> **Implementation Boundary Note (Milestone 3B.4.2)**:
+> - **Implemented in Milestone 3B.4.2**: Core `OrderManager` registry and lifecycle, permanent vs. active order tracking, idempotent order registration, atomic fill-record routing, remainder cancellation, and macro `OrderStatus` synchronization.
+> - **Pending in Future Stages**: Parent-child OCO bracket relationships, take-profit / stop-loss child order generation, and dynamic child order scaling on partial fills (deferred to subsequent milestone).
+> - **Pending**: `FillEngine` price matching and execution logic (deferred to Milestone 3B.4.4).
+
 ### 3.1 Responsibilities
 - Registers risk-approved orders from `OrderSubmittedEvent` (Priority 4).
 - Maintains the mapping of `order_id -> OrderExecutionState`.
-- Manages parent-child contingent order relationships (OCO brackets, take-profit, stop-loss).
-- Handles partial fills by dynamically scaling child order quantities to match executed position inventory.
+- Manages parent-child contingent order relationships (OCO brackets, take-profit, stop-loss; planned).
+- Handles partial fills by dynamically scaling child order quantities to match executed position inventory (planned).
 - Cancels unfilled residual order quantity without modifying or reversing already-executed position inventory.
 - Guarantees deterministic processing order.
 

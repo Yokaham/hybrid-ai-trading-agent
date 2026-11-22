@@ -26,6 +26,14 @@ from hybrid_agent.execution.backtest.exceptions import (
     RetroactiveEventError,
     SequenceIdOverflowError,
 )
+from hybrid_agent.execution.backtest.order_manager import (
+    DuplicateFillError,
+    DuplicateOrderError,
+    InvalidOrderStateError,
+    OrderManager,
+    OrderManagerError,
+    OrderNotFoundError,
+)
 from hybrid_agent.execution.backtest.portfolio import (
     AccountingClassification,
     AccountingLedger,
@@ -64,6 +72,8 @@ __all__ = [
     "ClockNotInitializedError",
     "ConversionResult",
     "DuplicateFXObservationError",
+    "DuplicateFillError",
+    "DuplicateOrderError",
     "EmptyQueueError",
     "EventPriority",
     "EventQueue",
@@ -73,6 +83,7 @@ __all__ = [
     "InstrumentAccountingIdentity",
     "InsufficientFundsError",
     "InvalidEventPriorityError",
+    "InvalidOrderStateError",
     "LedgerEntry",
     "LedgerEntryType",
     "MarketBarClosedEvent",
@@ -81,6 +92,9 @@ __all__ = [
     "OrderCancelledEvent",
     "OrderExecutionState",
     "OrderFilledEvent",
+    "OrderManager",
+    "OrderManagerError",
+    "OrderNotFoundError",
     "OrderPartiallyFilledEvent",
     "OrderSubmittedEvent",
     "OversellingError",

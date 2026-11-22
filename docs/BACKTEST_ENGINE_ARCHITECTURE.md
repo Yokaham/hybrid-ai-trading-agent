@@ -333,11 +333,55 @@ The `record_fill(fill: FillRecord)` method applies strict pre-flight validation 
 - **Executed Position Preservation**: All executed fills and `filled_quantity` are retained intact. Cancelling an order remainder never invalidates or reverses previously executed positions in `Portfolio`.
 - If an order is already completed (`leaves_quantity == 0`), cancellation is rejected.
 
-#### 6. Dynamic OCO Bracket Scaling (Preview for 3B.4.2)
+#### 6. Dynamic OCO Bracket Scaling (Preview for 3B.4.3)
 - When an entry order partially fills, linked exit child orders (Take-Profit / Stop-Loss) are activated and scaled strictly to the cumulative executed quantity ($Q_{\text{child}} = Q_{\text{filled}}$).
 - Cancelling the remaining entry quantity leaves the child bracket actively protecting the executed inventory without premature termination.
 
-### 6.3 CFD Financing & Overnight Holding Model
+### 6.3 OrderManager Core Lifecycle and Registry (Milestone 3B.4.2)
+
+Milestone 3B.4.2 implements the central `OrderManager` coordinator responsible for order registration, execution-state ownership, active matching order indexing, fill synchronization, and remainder cancellation:
+
+#### 1. Strict Architectural Separation
+- **Zero Independent Accounting**: `OrderManager` maintains **zero** independent cash balances, position inventory, margin accounting, or realized/unrealized P&L calculations. Authoritative accounting remains strictly within `Portfolio.apply_fill()`.
+- **Zero Price Matching**: `OrderManager` performs no quote consumption, bar evaluation, slippage calculation, or market matching. It receives immutable `FillRecord` events generated downstream by `FillEngine`.
+
+#### 2. Dual-Registry Architecture (Permanent vs. Active)
+- **Permanent Order Registry (`_orders`)**: Maps every unique `order_id` to its owning `OrderExecutionState`. Orders remain in this registry indefinitely across the entire simulation lifetime for post-trade analysis, trade attribution, and auditability. Order IDs are never reused or overwritten.
+- **Active Order Registry (`_active_order_ids`)**: Tracks only orders currently eligible for execution matching (`ACTIVE` or `PARTIALLY_FILLED` states with $\text{leaves\_quantity} > 0$). When an order reaches a terminal state (`FILLED` or `CANCELLED`), it is immediately and irreversibly removed from active collections.
+- **Fill Registry (`_fill_to_order_id`)**: Indexes every `fill_id` to its owning `order_id`. Guarantees global uniqueness of fill IDs across all orders and provides $O(1)$ fill-to-order traceability.
+
+#### 3. Order Registration Contract
+- **Trigger**: Ingestion of `OrderSubmittedEvent` (Priority 4: `ORDER_SUBMISSION_RESERVATION`).
+- **Pre-flight Validation**:
+  - `event.timestamp` and `event.submission_time` must be valid timezone-aware UTC and must match identically ($T_{\text{event}} = T_{\text{submission}}$).
+  - Order must be in `OrderStatus.APPROVED` or `OrderStatus.SUBMITTED`.
+  - Instrument specification must match `order.symbol`. If pre-registered, specs must not conflict.
+- **Original Order Protection**: The manager takes a deep copy (`order.model_copy(deep=True)`) before managing state. If the order was in `APPROVED` status, the managed copy transitions to `SUBMITTED` using the submission timestamp. The caller's original object remains unaffected.
+- **Duplicate Registration Handling**:
+  - Idempotent: Re-registering the same `order_id` with identical order parameters and submission timestamp returns the existing `OrderExecutionState` without creating duplicate active entries.
+  - Conflicting: Attempting to register an existing `order_id` with conflicting parameters raises `DuplicateOrderError`.
+
+#### 4. Fill Recording & Lifecycle Synchronization
+- **Trigger**: Arrival of an immutable `FillRecord` from `FillEngine`.
+- **Validation**: Verifies order existence (`OrderNotFoundError`), rejects duplicate `fill_id` across all orders (`DuplicateFillError`), ensures symbol/side match, and verifies the order is active.
+- **Atomicity**: Delegates validation and calculation to `OrderExecutionState.record_fill()`. If any validation fails, manager indexes and execution states remain completely unmutated.
+- **Macro Lifecycle Synchronization**:
+  - Partial fill: `ExecutionStatus` transitions to `PARTIALLY_FILLED`; domain `OrderStatus` remains `SUBMITTED`; order remains active.
+  - Full fill: When $\text{leaves\_quantity} = Q_{\text{fill}}$, `ExecutionStatus` transitions to `FILLED`; domain `OrderStatus` transitions to `FILLED` using `fill.timestamp`; the order is removed from the active collection.
+
+#### 5. Cancellation Semantics & Position Preservation
+- **Trigger**: Calling `cancel_order(order_id, timestamp, reason)`.
+- **Invariance**: Cancelling an order cancels only the unexecuted remainder ($\text{leaves\_quantity} \to 0$, recorded as $\text{cancelled\_quantity}$). All previously executed fills, cumulative filled quantity, and average fill price are strictly preserved.
+- **Macro Lifecycle**: Domain `OrderStatus` transitions to `CANCELLED` using the cancellation timestamp.
+- **Event Emission**: Emits `OrderCancelledEvent` containing the managed order snapshot, timestamp, and reason.
+- **Zero Portfolio Corruption**: Cancellation does not interact with or reverse existing positions in `Portfolio`.
+
+#### 6. Deterministic Retrieval
+- `get_active_orders(symbol=None)`: Returns active orders sorted deterministically by `(submission_time, registration_sequence, order_id)`.
+- `get_all_orders(symbol=None)`: Returns all orders preserving registration order.
+- Returned collections are defensive list copies, protecting internal manager registries from external mutation.
+
+### 6.4 CFD Financing & Overnight Holding Model
 - **Intraday Holding**: CFD positions opened and closed within the same trading session incur **zero** financing charges.
 - **Overnight Financing Model**: For positions held past the daily rollover cutoff (e.g. 22:00 UTC):
   $$\text{Daily Financing Charge} = \text{Notional} \times \frac{R_{\text{benchmark}} \pm \text{Spread}_{\text{financing}}}{360} \times \text{DaysHeld}$$
