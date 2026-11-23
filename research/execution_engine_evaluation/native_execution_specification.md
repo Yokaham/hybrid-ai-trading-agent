@@ -168,28 +168,36 @@ When an entry order receives a partial fill:
 | **Bar-Only Stop SELL** | OHLCV Bar | $\text{SyntheticLowBid} \le \text{TriggerPrice}$ | $\min(\text{TriggerPrice}, \text{OpenBid}) - \text{Slippage}$ | TAKER |
 
 ### 4.3 Review Corrections & Invariant Hardening (Milestone 3B.4.4)
-1. **Market-Event Identity and Cache Safety Contract**:
-   - Canonical fingerprinting of market data events (`_create_event_fingerprint`) across symbol, timestamp, bid, ask, sizes, and provider sequence attributes.
+1. **Market-Event Identity Independent of Ingestion Time**:
+   - Canonical fingerprinting of market data events (`_create_event_fingerprint`) across immutable observation attributes: symbol, event type, timestamp, bid, ask, prices, and sizes.
+   - Ingestion time (`retrieved_at`) and arbitrary provenance metadata are explicitly excluded from the fingerprint, guaranteeing that re-ingesting the identical market observation at different times yields identical fingerprints.
+   - Provider sequence numbers/IDs (`sequence_id`, `sequence_number`, `sequence`, `seq`, `provider_event_id`, `event_id`, `message_id`, `msg_seq_num`) in `DataProvenance.metadata` are extracted and incorporated when present. If absent, canonical fallback `(source_name, source_type, is_synthetic)` is used.
+   - Documented limitation: Indistinguishable identical observations lacking provider sequence IDs cannot be distinguished from retransmissions without inventing synthetic IDs.
    - Distinct events must carry distinct IDs; reusing an existing ID with a different observation raises `DuplicateMarketEventError`.
    - Presenting the same observation under multiple or renamed IDs raises `DuplicateMarketEventError` to prevent duplicate liquidity consumption.
    - Idempotent replay: Presenting the same observation under the same ID returns cached fills without re-consuming liquidity.
-2. **Transactional Candidate Creation**:
-   - All fallible validation, calculations (price, volume, slippage, commission), and `FillRecord`/`FillCandidate` construction are completed BEFORE committing liquidity or mutating commission state.
-   - If validation or creation fails, no state mutation occurs (zero leakage).
-3. **Two-Phase Commission Commit & Multi-Fill Order-Level Min/Max**:
-   - Decouples `calculate_commission` (read-only prospective fee estimation) from `commit_commission` (stateful tracking of order-level cumulative raw fees and fees charged).
-   - Order-level min/max caps (`min_per_order`, `max_per_order`) are enforced incrementally across multiple partial fills, guaranteeing that total commissions charged across all fills of an order stay within $[min, max]$.
-   - Idempotent commission commitment per `fill_id`.
-4. **Preserve Explicit Commission Currency in Portfolio Integration**:
+2. **Two-Phase Transactional Matching and Rollback Contract**:
+   - `match_quote()` and `match_bar()` are atomic transactional operations.
+   - Phase 1 (Staging): Candidate calculation, price derivation, local liquidity tracking (`staged_consumed_quote` / `staged_consumed_bar`), and incremental fee calculation against local state.
+   - Phase 2 (Commit): State commit across liquidity and commission models occurs only after all candidates in the matching call are constructed and verified.
+   - Rollback on Failure: If any error occurs in Phase 1 or Phase 2, `_restore_state()`, `liquidity_model.restore()`, and `commission_model.restore()` revert all state to the pre-call snapshot ($S_0$).
+   - Models must implement the `snapshot() -> Any` and `restore(snapshot: Any) -> None` contract.
+3. **Commission Fill-ID Consistency and Conflict Safety**:
+   - `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across all commission models.
+   - Replaying identical fill IDs with matching details is idempotent.
+   - Reusing an existing `fill_id` with conflicting order, price, quantity, or fee details raises explicit `CommissionConflictError(ValueError)`.
+   - Distinct fills with different IDs are never deduplicated.
+4. **Finite Unbounded Liquidity Ceiling**:
+   - Replaced all non-finite `Decimal("Infinity")` in `DefaultLiquidityModel` with finite `UNBOUNDED_LIQUIDITY_CEILING = Decimal(1_000_000_000)`.
+   - Available and remaining liquidity are always strictly finite decimals.
+5. **Preserve Explicit Commission Currency in Portfolio Integration**:
    - Introduces `PortfolioFillApplication` and `FillCandidate.to_portfolio_application()` / `to_portfolio_event_and_currency()`.
    - Packages fill events with exact, un-inferred `commission_currency` from canonical `FillRecord` for direct input to `Portfolio.apply_fill()`.
-5. **Strict Non-Finite Numeric Validation & Strictly Positive Prices**:
+6. **Strict Non-Finite Numeric Validation & Strictly Positive Prices**:
    - Rejects non-finite values (`NaN`, `Infinity`, `-Infinity`) across all models and inputs.
    - Enforces strictly positive execution prices ($P_{\text{exec}} > 0$).
-6. **Bar Execution Timestamp Availability Convention**:
+7. **Bar Execution Timestamp Availability Convention**:
    - Clarifies that `bar.end_time` for intrabar touches is an availability-time and confirmation convention, preventing forward-looking bias while avoiding false microsecond precision claims.
-7. **Explicit Missing-Volume Policies**:
-   - Defines `FAIL_CLOSED`, `FIXED_DEFAULT_CAP`, and `UNLIMITED_WITH_DIAGNOSTIC` (capped at finite $1,000,000,000$) with observable diagnostics.
 
 ---
 

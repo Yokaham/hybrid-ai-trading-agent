@@ -12,9 +12,11 @@ and explicit state commit (commit_commission) with fill-level idempotency.
 
 import math
 from decimal import Decimal
+from typing import Any
 
 from hybrid_agent.core.models import InstrumentSpecification
 from hybrid_agent.execution.backtest.execution_models import (
+    CommissionConflictError,
     CommissionModel,
     InvalidModelConfigurationError,
 )
@@ -51,6 +53,10 @@ def _normalize_currency(currency: str | None, name: str) -> str:
 class ZeroCommissionModel(CommissionModel):
     """Zero commission model."""
 
+    def __init__(self) -> None:
+        # fill_id -> (order_id, fill_price, fill_quantity, fee, currency)
+        self._committed_fills: dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]] = {}
+
     def calculate_commission(
         self,
         order: OrderSnapshot,
@@ -58,8 +64,22 @@ class ZeroCommissionModel(CommissionModel):
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
         fill_id: str | None = None,
+        **kwargs: Any,
     ) -> tuple[Decimal, str | None]:
         """Returns (Decimal(0), None). Pure calculation."""
+        px = _to_decimal(fill_price, "fill_price")
+        qty = _to_decimal(fill_quantity, "fill_quantity")
+        if fill_id is not None and fill_id in self._committed_fills:
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
         return Decimal(0), None
 
     def commit_commission(
@@ -70,11 +90,38 @@ class ZeroCommissionModel(CommissionModel):
         spec: InstrumentSpecification | None = None,
         fill_id: str | None = None,
     ) -> tuple[Decimal, str | None]:
-        """Returns (Decimal(0), None). No state to commit."""
+        """Returns (Decimal(0), None) and records fill details if fill_id is supplied."""
+        px = _to_decimal(fill_price, "fill_price")
+        qty = _to_decimal(fill_quantity, "fill_quantity")
+        if fill_id is not None and fill_id in self._committed_fills:
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
+
+        if fill_id is not None:
+            self._committed_fills[fill_id] = (order.id, px, qty, Decimal(0), None)
         return Decimal(0), None
 
+    def snapshot(self) -> dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]]:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        return dict(self._committed_fills)
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
+        if not isinstance(snapshot, dict):
+            raise TypeError("Invalid ZeroCommissionModel snapshot format")
+        self._committed_fills = dict(snapshot)
+
     def reset(self) -> None:
-        """No state to reset."""
+        """Clears all committed fills."""
+        self._committed_fills.clear()
 
 
 class PerShareCommissionModel(CommissionModel):
@@ -88,6 +135,7 @@ class PerShareCommissionModel(CommissionModel):
     - Subsequent partial fills are charged incrementally based on cumulative raw vs effective fees.
     - The cumulative fee charged across all partial fills never exceeds max_per_order.
     - Idempotent: re-committing the same fill_id does not charge additional fees.
+    - Reusing committed fill_id with conflicting details raises CommissionConflictError.
     """
 
     def __init__(
@@ -132,8 +180,8 @@ class PerShareCommissionModel(CommissionModel):
         self._order_cumulative_raw: dict[str, Decimal] = {}
         # Order tracking: order_id -> cumulative fee charged
         self._order_cumulative_charged: dict[str, Decimal] = {}
-        # Fill tracking: fill_id -> (fee, currency)
-        self._committed_fills: dict[str, tuple[Decimal, str | None]] = {}
+        # Fill tracking: fill_id -> (order_id, fill_price, fill_quantity, fee, currency)
+        self._committed_fills: dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]] = {}
 
     @property
     def per_share_rate(self) -> Decimal:
@@ -155,6 +203,8 @@ class PerShareCommissionModel(CommissionModel):
         self,
         order_id: str,
         fill_quantity: Decimal,
+        staged_prev_raw: Decimal | None = None,
+        staged_prev_charged: Decimal | None = None,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         """Calculates tentative incremental fee.
 
@@ -162,7 +212,11 @@ class PerShareCommissionModel(CommissionModel):
             (raw_fill_fee, incremental_fee, new_cumulative_raw, new_cumulative_charged)
         """
         raw_fill_fee = fill_quantity * self._per_share_rate
-        prev_raw = self._order_cumulative_raw.get(order_id, Decimal(0))
+        prev_raw = (
+            staged_prev_raw
+            if staged_prev_raw is not None
+            else self._order_cumulative_raw.get(order_id, Decimal(0))
+        )
         new_raw = prev_raw + raw_fill_fee
 
         target_effective = new_raw
@@ -171,7 +225,11 @@ class PerShareCommissionModel(CommissionModel):
         if self._max_per_order is not None and target_effective > self._max_per_order:
             target_effective = self._max_per_order
 
-        prev_charged = self._order_cumulative_charged.get(order_id, Decimal(0))
+        prev_charged = (
+            staged_prev_charged
+            if staged_prev_charged is not None
+            else self._order_cumulative_charged.get(order_id, Decimal(0))
+        )
         incremental_fee = max(Decimal(0), target_effective - prev_charged)
         new_charged = prev_charged + incremental_fee
         return raw_fill_fee, incremental_fee, new_raw, new_charged
@@ -183,17 +241,31 @@ class PerShareCommissionModel(CommissionModel):
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
         fill_id: str | None = None,
+        staged_prev_raw: Decimal | None = None,
+        staged_prev_charged: Decimal | None = None,
+        **kwargs: Any,
     ) -> tuple[Decimal, str | None]:
         """Calculates tentative commission without committing state."""
-        _to_decimal(fill_price, "fill_price")
+        px = _to_decimal(fill_price, "fill_price")
         qty = _to_decimal(fill_quantity, "fill_quantity")
         if qty <= Decimal(0):
             raise ValueError(f"fill_quantity must be strictly positive, got {qty}")
 
         if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
 
-        _, incremental_fee, _, _ = self._calc_incremental(order.id, qty)
+        _, incremental_fee, _, _ = self._calc_incremental(
+            order.id, qty, staged_prev_raw, staged_prev_charged
+        )
         if incremental_fee == Decimal(0):
             return Decimal(0), None
         return incremental_fee, self._currency
@@ -207,23 +279,53 @@ class PerShareCommissionModel(CommissionModel):
         fill_id: str | None = None,
     ) -> tuple[Decimal, str | None]:
         """Commits commission state for an accepted fill. Idempotent across fill_id."""
-        _to_decimal(fill_price, "fill_price")
+        px = _to_decimal(fill_price, "fill_price")
         qty = _to_decimal(fill_quantity, "fill_quantity")
         if qty <= Decimal(0):
             raise ValueError(f"fill_quantity must be strictly positive, got {qty}")
 
         if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
 
         _, incremental_fee, new_raw, new_charged = self._calc_incremental(order.id, qty)
         self._order_cumulative_raw[order.id] = new_raw
         self._order_cumulative_charged[order.id] = new_charged
 
         result_curr = self._currency if incremental_fee > Decimal(0) else None
-        result = (incremental_fee, result_curr)
         if fill_id is not None:
-            self._committed_fills[fill_id] = result
-        return result
+            self._committed_fills[fill_id] = (order.id, px, qty, incremental_fee, result_curr)
+        return incremental_fee, result_curr
+
+    def snapshot(
+        self,
+    ) -> tuple[
+        dict[str, Decimal],
+        dict[str, Decimal],
+        dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]],
+    ]:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        return (
+            dict(self._order_cumulative_raw),
+            dict(self._order_cumulative_charged),
+            dict(self._committed_fills),
+        )
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 3:
+            raise TypeError("Invalid PerShareCommissionModel snapshot format")
+        self._order_cumulative_raw = dict(snapshot[0])
+        self._order_cumulative_charged = dict(snapshot[1])
+        self._committed_fills = dict(snapshot[2])
 
     def reset(self) -> None:
         """Clears all internal cross-fill and order-level cumulative fee state."""
@@ -243,6 +345,7 @@ class PercentageCommissionModel(CommissionModel):
     - Subsequent partial fills are charged incrementally based on cumulative raw vs effective fees.
     - The cumulative fee charged across all partial fills never exceeds max_per_order.
     - Idempotent: re-committing the same fill_id does not charge additional fees.
+    - Reusing committed fill_id with conflicting details raises CommissionConflictError.
     """
 
     def __init__(
@@ -287,8 +390,8 @@ class PercentageCommissionModel(CommissionModel):
         self._order_cumulative_raw: dict[str, Decimal] = {}
         # Order tracking: order_id -> cumulative fee charged
         self._order_cumulative_charged: dict[str, Decimal] = {}
-        # Fill tracking: fill_id -> (fee, currency)
-        self._committed_fills: dict[str, tuple[Decimal, str | None]] = {}
+        # Fill tracking: fill_id -> (order_id, fill_price, fill_quantity, fee, currency)
+        self._committed_fills: dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]] = {}
 
     @property
     def percentage_rate(self) -> Decimal:
@@ -312,6 +415,8 @@ class PercentageCommissionModel(CommissionModel):
         fill_price: Decimal,
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None,
+        staged_prev_raw: Decimal | None = None,
+        staged_prev_charged: Decimal | None = None,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
         contract_size = (
             Decimal(str(spec.contract_size))
@@ -321,7 +426,11 @@ class PercentageCommissionModel(CommissionModel):
         notional = fill_price * fill_quantity * contract_size
         raw_fill_fee = notional * self._percentage_rate
 
-        prev_raw = self._order_cumulative_raw.get(order_id, Decimal(0))
+        prev_raw = (
+            staged_prev_raw
+            if staged_prev_raw is not None
+            else self._order_cumulative_raw.get(order_id, Decimal(0))
+        )
         new_raw = prev_raw + raw_fill_fee
 
         target_effective = new_raw
@@ -330,7 +439,11 @@ class PercentageCommissionModel(CommissionModel):
         if self._max_per_order is not None and target_effective > self._max_per_order:
             target_effective = self._max_per_order
 
-        prev_charged = self._order_cumulative_charged.get(order_id, Decimal(0))
+        prev_charged = (
+            staged_prev_charged
+            if staged_prev_charged is not None
+            else self._order_cumulative_charged.get(order_id, Decimal(0))
+        )
         incremental_fee = max(Decimal(0), target_effective - prev_charged)
         new_charged = prev_charged + incremental_fee
         return raw_fill_fee, incremental_fee, new_raw, new_charged
@@ -342,6 +455,9 @@ class PercentageCommissionModel(CommissionModel):
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
         fill_id: str | None = None,
+        staged_prev_raw: Decimal | None = None,
+        staged_prev_charged: Decimal | None = None,
+        **kwargs: Any,
     ) -> tuple[Decimal, str | None]:
         """Calculates tentative commission without committing state."""
         px = _to_decimal(fill_price, "fill_price")
@@ -350,9 +466,20 @@ class PercentageCommissionModel(CommissionModel):
             raise ValueError("fill_price and fill_quantity must be strictly positive")
 
         if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
 
-        _, incremental_fee, _, _ = self._calc_incremental(order.id, px, qty, spec)
+        _, incremental_fee, _, _ = self._calc_incremental(
+            order.id, px, qty, spec, staged_prev_raw, staged_prev_charged
+        )
         if incremental_fee == Decimal(0):
             return Decimal(0), None
         return incremental_fee, self._currency
@@ -372,17 +499,47 @@ class PercentageCommissionModel(CommissionModel):
             raise ValueError("fill_price and fill_quantity must be strictly positive")
 
         if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
 
         _, incremental_fee, new_raw, new_charged = self._calc_incremental(order.id, px, qty, spec)
         self._order_cumulative_raw[order.id] = new_raw
         self._order_cumulative_charged[order.id] = new_charged
 
         result_curr = self._currency if incremental_fee > Decimal(0) else None
-        result = (incremental_fee, result_curr)
         if fill_id is not None:
-            self._committed_fills[fill_id] = result
-        return result
+            self._committed_fills[fill_id] = (order.id, px, qty, incremental_fee, result_curr)
+        return incremental_fee, result_curr
+
+    def snapshot(
+        self,
+    ) -> tuple[
+        dict[str, Decimal],
+        dict[str, Decimal],
+        dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]],
+    ]:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        return (
+            dict(self._order_cumulative_raw),
+            dict(self._order_cumulative_charged),
+            dict(self._committed_fills),
+        )
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 3:
+            raise TypeError("Invalid PercentageCommissionModel snapshot format")
+        self._order_cumulative_raw = dict(snapshot[0])
+        self._order_cumulative_charged = dict(snapshot[1])
+        self._committed_fills = dict(snapshot[2])
 
     def reset(self) -> None:
         """Clears all internal cross-fill and order-level cumulative fee state."""
@@ -414,7 +571,8 @@ class FixedPerOrderCommissionModel(CommissionModel):
         self._fixed_fee = fee
         self._currency = curr
         self._charged_orders: set[str] = set()
-        self._committed_fills: dict[str, tuple[Decimal, str | None]] = {}
+        # fill_id -> (order_id, fill_price, fill_quantity, fee, currency)
+        self._committed_fills: dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]] = {}
 
     @property
     def fixed_fee(self) -> Decimal:
@@ -431,15 +589,29 @@ class FixedPerOrderCommissionModel(CommissionModel):
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
         fill_id: str | None = None,
+        staged_charged: bool | None = None,
+        **kwargs: Any,
     ) -> tuple[Decimal, str | None]:
         """Calculates tentative commission without mutating charged order state."""
+        px = _to_decimal(fill_price, "fill_price")
+        qty = _to_decimal(fill_quantity, "fill_quantity")
+
+        if fill_id is not None and fill_id in self._committed_fills:
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
+
         if self._fixed_fee == Decimal(0):
             return Decimal(0), None
 
-        if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
-
-        if order.id in self._charged_orders:
+        if (staged_charged is True) or (order.id in self._charged_orders):
             return Decimal(0), None
 
         return self._fixed_fee, self._currency
@@ -453,17 +625,41 @@ class FixedPerOrderCommissionModel(CommissionModel):
         fill_id: str | None = None,
     ) -> tuple[Decimal, str | None]:
         """Commits commission state for an accepted fill. Idempotent across fill_id."""
-        if fill_id is not None and fill_id in self._committed_fills:
-            return self._committed_fills[fill_id]
+        px = _to_decimal(fill_price, "fill_price")
+        qty = _to_decimal(fill_quantity, "fill_quantity")
 
-        fee, curr = self.calculate_commission(order, fill_price, fill_quantity, spec, fill_id)
+        if fill_id is not None and fill_id in self._committed_fills:
+            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
+                fill_id
+            ]
+            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+                raise CommissionConflictError(
+                    f"Conflicting fill details for committed fill_id '{fill_id}': "
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                )
+            return cached_fee, cached_curr
+
+        fee, curr = self.calculate_commission(order, px, qty, spec, fill_id)
         if fee > Decimal(0):
             self._charged_orders.add(order.id)
 
-        result = (fee, curr)
         if fill_id is not None:
-            self._committed_fills[fill_id] = result
-        return result
+            self._committed_fills[fill_id] = (order.id, px, qty, fee, curr)
+        return fee, curr
+
+    def snapshot(
+        self,
+    ) -> tuple[set[str], dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]]]:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        return (set(self._charged_orders), dict(self._committed_fills))
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+            raise TypeError("Invalid FixedPerOrderCommissionModel snapshot format")
+        self._charged_orders = set(snapshot[0])
+        self._committed_fills = dict(snapshot[1])
 
     def reset(self) -> None:
         """Clears the set of charged orders and committed fills."""

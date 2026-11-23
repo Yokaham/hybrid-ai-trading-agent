@@ -43,6 +43,7 @@ from hybrid_agent.execution.backtest.exceptions import (
     SequenceIdOverflowError,
 )
 from hybrid_agent.execution.backtest.execution_models import (
+    CommissionConflictError,
     CommissionModel,
     DuplicateMarketEventError,
     ExecutionProvenance,
@@ -125,6 +126,7 @@ __all__ = [
     "BracketStatus",
     "CashBook",
     "ClockNotInitializedError",
+    "CommissionConflictError",
     "CommissionModel",
     "ConversionResult",
     "DefaultLiquidityModel",

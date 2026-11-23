@@ -15,7 +15,9 @@ Bar Execution Timestamp Convention:
   lookahead bias by ensuring order matching is confirmed only after the bar closes.
 """
 
+import dataclasses
 import math
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
@@ -23,6 +25,7 @@ from typing import Any
 from hybrid_agent.core.constants import OrderSide, OrderType
 from hybrid_agent.core.models import (
     Bar,
+    DataProvenance,
     InstrumentSpecification,
     Quote,
     Tick,
@@ -112,6 +115,21 @@ class FillEngine:
             dict(instrument_specs) if instrument_specs is not None else {}
         )
 
+        # Validate transactional rollback contract on injected models
+        for model_name, model in [
+            ("liquidity_model", self._liquidity_model),
+            ("commission_model", self._commission_model),
+        ]:
+            if not (
+                hasattr(model, "snapshot")
+                and callable(model.snapshot)
+                and hasattr(model, "restore")
+                and callable(model.restore)
+            ):
+                raise InvalidModelConfigurationError(
+                    f"{model_name} '{type(model).__name__}' does not implement the transactional contract (snapshot/restore)"
+                )
+
         # Market event identity mapping: market_event_id -> observation fingerprint
         self._event_id_to_fingerprint: dict[str, tuple[Any, ...]] = {}
         # Reverse mapping: fingerprint -> market_event_id
@@ -156,25 +174,75 @@ class FillEngine:
         self._commission_model.reset()
         self._liquidity_model.reset()
 
+    def _snapshot_state(
+        self,
+    ) -> tuple[
+        dict[str, int],
+        dict[str, tuple[Any, ...]],
+        dict[tuple[Any, ...], str],
+        dict[str, list[FillCandidate]],
+    ]:
+        """Captures internal engine state snapshot for transactional rollback."""
+        return (
+            dict(self._event_fill_counts),
+            dict(self._event_id_to_fingerprint),
+            dict(self._fingerprint_to_event_id),
+            {k: list(v) for k, v in self._processed_events.items()},
+        )
+
+    def _restore_state(self, snapshot: Any) -> None:
+        """Restores internal engine state from a previously captured snapshot."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 4:
+            raise TypeError("Invalid FillEngine state snapshot format")
+        self._event_fill_counts = dict(snapshot[0])
+        self._event_id_to_fingerprint = dict(snapshot[1])
+        self._fingerprint_to_event_id = dict(snapshot[2])
+        self._processed_events = {k: list(v) for k, v in snapshot[3].items()}
+
     @staticmethod
-    def _create_event_fingerprint(event: Quote | Tick | Bar) -> tuple[Any, ...]:
+    def _extract_provider_sequence(provenance: DataProvenance | None) -> tuple[str, str] | None:
+        """Extracts a stable provider event/sequence identifier from metadata if present.
+
+        Returns (key, value) or None if no recognized sequence identifier exists.
+        Does not invent identifiers when none are supplied.
+        """
+        if provenance is None or not provenance.metadata:
+            return None
+        for key in (
+            "sequence_id",
+            "sequence_number",
+            "sequence",
+            "seq",
+            "provider_event_id",
+            "event_id",
+            "message_id",
+            "msg_seq_num",
+        ):
+            if key in provenance.metadata and provenance.metadata[key] is not None:
+                return (key, str(provenance.metadata[key]))
+        return None
+
+    @classmethod
+    def _create_event_fingerprint(cls, event: Quote | Tick | Bar) -> tuple[Any, ...]:
         """Constructs an immutable canonical fingerprint identifying a specific market observation.
 
-        Includes instrument, event type, timestamp, and core market data fields.
+        Includes instrument, event type, timestamp, core market data fields, and stable source
+        provenance (source_name, source_type, is_synthetic, provider_sequence).
+
+        Limitation:
+        - Ingestion audit metadata such as `retrieved_at` is strictly excluded from event identity.
+        - Two genuinely distinct observations that have identical available identity fields
+          (instrument, event type, timestamp, market prices/volumes, and source) cannot be
+          distinguished without a source-provided sequence or event identifier in metadata.
         """
         prov_key: Any = None
         if event.provenance is not None:
-            meta_items = (
-                tuple(sorted((str(k), str(v)) for k, v in event.provenance.metadata.items()))
-                if event.provenance.metadata
-                else ()
-            )
+            provider_seq = cls._extract_provider_sequence(event.provenance)
             prov_key = (
                 event.provenance.source_name,
                 event.provenance.source_type.value,
-                validate_utc_timestamp(event.provenance.retrieved_at).isoformat(),
                 event.provenance.is_synthetic,
-                meta_items,
+                provider_seq,
             )
 
         if isinstance(event, Quote):
@@ -301,220 +369,280 @@ class FillEngine:
             else Decimal("0.01")
         )
 
-        fills: list[FillCandidate] = []
         bid_dec = Decimal(str(quote.bid))
         ask_dec = Decimal(str(quote.ask))
 
-        for snap in active_orders:
-            order = snap.order
-            if order.symbol.upper() != symbol:
-                continue
+        # Capture snapshots for atomic transactional matching
+        engine_snap = self._snapshot_state()
+        liq_snap = self._liquidity_model.snapshot()
+        comm_snap = self._commission_model.snapshot()
 
-            if snap.is_terminal or snap.leaves_quantity <= Decimal(0):
-                continue
+        try:
+            # Phase 1: Staging & Candidate Preparation
+            staged_consumed_quote: dict[tuple[str, str, OrderSide], Decimal] = defaultdict(Decimal)
+            staged_order_cumulative_raw: dict[str, Decimal] = {}
+            staged_order_cumulative_charged: dict[str, Decimal] = {}
+            staged_charged_orders: set[str] = set()
 
-            # Causality check: order cannot execute against quote prior to submission
-            if snap.submission_time > quote_time:
-                continue
+            staged_items: list[tuple[FillRecord, FillCandidate, Decimal, str, OrderSide]] = []
+            curr_fill_count = self._event_fill_counts.get(market_event_id, 0)
 
-            if not snap.leaves_quantity.is_finite() or snap.leaves_quantity <= Decimal(0):
-                continue
+            for snap in active_orders:
+                order = snap.order
+                if order.symbol.upper() != symbol:
+                    continue
 
-            # 1. Evaluate crossing conditions and base price
-            base_price: Decimal
-            liq_side: LiquiditySide
+                if snap.is_terminal or snap.leaves_quantity <= Decimal(0):
+                    continue
 
-            if order.order_type == OrderType.MARKET:
-                if order.side == OrderSide.BUY:
-                    base_price = ask_dec
-                else:
-                    base_price = bid_dec
-                liq_side = LiquiditySide.TAKER
+                # Causality check: order cannot execute against quote prior to submission
+                if snap.submission_time > quote_time:
+                    continue
 
-            elif order.order_type == OrderType.LIMIT:
-                if (
-                    order.limit_price is None
-                    or math.isnan(order.limit_price)
-                    or math.isinf(order.limit_price)
-                    or order.limit_price <= 0.0
-                ):
-                    raise ValueError(f"Limit order '{order.id}' is missing valid limit_price")
-                limit_px = Decimal(str(order.limit_price))
-                if not limit_px.is_finite():
-                    raise ValueError(
-                        f"Limit order '{order.id}' has non-finite limit_price: {limit_px}"
-                    )
+                if not snap.leaves_quantity.is_finite() or snap.leaves_quantity <= Decimal(0):
+                    continue
 
-                if order.side == OrderSide.BUY:
-                    if ask_dec > limit_px:
-                        # Market Ask has not reached or crossed the limit
-                        continue
-                    base_price = ask_dec
-                else:  # OrderSide.SELL
-                    if bid_dec < limit_px:
-                        # Market Bid has not reached or crossed the limit
-                        continue
-                    base_price = bid_dec
+                # 1. Evaluate crossing conditions and base price
+                base_price: Decimal
+                liq_side: LiquiditySide
 
-                # Maker vs Taker: if order was submitted at the same timestamp as quote, it is marketable taker
-                if snap.submission_time >= quote_time:
+                if order.order_type == OrderType.MARKET:
+                    if order.side == OrderSide.BUY:
+                        base_price = ask_dec
+                    else:
+                        base_price = bid_dec
                     liq_side = LiquiditySide.TAKER
-                else:
-                    liq_side = LiquiditySide.MAKER
 
-            elif order.order_type == OrderType.STOP_LOSS:
-                if (
-                    order.stop_loss_price is None
-                    or math.isnan(order.stop_loss_price)
-                    or math.isinf(order.stop_loss_price)
-                    or order.stop_loss_price <= 0.0
-                ):
-                    raise ValueError(f"Stop order '{order.id}' is missing valid stop_loss_price")
-                stop_px = Decimal(str(order.stop_loss_price))
-                if not stop_px.is_finite():
-                    raise ValueError(
-                        f"Stop order '{order.id}' has non-finite stop_loss_price: {stop_px}"
+                elif order.order_type == OrderType.LIMIT:
+                    if (
+                        order.limit_price is None
+                        or math.isnan(order.limit_price)
+                        or math.isinf(order.limit_price)
+                        or order.limit_price <= 0.0
+                    ):
+                        raise ValueError(f"Limit order '{order.id}' is missing valid limit_price")
+                    limit_px = Decimal(str(order.limit_price))
+                    if not limit_px.is_finite():
+                        raise ValueError(
+                            f"Limit order '{order.id}' has non-finite limit_price: {limit_px}"
+                        )
+
+                    if order.side == OrderSide.BUY:
+                        if ask_dec > limit_px:
+                            # Market Ask has not reached or crossed the limit
+                            continue
+                        base_price = ask_dec
+                    else:  # OrderSide.SELL
+                        if bid_dec < limit_px:
+                            # Market Bid has not reached or crossed the limit
+                            continue
+                        base_price = bid_dec
+
+                    # Maker vs Taker: if order was submitted at the same timestamp as quote, it is marketable taker
+                    if snap.submission_time >= quote_time:
+                        liq_side = LiquiditySide.TAKER
+                    else:
+                        liq_side = LiquiditySide.MAKER
+
+                elif order.order_type == OrderType.STOP_LOSS:
+                    if (
+                        order.stop_loss_price is None
+                        or math.isnan(order.stop_loss_price)
+                        or math.isinf(order.stop_loss_price)
+                        or order.stop_loss_price <= 0.0
+                    ):
+                        raise ValueError(
+                            f"Stop order '{order.id}' is missing valid stop_loss_price"
+                        )
+                    stop_px = Decimal(str(order.stop_loss_price))
+                    if not stop_px.is_finite():
+                        raise ValueError(
+                            f"Stop order '{order.id}' has non-finite stop_loss_price: {stop_px}"
+                        )
+
+                    if order.side == OrderSide.BUY:
+                        if ask_dec < stop_px:
+                            # Stop has not been triggered
+                            continue
+                        base_price = ask_dec
+                    else:  # OrderSide.SELL
+                        if bid_dec > stop_px:
+                            # Stop has not been triggered
+                            continue
+                        base_price = bid_dec
+                    liq_side = LiquiditySide.TAKER
+
+                else:
+                    ot_str = getattr(order.order_type, "value", str(order.order_type))
+                    raise UnsupportedOrderTypeError(
+                        f"Order type '{ot_str}' is not supported by FillEngine"
+                    )
+
+                # 2. Check available quote displayed liquidity (taking into account already staged fills)
+                avail_depth, depth_diagnostics = (
+                    self._liquidity_model.get_available_quote_liquidity(
+                        quote=quote,
+                        side=order.side,
+                        market_event_id=market_event_id,
+                    )
+                )
+                already_staged = staged_consumed_quote[(market_event_id, symbol, order.side)]
+                effective_avail = max(Decimal(0), avail_depth - already_staged)
+                if not effective_avail.is_finite() or effective_avail <= Decimal(0):
+                    continue
+
+                # 3. Determine candidate fill quantity
+                cand_qty = min(snap.leaves_quantity, effective_avail)
+
+                # Align with volume step if spec exists
+                if spec is not None and spec.volume_step > 0:
+                    step = Decimal(str(spec.volume_step))
+                    steps = (cand_qty / step).to_integral_value()
+                    cand_qty = steps * step
+
+                if not cand_qty.is_finite() or cand_qty <= Decimal(0):
+                    continue
+
+                # 4. Calculate adverse slippage
+                slippage = self._slippage_model.calculate_slippage(
+                    order=order,
+                    base_price=base_price,
+                    fill_quantity=cand_qty,
+                    market_data=quote,
+                    spec=spec,
+                )
+                if not slippage.is_finite() or slippage < Decimal(0):
+                    raise InvalidModelConfigurationError(
+                        f"Calculated slippage must be finite and non-negative, got {slippage}"
                     )
 
                 if order.side == OrderSide.BUY:
-                    if ask_dec < stop_px:
-                        # Stop has not been triggered
+                    raw_fill_price = base_price + slippage
+                    fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.BUY)
+                else:
+                    raw_fill_price = base_price - slippage
+                    fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.SELL)
+
+                if not fill_price.is_finite() or fill_price <= Decimal(0):
+                    raise FillEngineError(
+                        f"Execution price {fill_price} after costs is invalid or non-positive for order {order.id}"
+                    )
+
+                # 5. Contractual limit-price protection
+                if order.order_type == OrderType.LIMIT:
+                    assert order.limit_price is not None
+                    limit_px = Decimal(str(order.limit_price))
+                    if order.side == OrderSide.BUY and fill_price > limit_px:
                         continue
-                    base_price = ask_dec
-                else:  # OrderSide.SELL
-                    if bid_dec > stop_px:
-                        # Stop has not been triggered
+                    if order.side == OrderSide.SELL and fill_price < limit_px:
                         continue
-                    base_price = bid_dec
-                liq_side = LiquiditySide.TAKER
 
-            else:
-                ot_str = getattr(order.order_type, "value", str(order.order_type))
-                raise UnsupportedOrderTypeError(
-                    f"Order type '{ot_str}' is not supported by FillEngine"
-                )
+                # 6. Fallible candidate preparation & validation
+                curr_fill_count += 1
+                fill_id = f"fill-{market_event_id}-{order.id}-{curr_fill_count}"
 
-            # 2. Check available quote displayed liquidity
-            avail_depth, depth_diagnostics = self._liquidity_model.get_available_quote_liquidity(
-                quote=quote,
-                side=order.side,
-                market_event_id=market_event_id,
-            )
-            if not avail_depth.is_finite() or avail_depth <= Decimal(0):
-                continue
+                staged_raw = staged_order_cumulative_raw.get(order.id)
+                staged_charged = staged_order_cumulative_charged.get(order.id)
+                staged_is_charged = (order.id in staged_charged_orders) or None
 
-            # 3. Determine candidate fill quantity
-            cand_qty = min(snap.leaves_quantity, avail_depth)
-
-            # Align with volume step if spec exists
-            if spec is not None and spec.volume_step > 0:
-                step = Decimal(str(spec.volume_step))
-                steps = (cand_qty / step).to_integral_value()
-                cand_qty = steps * step
-
-            if not cand_qty.is_finite() or cand_qty <= Decimal(0):
-                continue
-
-            # 4. Calculate adverse slippage
-            slippage = self._slippage_model.calculate_slippage(
-                order=order,
-                base_price=base_price,
-                fill_quantity=cand_qty,
-                market_data=quote,
-                spec=spec,
-            )
-            if not slippage.is_finite() or slippage < Decimal(0):
-                raise InvalidModelConfigurationError(
-                    f"Calculated slippage must be finite and non-negative, got {slippage}"
-                )
-
-            if order.side == OrderSide.BUY:
-                raw_fill_price = base_price + slippage
-                fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.BUY)
-            else:
-                raw_fill_price = base_price - slippage
-                fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.SELL)
-
-            if not fill_price.is_finite() or fill_price <= Decimal(0):
-                raise FillEngineError(
-                    f"Execution price {fill_price} after costs is invalid or non-positive for order {order.id}"
-                )
-
-            # 5. Contractual limit-price protection
-            if order.order_type == OrderType.LIMIT:
-                assert order.limit_price is not None
-                limit_px = Decimal(str(order.limit_price))
-                if order.side == OrderSide.BUY and fill_price > limit_px:
-                    continue
-                if order.side == OrderSide.SELL and fill_price < limit_px:
-                    continue
-
-            # 6. Fallible candidate preparation & validation (BEFORE state commit)
-            count = self._event_fill_counts.get(market_event_id, 0) + 1
-            fill_id = f"fill-{market_event_id}-{order.id}-{count}"
-
-            # Calculate tentative commission (read-only, does not commit state)
-            fee, fee_currency = self._commission_model.calculate_commission(
-                order=order,
-                fill_price=fill_price,
-                fill_quantity=cand_qty,
-                spec=spec,
-            )
-            if not fee.is_finite() or fee < Decimal(0):
-                raise InvalidModelConfigurationError(
-                    f"Commission fee {fee} must be finite and non-negative"
-                )
-            if fee > Decimal(0) and (fee_currency is None or not fee_currency.strip()):
-                raise InvalidModelConfigurationError(
-                    f"Non-zero commission ({fee}) requires an explicit non-empty currency"
-                )
-
-            record = FillRecord(
-                fill_id=fill_id,
-                order_id=order.id,
-                symbol=symbol,
-                side=order.side,
-                fill_price=fill_price,
-                fill_quantity=cand_qty,
-                fee=fee,
-                commission_currency=fee_currency,
-                slippage=slippage,
-                timestamp=quote_time,
-            )
-
-            candidate = FillCandidate(
-                fill_record=record,
-                order_snapshot=order,
-                is_complete=(cand_qty == snap.leaves_quantity),
-                liquidity_side=liq_side,
-                provenance=ExecutionProvenance.REAL_QUOTE,
-                market_event_id=market_event_id,
-                diagnostics=tuple(depth_diagnostics),
-            )
-
-            # 7. COMMIT STATE: Only after candidate is completely constructed and validated!
-            self._liquidity_model.consume_quote_liquidity(
-                market_event_id=market_event_id,
-                symbol=symbol,
-                side=order.side,
-                quantity=cand_qty,
-            )
-            if hasattr(self._commission_model, "commit_commission"):
-                self._commission_model.commit_commission(
+                fee, fee_currency = self._commission_model.calculate_commission(
                     order=order,
                     fill_price=fill_price,
                     fill_quantity=cand_qty,
                     spec=spec,
                     fill_id=fill_id,
+                    staged_prev_raw=staged_raw,
+                    staged_prev_charged=staged_charged,
+                    staged_charged=staged_is_charged,
                 )
-            self._event_fill_counts[market_event_id] = count
-            fills.append(candidate)
+                if not fee.is_finite() or fee < Decimal(0):
+                    raise InvalidModelConfigurationError(
+                        f"Commission fee {fee} must be finite and non-negative"
+                    )
+                if fee > Decimal(0) and (fee_currency is None or not fee_currency.strip()):
+                    raise InvalidModelConfigurationError(
+                        f"Non-zero commission ({fee}) requires an explicit non-empty currency"
+                    )
 
-        # Register event and cache results
-        self._event_id_to_fingerprint[market_event_id] = fp
-        self._fingerprint_to_event_id[fp] = market_event_id
-        self._processed_events[market_event_id] = fills
-        return list(fills)
+                record = FillRecord(
+                    fill_id=fill_id,
+                    order_id=order.id,
+                    symbol=symbol,
+                    side=order.side,
+                    fill_price=fill_price,
+                    fill_quantity=cand_qty,
+                    fee=fee,
+                    commission_currency=fee_currency,
+                    slippage=slippage,
+                    timestamp=quote_time,
+                )
+
+                candidate = FillCandidate(
+                    fill_record=record,
+                    order_snapshot=order,
+                    is_complete=(cand_qty == snap.leaves_quantity),
+                    liquidity_side=liq_side,
+                    provenance=ExecutionProvenance.REAL_QUOTE,
+                    market_event_id=market_event_id,
+                    diagnostics=tuple(depth_diagnostics),
+                )
+
+                # Track staged liquidity & commission state
+                staged_consumed_quote[(market_event_id, symbol, order.side)] += cand_qty
+                if hasattr(self._commission_model, "_calc_incremental"):
+                    if hasattr(self._commission_model, "_per_share_rate"):
+                        _, _, nr, nc = self._commission_model._calc_incremental(
+                            order.id, cand_qty, staged_raw, staged_charged
+                        )
+                        staged_order_cumulative_raw[order.id] = nr
+                        staged_order_cumulative_charged[order.id] = nc
+                    elif hasattr(self._commission_model, "_percentage_rate"):
+                        _, _, nr, nc = self._commission_model._calc_incremental(
+                            order.id, fill_price, cand_qty, spec, staged_raw, staged_charged
+                        )
+                        staged_order_cumulative_raw[order.id] = nr
+                        staged_order_cumulative_charged[order.id] = nc
+                if fee > Decimal(0):
+                    staged_charged_orders.add(order.id)
+
+                staged_items.append((record, candidate, cand_qty, symbol, order.side))
+
+            # Phase 2: State Commit (only reached if all candidate creation and validation succeeded)
+            committed_fills: list[FillCandidate] = []
+            for record, candidate, cand_qty, sym, side in staged_items:
+                self._liquidity_model.consume_quote_liquidity(
+                    market_event_id=market_event_id,
+                    symbol=sym,
+                    side=side,
+                    quantity=cand_qty,
+                )
+                committed_fee, committed_curr = self._commission_model.commit_commission(
+                    order=candidate.order_snapshot,
+                    fill_price=record.fill_price,
+                    fill_quantity=cand_qty,
+                    spec=spec,
+                    fill_id=record.fill_id,
+                )
+                # Verify commission match
+                if committed_fee != record.fee or committed_curr != record.commission_currency:
+                    record = dataclasses.replace(
+                        record, fee=committed_fee, commission_currency=committed_curr
+                    )
+                    candidate = dataclasses.replace(candidate, fill_record=record)
+
+                committed_fills.append(candidate)
+
+            self._event_fill_counts[market_event_id] = curr_fill_count
+            self._event_id_to_fingerprint[market_event_id] = fp
+            self._fingerprint_to_event_id[fp] = market_event_id
+            self._processed_events[market_event_id] = committed_fills
+            return list(committed_fills)
+
+        except Exception:
+            self._restore_state(engine_snap)
+            self._liquidity_model.restore(liq_snap)
+            self._commission_model.restore(comm_snap)
+            raise
 
     def match_bar(
         self,
@@ -645,150 +773,204 @@ class FillEngine:
                         # Ambiguous bar: Stop-Loss MUST win! Suppress Take-Profit
                         suppressed_order_ids.add(tp_snap.order.id)
 
-        # 3. Match eligible orders in deterministic order
-        fills: list[FillCandidate] = []
+        # Capture snapshots for atomic transactional matching
+        engine_snap = self._snapshot_state()
+        liq_snap = self._liquidity_model.snapshot()
+        comm_snap = self._commission_model.snapshot()
 
-        for snap in eligible_orders:
-            order = snap.order
-            if order.id in suppressed_order_ids:
-                continue
+        try:
+            # Phase 1: Staging & Candidate Preparation
+            staged_consumed_bar: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+            staged_order_cumulative_raw: dict[str, Decimal] = {}
+            staged_order_cumulative_charged: dict[str, Decimal] = {}
+            staged_charged_orders: set[str] = set()
 
-            match_result = self._evaluate_bar_execution(
-                order=order,
-                open_dec=open_dec,
-                high_dec=high_dec,
-                low_dec=low_dec,
-                close_dec=close_dec,
-                half_spread=half_spread,
-                bar_start=bar_start,
-                bar_end=bar_end,
-            )
-            if match_result is None:
-                continue
+            staged_items: list[tuple[FillRecord, FillCandidate, Decimal, str]] = []
+            curr_fill_count = self._event_fill_counts.get(market_event_id, 0)
 
-            base_price, exec_time, liq_side, is_open_gap = match_result
-
-            # 4. Check available bar volume participation liquidity
-            avail_vol, vol_diagnostics = self._liquidity_model.get_available_bar_liquidity(
-                bar=bar,
-                market_event_id=market_event_id,
-            )
-            if not avail_vol.is_finite() or avail_vol <= Decimal(0):
-                continue
-
-            cand_qty = min(snap.leaves_quantity, avail_vol)
-
-            # Volume step alignment
-            if spec is not None and spec.volume_step > 0:
-                step = Decimal(str(spec.volume_step))
-                steps = (cand_qty / step).to_integral_value()
-                cand_qty = steps * step
-
-            if not cand_qty.is_finite() or cand_qty <= Decimal(0):
-                continue
-
-            # 5. Slippage calculation
-            slippage = self._slippage_model.calculate_slippage(
-                order=order,
-                base_price=base_price,
-                fill_quantity=cand_qty,
-                market_data=bar,
-                spec=spec,
-            )
-            if not slippage.is_finite() or slippage < Decimal(0):
-                raise InvalidModelConfigurationError(
-                    f"Calculated slippage must be finite and non-negative, got {slippage}"
-                )
-
-            if order.side == OrderSide.BUY:
-                raw_fill_price = base_price + slippage
-                fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.BUY)
-            else:
-                raw_fill_price = base_price - slippage
-                fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.SELL)
-
-            if not fill_price.is_finite() or fill_price <= Decimal(0):
-                raise FillEngineError(
-                    f"Execution price {fill_price} after costs is invalid or non-positive for order {order.id}"
-                )
-
-            # 6. Contractual limit protection
-            if order.order_type == OrderType.LIMIT:
-                assert order.limit_price is not None
-                limit_px = Decimal(str(order.limit_price))
-                if order.side == OrderSide.BUY and fill_price > limit_px:
-                    continue
-                if order.side == OrderSide.SELL and fill_price < limit_px:
+            for snap in eligible_orders:
+                order = snap.order
+                if order.id in suppressed_order_ids:
                     continue
 
-            # 7. Fallible candidate preparation & validation (BEFORE state commit)
-            count = self._event_fill_counts.get(market_event_id, 0) + 1
-            fill_id = f"fill-{market_event_id}-{order.id}-{count}"
-
-            # Calculate tentative commission (read-only, does not commit state)
-            fee, fee_currency = self._commission_model.calculate_commission(
-                order=order,
-                fill_price=fill_price,
-                fill_quantity=cand_qty,
-                spec=spec,
-            )
-            if not fee.is_finite() or fee < Decimal(0):
-                raise InvalidModelConfigurationError(
-                    f"Commission fee {fee} must be finite and non-negative"
+                match_result = self._evaluate_bar_execution(
+                    order=order,
+                    open_dec=open_dec,
+                    high_dec=high_dec,
+                    low_dec=low_dec,
+                    close_dec=close_dec,
+                    half_spread=half_spread,
+                    bar_start=bar_start,
+                    bar_end=bar_end,
                 )
-            if fee > Decimal(0) and (fee_currency is None or not fee_currency.strip()):
-                raise InvalidModelConfigurationError(
-                    f"Non-zero commission ({fee}) requires an explicit non-empty currency"
+                if match_result is None:
+                    continue
+
+                base_price, exec_time, liq_side, is_open_gap = match_result
+
+                # Check available bar volume participation liquidity (taking into account already staged fills)
+                avail_vol, vol_diagnostics = self._liquidity_model.get_available_bar_liquidity(
+                    bar=bar,
+                    market_event_id=market_event_id,
                 )
+                already_staged = staged_consumed_bar[(market_event_id, symbol)]
+                effective_avail = max(Decimal(0), avail_vol - already_staged)
+                if not effective_avail.is_finite() or effective_avail <= Decimal(0):
+                    continue
 
-            diagnostics = list(vol_diagnostics)
-            if is_open_gap:
-                diagnostics.append("Opening price gap execution applied")
+                cand_qty = min(snap.leaves_quantity, effective_avail)
 
-            record = FillRecord(
-                fill_id=fill_id,
-                order_id=order.id,
-                symbol=symbol,
-                side=order.side,
-                fill_price=fill_price,
-                fill_quantity=cand_qty,
-                fee=fee,
-                commission_currency=fee_currency,
-                slippage=slippage,
-                timestamp=exec_time,
-            )
+                # Volume step alignment
+                if spec is not None and spec.volume_step > 0:
+                    step = Decimal(str(spec.volume_step))
+                    steps = (cand_qty / step).to_integral_value()
+                    cand_qty = steps * step
 
-            candidate = FillCandidate(
-                fill_record=record,
-                order_snapshot=order,
-                is_complete=(cand_qty == snap.leaves_quantity),
-                liquidity_side=liq_side,
-                provenance=ExecutionProvenance.SYNTHETIC_BAR,
-                market_event_id=market_event_id,
-                diagnostics=tuple(diagnostics),
-            )
+                if not cand_qty.is_finite() or cand_qty <= Decimal(0):
+                    continue
 
-            # 8. COMMIT STATE: Only after candidate is completely constructed and validated!
-            self._liquidity_model.consume_bar_liquidity(
-                market_event_id=market_event_id,
-                symbol=symbol,
-                quantity=cand_qty,
-            )
-            if hasattr(self._commission_model, "commit_commission"):
-                self._commission_model.commit_commission(
+                # 5. Slippage calculation
+                slippage = self._slippage_model.calculate_slippage(
+                    order=order,
+                    base_price=base_price,
+                    fill_quantity=cand_qty,
+                    market_data=bar,
+                    spec=spec,
+                )
+                if not slippage.is_finite() or slippage < Decimal(0):
+                    raise InvalidModelConfigurationError(
+                        f"Calculated slippage must be finite and non-negative, got {slippage}"
+                    )
+
+                if order.side == OrderSide.BUY:
+                    raw_fill_price = base_price + slippage
+                    fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.BUY)
+                else:
+                    raw_fill_price = base_price - slippage
+                    fill_price = round_to_tick(raw_fill_price, tick_size, OrderSide.SELL)
+
+                if not fill_price.is_finite() or fill_price <= Decimal(0):
+                    raise FillEngineError(
+                        f"Execution price {fill_price} after costs is invalid or non-positive for order {order.id}"
+                    )
+
+                # 6. Contractual limit protection
+                if order.order_type == OrderType.LIMIT:
+                    assert order.limit_price is not None
+                    limit_px = Decimal(str(order.limit_price))
+                    if order.side == OrderSide.BUY and fill_price > limit_px:
+                        continue
+                    if order.side == OrderSide.SELL and fill_price < limit_px:
+                        continue
+
+                # 7. Fallible candidate preparation & validation
+                curr_fill_count += 1
+                fill_id = f"fill-{market_event_id}-{order.id}-{curr_fill_count}"
+
+                staged_raw = staged_order_cumulative_raw.get(order.id)
+                staged_charged = staged_order_cumulative_charged.get(order.id)
+                staged_is_charged = (order.id in staged_charged_orders) or None
+
+                fee, fee_currency = self._commission_model.calculate_commission(
                     order=order,
                     fill_price=fill_price,
                     fill_quantity=cand_qty,
                     spec=spec,
                     fill_id=fill_id,
+                    staged_prev_raw=staged_raw,
+                    staged_prev_charged=staged_charged,
+                    staged_charged=staged_is_charged,
                 )
-            self._event_fill_counts[market_event_id] = count
-            fills.append(candidate)
+                if not fee.is_finite() or fee < Decimal(0):
+                    raise InvalidModelConfigurationError(
+                        f"Commission fee {fee} must be finite and non-negative"
+                    )
+                if fee > Decimal(0) and (fee_currency is None or not fee_currency.strip()):
+                    raise InvalidModelConfigurationError(
+                        f"Non-zero commission ({fee}) requires an explicit non-empty currency"
+                    )
 
-        self._event_id_to_fingerprint[market_event_id] = fp
-        self._fingerprint_to_event_id[fp] = market_event_id
-        self._processed_events[market_event_id] = fills
-        return list(fills)
+                diagnostics = list(vol_diagnostics)
+                if is_open_gap:
+                    diagnostics.append("Opening price gap execution applied")
+
+                record = FillRecord(
+                    fill_id=fill_id,
+                    order_id=order.id,
+                    symbol=symbol,
+                    side=order.side,
+                    fill_price=fill_price,
+                    fill_quantity=cand_qty,
+                    fee=fee,
+                    commission_currency=fee_currency,
+                    slippage=slippage,
+                    timestamp=exec_time,
+                )
+
+                candidate = FillCandidate(
+                    fill_record=record,
+                    order_snapshot=order,
+                    is_complete=(cand_qty == snap.leaves_quantity),
+                    liquidity_side=liq_side,
+                    provenance=ExecutionProvenance.SYNTHETIC_BAR,
+                    market_event_id=market_event_id,
+                    diagnostics=tuple(diagnostics),
+                )
+
+                # Track staged liquidity & commission state
+                staged_consumed_bar[(market_event_id, symbol)] += cand_qty
+                if hasattr(self._commission_model, "_calc_incremental"):
+                    if hasattr(self._commission_model, "_per_share_rate"):
+                        _, _, nr, nc = self._commission_model._calc_incremental(
+                            order.id, cand_qty, staged_raw, staged_charged
+                        )
+                        staged_order_cumulative_raw[order.id] = nr
+                        staged_order_cumulative_charged[order.id] = nc
+                    elif hasattr(self._commission_model, "_percentage_rate"):
+                        _, _, nr, nc = self._commission_model._calc_incremental(
+                            order.id, fill_price, cand_qty, spec, staged_raw, staged_charged
+                        )
+                        staged_order_cumulative_raw[order.id] = nr
+                        staged_order_cumulative_charged[order.id] = nc
+                if fee > Decimal(0):
+                    staged_charged_orders.add(order.id)
+
+                staged_items.append((record, candidate, cand_qty, symbol))
+
+            # Phase 2: State Commit (only reached if all candidate creation and validation succeeded)
+            committed_fills: list[FillCandidate] = []
+            for record, candidate, cand_qty, sym in staged_items:
+                self._liquidity_model.consume_bar_liquidity(
+                    market_event_id=market_event_id,
+                    symbol=sym,
+                    quantity=cand_qty,
+                )
+                committed_fee, committed_curr = self._commission_model.commit_commission(
+                    order=candidate.order_snapshot,
+                    fill_price=record.fill_price,
+                    fill_quantity=cand_qty,
+                    spec=spec,
+                    fill_id=record.fill_id,
+                )
+                if committed_fee != record.fee or committed_curr != record.commission_currency:
+                    record = dataclasses.replace(
+                        record, fee=committed_fee, commission_currency=committed_curr
+                    )
+                    candidate = dataclasses.replace(candidate, fill_record=record)
+
+                committed_fills.append(candidate)
+
+            self._event_fill_counts[market_event_id] = curr_fill_count
+            self._event_id_to_fingerprint[market_event_id] = fp
+            self._fingerprint_to_event_id[fp] = market_event_id
+            self._processed_events[market_event_id] = committed_fills
+            return list(committed_fills)
+
+        except Exception:
+            self._restore_state(engine_snap)
+            self._liquidity_model.restore(liq_snap)
+            self._commission_model.restore(comm_snap)
+            raise
 
     @staticmethod
     def _check_bar_trigger(

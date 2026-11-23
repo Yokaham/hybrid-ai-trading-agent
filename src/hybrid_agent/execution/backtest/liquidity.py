@@ -10,6 +10,7 @@ Provides:
 import math
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 
 from hybrid_agent.core.constants import OrderSide
 from hybrid_agent.core.models import Bar, Quote, Tick, VolumeType
@@ -150,10 +151,10 @@ class DefaultLiquidityModel(LiquidityModel):
                         f"Missing quote displayed size for {symbol}: applied default size {self._default_quote_size}"
                     )
                 else:  # UNLIMITED_WITH_DIAGNOSTIC
+                    total_depth = UNBOUNDED_LIQUIDITY_CEILING
                     diagnostics.append(
-                        f"Missing quote displayed size for {symbol}: assumed unbounded liquidity"
+                        f"Missing quote displayed size for {symbol}: assumed unbounded liquidity (diagnostic applied)"
                     )
-                    return Decimal("Infinity"), tuple(diagnostics)
             else:
                 total_depth = Decimal(str(depth_val))
 
@@ -171,10 +172,10 @@ class DefaultLiquidityModel(LiquidityModel):
                         f"Unverified Tick volume for {symbol}: applied default quote size {self._default_quote_size}"
                     )
                 else:  # UNLIMITED_WITH_DIAGNOSTIC
+                    total_depth = UNBOUNDED_LIQUIDITY_CEILING
                     diagnostics.append(
                         f"Unverified Tick volume for {symbol}: assumed unbounded liquidity (diagnostic applied)"
                     )
-                    return UNBOUNDED_LIQUIDITY_CEILING, tuple(diagnostics)
             else:
                 depth_val = quote.ask_volume if side == OrderSide.BUY else quote.bid_volume
                 total_depth = (
@@ -250,6 +251,19 @@ class DefaultLiquidityModel(LiquidityModel):
             return
         key = (market_event_id, symbol.upper())
         self._consumed_bar_liquidity[key] = self._consumed_bar_liquidity.get(key, Decimal(0)) + qty
+
+    def snapshot(
+        self,
+    ) -> tuple[dict[tuple[str, str, OrderSide], Decimal], dict[tuple[str, str], Decimal]]:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        return (dict(self._consumed_quote_liquidity), dict(self._consumed_bar_liquidity))
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
+        if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+            raise TypeError("Invalid liquidity model snapshot format")
+        self._consumed_quote_liquidity = dict(snapshot[0])
+        self._consumed_bar_liquidity = dict(snapshot[1])
 
     def reset(self) -> None:
         """Resets all consumed quote and bar liquidity state for a new simulation."""

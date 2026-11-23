@@ -465,16 +465,22 @@ Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular ex
 
 #### 1.1 Market-Event Identity and Cache Safety Contract
 - **One ID per Observation**: A `market_event_id` must uniquely identify one specific market observation.
-- **Observation Fingerprinting**: Observations are fingerprinted across instrument, event type (`Quote`, `Tick`, `Bar`), UTC timestamp, prices, and volumes/sizes, incorporating provider sequence and ingestion metadata where exposed by data models.
+- **Ingestion-Time Independent Fingerprinting**: Observations are fingerprinted strictly across canonical market observation fields: instrument symbol, event type (`Quote`, `Tick`, `Bar`), market UTC timestamp, prices, and volumes/sizes.
+  - **Exclusion of Ingestion Artifacts**: Ingestion timestamps (`retrieved_at`) and arbitrary provenance metadata are explicitly excluded from the fingerprint, ensuring that identical market observations re-ingested at different times produce identical fingerprints.
+  - **Provider Sequence Handling**: `DataProvenance.metadata` is inspected for stable provider sequence identifiers (`sequence_id`, `sequence_number`, `sequence`, `seq`, `provider_event_id`, `event_id`, `message_id`, `msg_seq_num`). If present, `(key, value)` is incorporated into identity. In their absence, a canonical fallback `(source_name, source_type, is_synthetic)` is used.
+  - **Documented Retransmission Limitation**: If an external provider emits multiple distinct market observations with identical timestamps, identical prices, identical sizes, and no provider sequence ID, they cannot be distinguished from identical retransmissions without inventing synthetic identifiers.
 - **Identity Conflict Detection**:
   - Reusing an existing `market_event_id` with a different observation payload raises `DuplicateMarketEventError`.
   - Replaying the same logical observation under multiple or renamed event IDs raises `DuplicateMarketEventError`, strictly preventing accidental liquidity re-use.
-  - Successive legitimate market updates are distinguished by their differing timestamps, ticks, or provider sequence IDs.
+  - Successive legitimate market updates are distinguished by their differing timestamps, prices/sizes, or provider sequence IDs.
   - Reprocessing the exact same observation under the same ID is idempotent: it returns previously cached fills without creating additional fills or re-consuming liquidity.
 
-#### 1.2 Transactional Candidate Creation Contract
-- **Order of Operations**: All fallible price calculations, finite numeric checks, limit checks, tentative commission calculations, and `FillRecord` / `FillCandidate` constructions occur strictly BEFORE any state mutation.
-- **Zero Partial Mutation**: If candidate validation or construction fails at any point, liquidity consumption is not committed, commission state is not altered, and fill counts remain unchanged.
+#### 1.2 Two-Phase Transactional Matching & Engine Rollback Contract
+- **Atomic Operations**: `match_quote()` and `match_bar()` are fully atomic transactional operations.
+- **Phase 1 (Staging)**: All candidate calculations, price derivations, finite numeric checks, limit checks, tentative commission calculations, and `FillRecord` / `FillCandidate` constructions occur in a staging phase against local state (`staged_consumed_quote` / `staged_consumed_bar`).
+- **Phase 2 (Commit)**: State commit only proceeds once all candidate records across all matching orders in the call are fully constructed and verified.
+- **Complete Rollback on Failure**: If any error occurs in Phase 1 or Phase 2 (including candidate validation, commission commit, or liquidity commit), all state across `FillEngine`, `LiquidityModel`, and `CommissionModel` is rolled back completely to pre-call snapshot ($S_0$) via `restore()`.
+- **Model Contract**: Injected liquidity and commission models must implement the `snapshot() -> Any` and `restore(snapshot: Any) -> None` protocol contract.
 
 #### 2. Quote vs. Bar Execution Semantics
 - **L1 Quote / Tick Execution**:
@@ -511,13 +517,17 @@ Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular ex
 - **`PercentageCommissionModel`**: Fee as a percentage of gross notional ($F = Q \times P \times \text{pct}$).
 - **`FixedPerOrderCommissionModel`**: Flat fee assessed on the initial fill of an order; subsequent partial fills incur $0.0$ fee.
 - **Mandatory Currency Invariant**: Any positive commission fee ($> 0.0$) must specify a non-empty `commission_currency`, matching the portfolio accounting requirements of Milestone 3B.3.
+- **Fill-ID Consistency & Conflict Safety**: `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across all commission models. Replay of an identical fill ID with matching details is idempotent. Reusing an existing `fill_id` with conflicting order ID, price, quantity, or fee raises explicit `CommissionConflictError(ValueError)`. Distinct fills with different IDs are never deduplicated.
+- **Transactional Snapshot/Restore**: All commission models implement `snapshot()` and `restore()` to participate in atomic transaction rollbacks.
 
 #### 6. Liquidity Consumption & Volume Participation
 - **`DefaultLiquidityModel`**:
   - Quote Depth: Tracks available top-of-book size (`bid_size`, `ask_size`) per market event ID. Multiple competing orders consume depth deterministically in FIFO arrival order. Once depth is exhausted, subsequent orders receive partial fills or zero fills according to policy.
+  - Finite Unbounded Liquidity: Under `UNLIMITED_WITH_DIAGNOSTIC` policy, available liquidity uses a finite ceiling (`UNBOUNDED_LIQUIDITY_CEILING = Decimal(1_000_000_000)`), eliminating all non-finite `Decimal("Infinity")` representations.
   - Bar Participation: Caps aggregate fill volume across all orders to `max_volume_participation * bar.volume`.
   - Distinguishes displayed top-of-book depth (`Quote.bid_size`) from trade/tick activity volume (`Tick.bid_volume`), rejecting ambiguous tick volumes unless explicitly enabled.
 - **Policies**: Configurable `MissingQuoteLiquidityPolicy` and `MissingBarVolumePolicy` governing whether missing liquidity fails closed, produces diagnostics, or permits full fills.
+- **Transactional Snapshot/Restore**: `DefaultLiquidityModel` implements `snapshot()` and `restore()` to participate in atomic transaction rollbacks.
 
 #### 7. Limit Price Protection Invariant
 - **Post-Cost Guarantee**: All spread, slippage, and tick rounding adjustments are evaluated prior to fill validation.

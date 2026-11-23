@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from hybrid_agent.core.constants import OrderSide
 from hybrid_agent.core.models import (
@@ -260,6 +260,10 @@ class SlippageModel(Protocol):
         ...
 
 
+class CommissionConflictError(ValueError):
+    """Raised when an already committed fill_id is reused with conflicting order or fill details."""
+
+
 @runtime_checkable
 class CommissionModel(Protocol):
     """Protocol for execution fee and commission calculation."""
@@ -270,6 +274,8 @@ class CommissionModel(Protocol):
         fill_price: Decimal,
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
+        fill_id: str | None = None,
+        **kwargs: Any,
     ) -> tuple[Decimal, str | None]:
         """Calculates tentative execution commission and explicit currency without committing state.
 
@@ -291,6 +297,14 @@ class CommissionModel(Protocol):
 
         Idempotent across identical fill_id.
         """
+        ...
+
+    def snapshot(self) -> Any:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        ...
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
         ...
 
     def reset(self) -> None:
@@ -336,6 +350,14 @@ class LiquidityModel(Protocol):
         quantity: Decimal,
     ) -> None:
         """Consumes a portion of available bar participation volume for a market event."""
+        ...
+
+    def snapshot(self) -> Any:
+        """Returns an opaque snapshot of internal state for transactional rollback."""
+        ...
+
+    def restore(self, snapshot: Any) -> None:
+        """Restores internal state from a previously captured snapshot."""
         ...
 
     def reset(self) -> None:
