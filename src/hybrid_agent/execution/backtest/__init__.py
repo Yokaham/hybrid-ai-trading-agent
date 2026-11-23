@@ -12,6 +12,12 @@ from hybrid_agent.execution.backtest.bracket import (
     InvalidBracketStateError,
 )
 from hybrid_agent.execution.backtest.clock import SimulationClock
+from hybrid_agent.execution.backtest.commission import (
+    FixedPerOrderCommissionModel,
+    PercentageCommissionModel,
+    PerShareCommissionModel,
+    ZeroCommissionModel,
+)
 from hybrid_agent.execution.backtest.event_queue import (
     MAX_SEQUENCE_ID,
     EventQueue,
@@ -35,6 +41,26 @@ from hybrid_agent.execution.backtest.exceptions import (
     InvalidEventPriorityError,
     RetroactiveEventError,
     SequenceIdOverflowError,
+)
+from hybrid_agent.execution.backtest.execution_models import (
+    CommissionModel,
+    DuplicateMarketEventError,
+    ExecutionProvenance,
+    FillCandidate,
+    FillEngineError,
+    InvalidModelConfigurationError,
+    LiquidityExhaustedError,
+    LiquidityModel,
+    LiquiditySide,
+    SlippageModel,
+    SpreadModel,
+    UnsupportedOrderTypeError,
+)
+from hybrid_agent.execution.backtest.fill_engine import FillEngine
+from hybrid_agent.execution.backtest.liquidity import (
+    DefaultLiquidityModel,
+    MissingBarVolumePolicy,
+    MissingQuoteLiquidityPolicy,
 )
 from hybrid_agent.execution.backtest.order_manager import (
     DuplicateFillError,
@@ -66,6 +92,16 @@ from hybrid_agent.execution.backtest.portfolio import (
     StaleFXRateError,
     TimestampedCurrencyConverter,
 )
+from hybrid_agent.execution.backtest.slippage import (
+    FixedSlippageModel,
+    VolumeShareSlippageModel,
+    ZeroSlippageModel,
+    round_to_tick,
+)
+from hybrid_agent.execution.backtest.spread import (
+    RealQuoteSpreadModel,
+    SyntheticBarSpreadModel,
+)
 from hybrid_agent.execution.backtest.state import (
     ExecutionStatus,
     FillRecord,
@@ -88,27 +124,42 @@ __all__ = [
     "BracketStatus",
     "CashBook",
     "ClockNotInitializedError",
+    "CommissionModel",
     "ConversionResult",
+    "DefaultLiquidityModel",
     "DuplicateBracketError",
     "DuplicateFXObservationError",
     "DuplicateFillError",
+    "DuplicateMarketEventError",
     "DuplicateOrderError",
     "EmptyQueueError",
     "EventPriority",
     "EventQueue",
+    "ExecutionProvenance",
     "ExecutionStatus",
     "FXRateObservation",
+    "FillCandidate",
+    "FillEngine",
+    "FillEngineError",
     "FillRecord",
+    "FixedPerOrderCommissionModel",
+    "FixedSlippageModel",
     "InstrumentAccountingIdentity",
     "InsufficientFundsError",
     "InvalidBracketStateError",
     "InvalidEventPriorityError",
+    "InvalidModelConfigurationError",
     "InvalidOrderStateError",
     "LedgerEntry",
     "LedgerEntryType",
+    "LiquidityExhaustedError",
+    "LiquidityModel",
+    "LiquiditySide",
     "MarketBarClosedEvent",
     "MarketBarOpenedEvent",
+    "MissingBarVolumePolicy",
     "MissingFXRateError",
+    "MissingQuoteLiquidityPolicy",
     "OrderCancelledEvent",
     "OrderExecutionSnapshot",
     "OrderExecutionState",
@@ -120,6 +171,8 @@ __all__ = [
     "OrderSnapshot",
     "OrderSubmittedEvent",
     "OversellingError",
+    "PerShareCommissionModel",
+    "PercentageCommissionModel",
     "Portfolio",
     "PortfolioMarkedEvent",
     "PositionAccountingModel",
@@ -128,10 +181,19 @@ __all__ = [
     "PositionTracker",
     "PositionUpdatedEvent",
     "PrioritizedEvent",
+    "RealQuoteSpreadModel",
     "RetroactiveEventError",
     "SequenceIdOverflowError",
     "SimulationClock",
+    "SlippageModel",
+    "SpreadModel",
     "StaleFXRateError",
+    "SyntheticBarSpreadModel",
     "TemporalOrderViolationError",
     "TimestampedCurrencyConverter",
+    "UnsupportedOrderTypeError",
+    "VolumeShareSlippageModel",
+    "ZeroCommissionModel",
+    "ZeroSlippageModel",
+    "round_to_tick",
 ]

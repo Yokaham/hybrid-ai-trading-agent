@@ -448,6 +448,74 @@ Milestone 3B.4.3 implements deterministic OCO (One-Cancels-the-Other) bracket an
 - **Intraday Holding**: CFD positions opened and closed within the same trading session incur **zero** financing charges.
 - **Overnight Financing Model**: For positions held past the daily rollover cutoff (e.g. 22:00 UTC):
   $$\text{Daily Financing Charge} = \text{Notional} \times \frac{R_{\text{benchmark}} \pm \text{Spread}_{\text{financing}}}{360} \times \text{DaysHeld}$$
+
+### 6.6 Native FillEngine and Execution Cost Models (Milestone 3B.4.4)
+
+Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular execution cost models for microstructure simulation:
+
+#### 1. FillEngine Architecture & Public API
+- **Pure Matching Engine**: `FillEngine` is an execution transition function evaluating active order snapshots against incoming market events (`Quote`, `Tick`, `Bar`).
+- **Core Interfaces**:
+  - `match_quote(quote, active_orders, market_event_id)`: Evaluates active orders against top-of-book L1 quotes.
+  - `match_bar(bar, active_orders, market_event_id)`: Evaluates active orders against completed or opening OHLCV bars.
+  - `register_instrument(symbol, spec)`: Registers instrument specifications (tick size, lot size, currencies) for price rounding and lot alignment.
+  - `reset()`: Resets all transient simulation state (liquidity trackers, per-order fee trackers, duplicate event caches) to start a clean backtest.
+- **Strict Decoupling**: Maintains zero cash balances and zero position inventory. Emits canonical `FillCandidate` objects convertible to `OrderFilledEvent` / `OrderPartiallyFilledEvent` for `Portfolio.apply_fill()` and `FillRecord` for `OrderManager.record_fill()`.
+
+#### 2. Quote vs. Bar Execution Semantics
+- **L1 Quote / Tick Execution**:
+  - Taker BUY orders match at `Ask`; Taker SELL orders match at `Bid`.
+  - Marketable limit orders execute immediately if `LimitPrice >= Ask` (BUY) or `LimitPrice <= Bid` (SELL).
+  - Resting limit orders execute on subsequent quotes crossing their limit price.
+  - Stop orders trigger when `Ask >= TriggerPrice` (BUY) or `Bid <= TriggerPrice` (SELL).
+- **OHLCV Bar Execution**:
+  - Market orders submitted prior to bar start execute at the bar `Open` price (adjusted by half-spread and adverse slippage).
+  - Limit orders execute if the bar's synthetic price range crosses the limit. If `Open` gaps favorably through the limit price, the order receives opening price improvement ($\min(P_{\text{limit}}, P_{\text{open}})$ for BUY; $\max(P_{\text{limit}}, P_{\text{open}})$ for SELL).
+  - Stop orders trigger if the bar's price extremes reach the trigger price. If `Open` gaps adversely past the trigger price, the order executes at `Open` (plus adverse spread and slippage), accurately simulating gap risk.
+  - Causality Enforcement: Orders submitted at or after `bar.start_time` are rejected with `TemporalOrderViolationError` from executing on that bar.
+
+#### 3. Spread Treatment & Double-Spread Prevention
+- **`RealQuoteSpreadModel`**: Returns zero additive spread because L1 quotes inherently reflect the market spread ($P_{\text{ask}} - P_{\text{bid}}$). Prevents double-charging the trader.
+- **`SyntheticBarSpreadModel`**: Computes synthetic half-spreads around bar prices using either fixed currency spread or percentage spread (clamped to at least 1 instrument tick size).
+
+#### 4. Slippage Models & Conservative Tick Rounding
+- **`ZeroSlippageModel`**: Deterministic zero-slippage execution.
+- **`FixedSlippageModel`**: Constant adverse price offset per order.
+- **`VolumeShareSlippageModel`** (QuantConnect LEAN volume-share adaptation):
+  $$\Delta P = P \times \text{price\_impact} \times \left(\frac{Q_{\text{fill}}}{V_{\text{bar}}}\right)^2$$
+  - Directional: Always adverse ($+ \Delta P$ for BUY, $- \Delta P$ for SELL).
+  - Strict Volume Validation: Requires `VolumeType.REAL_TRADED`. Non-traded volume (tick counts) is rejected with `InvalidModelConfigurationError`.
+- **Conservative Tick Rounding (`round_to_tick`)**:
+  - Fractional prices resulting from spread or slippage are rounded to the nearest instrument `tick_size` in the adverse direction: BUY rounds UP (ceiling), SELL rounds DOWN (floor).
+
+#### 5. Commission Models & Currency Invariants
+- **`ZeroCommissionModel`**: Free execution ($0.0$ fee).
+- **`PerShareCommissionModel`**: Fee per unit executed ($F = Q \times \text{rate}$), with optional `min_per_order` and `max_per_order`.
+- **`PercentageCommissionModel`**: Fee as a percentage of gross notional ($F = Q \times P \times \text{pct}$).
+- **`FixedPerOrderCommissionModel`**: Flat fee assessed on the initial fill of an order; subsequent partial fills incur $0.0$ fee.
+- **Mandatory Currency Invariant**: Any positive commission fee ($> 0.0$) must specify a non-empty `commission_currency`, matching the portfolio accounting requirements of Milestone 3B.3.
+
+#### 6. Liquidity Consumption & Volume Participation
+- **`DefaultLiquidityModel`**:
+  - Quote Depth: Tracks available top-of-book size (`bid_size`, `ask_size`) per market event ID. Multiple competing orders consume depth deterministically in FIFO arrival order. Once depth is exhausted, subsequent orders receive partial fills or zero fills according to policy.
+  - Bar Participation: Caps aggregate fill volume across all orders to `max_volume_participation * bar.volume`.
+  - Distinguishes displayed top-of-book depth (`Quote.bid_size`) from trade/tick activity volume (`Tick.bid_volume`), rejecting ambiguous tick volumes unless explicitly enabled.
+- **Policies**: Configurable `MissingQuoteLiquidityPolicy` and `MissingBarVolumePolicy` governing whether missing liquidity fails closed, produces diagnostics, or permits full fills.
+
+#### 7. Limit Price Protection Invariant
+- **Post-Cost Guarantee**: All spread, slippage, and tick rounding adjustments are evaluated prior to fill validation.
+- If the adjusted execution price breaches the limit ($P_{\text{exec}} > P_{\text{limit}}$ for BUY or $P_{\text{exec}} < P_{\text{limit}}$ for SELL), the candidate fill is strictly rejected. The order's unexecuted remainder stays pending.
+
+#### 8. Intrabar Ambiguity & Stop-Loss Priority
+- In OHLCV bars touching both Stop-Loss and Take-Profit price thresholds of a bracket, the engine adheres to a **conservative stop-loss-first policy**: Stop-Loss executes immediately, preventing optimistic backtest bias.
+
+#### 9. Deterministic Traceability & Known Limitations
+- **Fill IDs**: Generated deterministically (`fill-{order_id}-{seq}`) for bit-for-bit replay consistency.
+- **Simulation Timestamps**: Fills inherit the timestamp of the triggering market event.
+- **Known Limitations**:
+  - Top-of-book L1 quotes provide price and size, but not full order book depth (L2/L3).
+  - Exchange queue position is not simulated on L1 feeds; orders are filled in deterministic submission order.
+  - Synthetic bar execution cannot observe intra-bar tick sequences; high-volatility bars rely on conservative assumptions.
   - Long CFDs pay: $\text{Notional} \times (R_{\text{benchmark}} + \text{Spread}) / 360$.
   - Short CFDs receive/pay: $\text{Notional} \times (R_{\text{benchmark}} - \text{Spread}) / 360$.
 - Financing charges are deducted directly from the cash balance in the instrument's profit currency and logged as explicit `FinancingTransaction` entries in `AccountingLedger`.
@@ -515,7 +583,7 @@ Milestone 3B.3 implements the core portfolio and accounting foundations:
    - Portfolio equity valuation converts foreign cash balances and position valuations using `TimestampedCurrencyConverter`.
    - Valuation translation produces zero journal transactions in `AccountingLedger`.
 4. **Explicit Boundaries & Deferred Components**:
-   - `FillEngine`, microstructure models (spread, slippage, liquidity), and order management (`OrderManager`) are deferred to **Milestone 3B.4**.
+   - `FillEngine`, microstructure models (spread, slippage, liquidity), and order management (`OrderManager`) are implemented in **Milestone 3B.4**.
    - Financing charge accrual models and `PortfolioRiskTracker` risk reservations are deferred to **Milestone 3B.5**.
 
 ---

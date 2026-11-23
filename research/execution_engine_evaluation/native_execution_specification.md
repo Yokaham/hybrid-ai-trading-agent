@@ -138,15 +138,16 @@ When an entry order receives a partial fill:
 
 ---
 
-## 4. FillEngine Specification
+## 4. FillEngine Specification (Implemented in Milestone 3B.4.4)
 
 ### 4.1 Responsibilities
-- Evaluates eligible orders against incoming market data (L1 quote ticks or OHLCV bars) at Priority 6 (`ORDER_MATCHING_FILL`).
+- Pure execution and matching transition function evaluating eligible order snapshots (`OrderExecutionSnapshot` or `OrderExecutionState`) against incoming market data (`Quote`, `Tick`, `Bar`) at Priority 6 (`ORDER_MATCHING_FILL`).
 - Matches orders based on explicit order type rules (Market, Limit, Stop-Loss).
-- Enforces displayed-size consumption on L1 quotes (no duplicate liquidity reuse within the same event).
-- Computes adverse slippage using non-linear volume share impact without double-charging the bid/ask spread.
-- Calculates commissions with mandatory explicit commission currency.
-- Generates `OrderFilledEvent` and `OrderPartiallyFilledEvent`.
+- Enforces displayed-size consumption on L1 quotes (no duplicate liquidity reuse within the same event; deterministic FIFO queue consumption across competing orders).
+- Computes adverse slippage using non-linear volume share impact without double-charging the bid/ask spread (`RealQuoteSpreadModel` produces zero additive spread on quotes).
+- Calculates commissions with mandatory explicit non-empty commission currency for all positive fees.
+- Applies conservative tick-size adverse rounding (BUY ceil, SELL floor) and strictly enforces limit price protection ($P_{\text{exec}} \le P_{\text{limit}}$ for BUY; $P_{\text{exec}} \ge P_{\text{limit}}$ for SELL) after all costs.
+- Generates canonical `FillCandidate` structures, cleanly adapting to `OrderFilledEvent` / `OrderPartiallyFilledEvent` for `Portfolio.apply_fill()` and `FillRecord` for `OrderManager.record_fill()`.
 
 ### 4.2 Matching Rules Matrix
 
@@ -154,15 +155,17 @@ When an entry order receives a partial fill:
 | :--- | :--- | :--- | :--- | :--- |
 | **Market BUY** | L1 Quote | Immediate upon arrival at $T \ge T_{\text{sub}}$ | $\text{Ask} + \text{Slippage}$ | TAKER |
 | **Market SELL** | L1 Quote | Immediate upon arrival at $T \ge T_{\text{sub}}$ | $\text{Bid} - \text{Slippage}$ | TAKER |
-| **Marketable Limit BUY** | L1 Quote | $\text{LimitPrice} \ge \text{Ask}$ | $\min(\text{LimitPrice}, \text{Ask})$ | TAKER |
-| **Resting Limit BUY** | L1 Quote | $\text{LimitPrice} \ge \text{Ask}$ (on later quote) | $\min(\text{LimitPrice}, \text{Ask})$ | MAKER |
-| **Resting Limit SELL** | L1 Quote | $\text{LimitPrice} \le \text{Bid}$ (on later quote) | $\max(\text{LimitPrice}, \text{Bid})$ | MAKER |
+| **Marketable Limit BUY** | L1 Quote | $\text{LimitPrice} \ge \text{Ask}$ | $\min(\text{LimitPrice}, \text{Ask} + \text{Slippage})$ | TAKER |
+| **Resting Limit BUY** | L1 Quote | $\text{LimitPrice} \ge \text{Ask}$ (on later quote) | $\min(\text{LimitPrice}, \text{Ask} + \text{Slippage})$ | MAKER |
+| **Resting Limit SELL** | L1 Quote | $\text{LimitPrice} \le \text{Bid}$ (on later quote) | $\max(\text{LimitPrice}, \text{Bid} - \text{Slippage})$ | MAKER |
 | **Stop-Loss BUY** | L1 Quote | $\text{Ask} \ge \text{TriggerPrice}$ | $\text{Ask} + \text{Slippage}$ | TAKER |
 | **Stop-Loss SELL** | L1 Quote | $\text{Bid} \le \text{TriggerPrice}$ | $\text{Bid} - \text{Slippage}$ | TAKER |
-| **Bar-Only Market BUY** | OHLCV Bar | Next eligible bar open ($T_{\text{start}}$) | $\text{Open} + \text{Slippage}$ | TAKER |
-| **Bar-Only Market SELL**| OHLCV Bar | Next eligible bar open ($T_{\text{start}}$) | $\text{Open} - \text{Slippage}$ | TAKER |
-| **Bar-Only Limit BUY** | OHLCV Bar | $\text{Low} \le \text{LimitPrice}$ | $\min(\text{LimitPrice}, \text{Open})$ | MAKER |
-| **Bar-Only Limit SELL**| OHLCV Bar | $\text{High} \ge \text{LimitPrice}$ | $\max(\text{LimitPrice}, \text{Open})$ | MAKER |
+| **Bar-Only Market BUY** | OHLCV Bar | Next eligible bar open ($T_{\text{start}} > T_{\text{sub}}$) | $\text{Open} + \text{HalfSpread} + \text{Slippage}$ | TAKER |
+| **Bar-Only Market SELL**| OHLCV Bar | Next eligible bar open ($T_{\text{start}} > T_{\text{sub}}$) | $\text{Open} - \text{HalfSpread} - \text{Slippage}$ | TAKER |
+| **Bar-Only Limit BUY** | OHLCV Bar | $\text{SyntheticLowAsk} \le \text{LimitPrice}$ | $\min(\text{LimitPrice}, \text{OpenAsk}) + \text{Slippage}$ | MAKER |
+| **Bar-Only Limit SELL**| OHLCV Bar | $\text{SyntheticHighBid} \ge \text{LimitPrice}$ | $\max(\text{LimitPrice}, \text{OpenBid}) - \text{Slippage}$ | MAKER |
+| **Bar-Only Stop BUY** | OHLCV Bar | $\text{SyntheticHighAsk} \ge \text{TriggerPrice}$ | $\max(\text{TriggerPrice}, \text{OpenAsk}) + \text{Slippage}$ | TAKER |
+| **Bar-Only Stop SELL** | OHLCV Bar | $\text{SyntheticLowBid} \le \text{TriggerPrice}$ | $\min(\text{TriggerPrice}, \text{OpenBid}) - \text{Slippage}$ | TAKER |
 
 ---
 
@@ -329,25 +332,37 @@ class FillEngine:
 
     def __init__(
         self,
+        spread_model: SpreadModel | None = None,
         slippage_model: SlippageModel | None = None,
         commission_model: CommissionModel | None = None,
-        max_volume_participation: float = 0.10,
+        liquidity_model: LiquidityModel | None = None,
+        instrument_specs: dict[str, InstrumentSpecification] | None = None,
     ) -> None: ...
+
+    def register_instrument(self, symbol: str, spec: InstrumentSpecification) -> None:
+        """Registers instrument specification for lot sizing, tick sizing, and currencies."""
+        ...
 
     def match_quote(
         self,
-        quote: QuoteTick,
-        active_orders: list[OrderExecutionState],
-    ) -> list[OrderFilledEvent | OrderPartiallyFilledEvent]:
+        quote: Quote | Tick,
+        active_orders: Sequence[OrderExecutionSnapshot | OrderExecutionState],
+        market_event_id: str | None = None,
+    ) -> list[FillCandidate]:
         """Matches active orders against top-of-book quote and consumes displayed size."""
         ...
 
     def match_bar(
         self,
         bar: Bar,
-        active_orders: list[OrderExecutionState],
-    ) -> list[OrderFilledEvent | OrderPartiallyFilledEvent]:
-        """Matches eligible orders against next available bar Open price."""
+        active_orders: Sequence[OrderExecutionSnapshot | OrderExecutionState],
+        market_event_id: str | None = None,
+    ) -> list[FillCandidate]:
+        """Matches eligible orders against bar Open, range extremes, or synthetic quote."""
+        ...
+
+    def reset(self) -> None:
+        """Resets all transient simulation state to start a clean backtest."""
         ...
 ```
 
