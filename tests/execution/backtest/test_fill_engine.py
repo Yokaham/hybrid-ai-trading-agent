@@ -34,9 +34,11 @@ from hybrid_agent.execution.backtest.events import (
     OrderSubmittedEvent,
 )
 from hybrid_agent.execution.backtest.execution_models import (
+    DuplicateMarketEventError,
     ExecutionProvenance,
     InvalidModelConfigurationError,
     LiquiditySide,
+    PortfolioFillApplication,
     UnsupportedOrderTypeError,
 )
 from hybrid_agent.execution.backtest.fill_engine import FillEngine
@@ -51,6 +53,7 @@ from hybrid_agent.execution.backtest.portfolio import (
     Portfolio,
     TimestampedCurrencyConverter,
 )
+from hybrid_agent.execution.backtest.portfolio.currency import FXRateObservation
 from hybrid_agent.execution.backtest.slippage import (
     FixedSlippageModel,
     VolumeShareSlippageModel,
@@ -747,6 +750,7 @@ class TestBarMatching:
         assert fills1[0].fill_record.timestamp == standard_bar.end_time
 
         # Limit at 147.50 -> Low + half_spread (148.01) never reaches 147.50
+        fill_engine.reset()
         snap2 = make_order_snapshot(
             order_id="bl-notrigger",
             side=OrderSide.BUY,
@@ -777,6 +781,7 @@ class TestBarMatching:
         assert fills1[0].fill_price == Decimal("151.50")
 
         # Limit at 153.00 -> High - half_spread (151.99) < 153.00 -> no fill
+        fill_engine.reset()
         snap2 = make_order_snapshot(
             order_id="sl-notrigger",
             side=OrderSide.SELL,
@@ -1138,6 +1143,7 @@ class TestExecutionCostModels:
         )
 
         fills_buy = engine.match_quote(quote, [snap_buy], market_event_id="m33-b")
+        engine.reset()
         fills_sell = engine.match_quote(quote, [snap_sell], market_event_id="m33-s")
 
         # BUY: Ask=150.10 + 0.05 = 150.15
@@ -1267,6 +1273,7 @@ class TestExecutionCostModels:
         assert f1[0].fill_record.commission_currency == "USD"
 
         # 1000 shares -> 1000 * 0.01 = 10.00 > max(5.00) -> 5.00
+        engine.reset()
         snap2 = make_order_snapshot(
             order_id="comm-max", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=1000.0
         )
@@ -1589,3 +1596,709 @@ class TestIntegrationBoundary:
         )
         with pytest.raises(UnsupportedOrderTypeError):
             fill_engine.match_quote(quote, [snap], market_event_id="q50")
+
+
+# ==============================================================================
+# Milestone 3B.4.4 Targeted Correction Pass Tests
+# ==============================================================================
+
+
+class TestFillEngineCorrectionPass:
+    """Comprehensive test suite for Milestone 3B.4.4 targeted corrections:
+
+    1. Market-event identity, cache safety, and duplicate payload detection.
+    2. Safe transactional candidate creation against partial state mutation.
+    3. Order-level min/max commission semantics across partial fills & cancellation.
+    4. Commission currency preservation in Portfolio integration path.
+    5. Finite numeric validation across cost and liquidity models.
+    6. Bar execution timestamp availability convention verification.
+    7. Missing-volume policies and visible diagnostic reporting.
+    """
+
+    # --------------------------------------------------------------------------
+    # 1. Market-Event Identity and Cache Safety
+    # --------------------------------------------------------------------------
+
+    def test_market_event_identity_same_id_same_payload_returns_cached_fills(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """1. Same ID and same payload returns previously matched fills without re-consuming liquidity."""
+        quote = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        snap = make_order_snapshot(
+            order_id="id-same-1", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=40.0
+        )
+        f1 = fill_engine.match_quote(quote, [snap], market_event_id="evt-idemp")
+        assert len(f1) == 1
+        assert f1[0].fill_quantity == Decimal(40)
+
+        # Reprocessing with the exact same ID and same payload
+        f2 = fill_engine.match_quote(quote, [snap], market_event_id="evt-idemp")
+        assert len(f2) == 1
+        assert f2[0].fill_id == f1[0].fill_id
+        assert f2[0].fill_quantity == Decimal(40)
+
+        # Confirm remaining liquidity was not depleted further
+        avail_depth, _ = fill_engine.liquidity_model.get_available_quote_liquidity(
+            quote, OrderSide.BUY, "evt-idemp"
+        )
+        assert avail_depth == Decimal(60)
+
+    def test_market_event_identity_same_id_different_payload_raises_conflict(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """2. Reusing an existing ID with different event data raises a clear DuplicateMarketEventError."""
+        q1 = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        q2 = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.20,  # Different bid/ask payload!
+            ask=150.30,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        snap = make_order_snapshot(
+            order_id="id-diff-pay", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=10.0
+        )
+        fill_engine.match_quote(q1, [snap], market_event_id="conflict-id")
+
+        with pytest.raises(
+            DuplicateMarketEventError,
+            match="was previously processed with different event data",
+        ):
+            fill_engine.match_quote(q2, [snap], market_event_id="conflict-id")
+
+    def test_market_event_identity_same_payload_different_ids_rejected(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """3. The same logical observation presented under different IDs raises DuplicateMarketEventError."""
+        quote = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        snap1 = make_order_snapshot(
+            order_id="o1-fp", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        snap2 = make_order_snapshot(
+            order_id="o2-fp", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        fill_engine.match_quote(quote, [snap1], market_event_id="id-first")
+
+        # Attempting to re-process the exact same quote under a different ID to bypass liquidity limits
+        with pytest.raises(
+            DuplicateMarketEventError,
+            match="has already been processed under event ID 'id-first'",
+        ):
+            fill_engine.match_quote(quote, [snap2], market_event_id="id-second")
+
+    def test_market_event_identity_two_distinct_observations_different_timestamps(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """4. Two distinct market observations with different timestamps process independently."""
+        q1 = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=50.0,
+            ask_size=50.0,
+        )
+        t2 = base_time + timedelta(seconds=1)
+        q2 = Quote(
+            symbol="AAPL",
+            timestamp=t2,
+            bid=150.05,
+            ask=150.15,
+            bid_size=50.0,
+            ask_size=50.0,
+        )
+        snap1 = make_order_snapshot(
+            order_id="o1-dist", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        snap2 = make_order_snapshot(
+            order_id="o2-dist",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=50.0,
+            submission_time=t2,
+        )
+        f1 = fill_engine.match_quote(q1, [snap1], market_event_id="q-t0")
+        f2 = fill_engine.match_quote(q2, [snap2], market_event_id="q-t1")
+
+        assert len(f1) == 1
+        assert len(f2) == 1
+        assert f1[0].fill_price == Decimal("150.10")
+        assert f2[0].fill_price == Decimal("150.15")
+
+    def test_market_event_identity_repeated_matching_against_already_consumed_event(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """5. Repeated matching against an already-consumed event does not produce additional fills."""
+        quote = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        snap1 = make_order_snapshot(
+            order_id="o1-consume", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=100.0
+        )
+        f1 = fill_engine.match_quote(quote, [snap1], market_event_id="consumed-evt")
+        assert len(f1) == 1
+        assert f1[0].fill_quantity == Decimal(100)
+
+        # A new order arrives, attempting to match against the same consumed event
+        snap2 = make_order_snapshot(
+            order_id="o2-consume", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=100.0
+        )
+        # Re-invoking with the same event ID returns the cached fills from the first call
+        cached_result = fill_engine.match_quote(quote, [snap2], market_event_id="consumed-evt")
+        assert len(cached_result) == 1
+        # The returned fill is strictly the previously cached fill for order 1
+        assert cached_result[0].order_id == "o1-consume"
+        # Order 2 was not filled and no duplicate liquidity was generated
+        assert all(c.order_id != "o2-consume" for c in cached_result)
+
+    # --------------------------------------------------------------------------
+    # 2. Transactional Candidate Creation & Partial State Safety
+    # --------------------------------------------------------------------------
+
+    def test_transactional_failure_does_not_mutate_liquidity_or_commission_state(
+        self, spec: InstrumentSpecification, base_time: datetime
+    ) -> None:
+        """Candidate creation failure leaves liquidity and commission state completely unmutated."""
+        commission_model = FixedPerOrderCommissionModel(fixed_fee="5.00", currency="USD")
+        engine = FillEngine(commission_model=commission_model, instrument_specs={"AAPL": spec})
+        quote = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+
+        # Create an order with an invalid non-finite limit price that triggers an error
+        snap_bad = OrderExecutionSnapshot(
+            order=OrderSnapshot(
+                id="bad-order-transact",
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                quantity=50.0,
+                limit_price=float("nan"),  # Non-finite limit price!
+                stop_loss_price=None,
+                take_profit_price=None,
+                status=OrderStatus.SUBMITTED,
+                created_at=base_time,
+                updated_at=base_time,
+            ),
+            submission_time=base_time,
+            original_quantity=Decimal(50),
+            filled_quantity=Decimal(0),
+            unfilled_quantity=Decimal(50),
+            leaves_quantity=Decimal(50),
+            cancelled_quantity=Decimal(0),
+            average_fill_price=Decimal(0),
+            cumulative_fees={},
+            status=ExecutionStatus.ACTIVE,
+            fills=(),
+            last_update_time=base_time,
+        )
+
+        with pytest.raises(ValueError, match="is missing valid limit_price"):
+            engine.match_quote(quote, [snap_bad], market_event_id="tx-fail-evt")
+
+        # Verify that liquidity was NOT consumed
+        avail_depth, _ = engine.liquidity_model.get_available_quote_liquidity(
+            quote, OrderSide.BUY, "tx-fail-evt"
+        )
+        assert avail_depth == Decimal(100)
+
+        # Verify that commission state was NOT committed
+        assert "bad-order-transact" not in commission_model._charged_orders
+
+    # --------------------------------------------------------------------------
+    # 3. Commission State and Partial-Fill Semantics
+    # --------------------------------------------------------------------------
+
+    def test_fixed_per_order_commission_preparation_does_not_mark_order_charged(
+        self, base_time: datetime
+    ) -> None:
+        """Calling calculate_commission on FixedPerOrderCommissionModel does not commit charged state."""
+        model = FixedPerOrderCommissionModel(fixed_fee="4.95", currency="USD")
+        snap = make_order_snapshot(
+            order_id="fixed-prep", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=100.0
+        )
+        # Tentative calculation:
+        fee1, curr1 = model.calculate_commission(snap.order, Decimal("150.00"), Decimal(50))
+        assert fee1 == Decimal("4.95")
+        assert curr1 == "USD"
+        # Crucial invariant: order must not be marked charged merely because calculation was attempted!
+        assert "fixed-prep" not in model._charged_orders
+
+        # A second calculation attempt still produces the full fee
+        fee2, curr2 = model.calculate_commission(snap.order, Decimal("150.00"), Decimal(50))
+        assert fee2 == Decimal("4.95")
+        assert curr2 == "USD"
+
+        # Explicit commit marks the order charged
+        committed_fee, _ = model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(50), fill_id="f1"
+        )
+        assert committed_fee == Decimal("4.95")
+        assert "fixed-prep" in model._charged_orders
+
+        # Subsequent calculation now returns zero
+        fee3, curr3 = model.calculate_commission(snap.order, Decimal("150.00"), Decimal(50))
+        assert fee3 == Decimal(0)
+        assert curr3 is None
+
+    def test_pershare_order_level_min_and_max_across_multiple_partial_fills(
+        self, spec: InstrumentSpecification, base_time: datetime
+    ) -> None:
+        """min_per_order is assessed on the first fill and incremental fills respect max_per_order."""
+        # Rate: 0.01 per share. Min: 1.00 USD. Max: 4.00 USD. Total order: 600 shares.
+        model = PerShareCommissionModel(
+            per_share_rate="0.01",
+            currency="USD",
+            min_per_order="1.00",
+            max_per_order="4.00",
+        )
+        engine = FillEngine(commission_model=model, instrument_specs={"AAPL": spec})
+        order_id = "multi-partial-comm"
+
+        # Partial Fill 1: 30 shares (raw fee: 0.30 < min 1.00 -> charged 1.00)
+        snap1 = make_order_snapshot(
+            order_id=order_id,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=600.0,
+            leaves_quantity=600.0,
+        )
+        q1 = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.0,
+            ask=150.1,
+            bid_size=100.0,
+            ask_size=30.0,
+        )
+        f1 = engine.match_quote(q1, [snap1], market_event_id="pf-1")
+        assert f1[0].fill_record.fee == Decimal("1.00")
+        assert f1[0].fill_record.commission_currency == "USD"
+
+        # Partial Fill 2: 50 shares (cumulative raw: 80 * 0.01 = 0.80 < min 1.00 -> incremental fee: 0.00)
+        t2 = base_time + timedelta(seconds=1)
+        snap2 = make_order_snapshot(
+            order_id=order_id,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=600.0,
+            leaves_quantity=570.0,
+        )
+        q2 = Quote(
+            symbol="AAPL",
+            timestamp=t2,
+            bid=150.0,
+            ask=150.1,
+            bid_size=100.0,
+            ask_size=50.0,
+        )
+        f2 = engine.match_quote(q2, [snap2], market_event_id="pf-2")
+        assert f2[0].fill_record.fee == Decimal(0)
+        assert f2[0].fill_record.commission_currency is None
+
+        # Partial Fill 3: 120 shares (cumulative raw: 200 * 0.01 = 2.00 > min 1.00 -> incremental fee: 2.00 - 1.00 = 1.00)
+        t3 = base_time + timedelta(seconds=2)
+        snap3 = make_order_snapshot(
+            order_id=order_id,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=600.0,
+            leaves_quantity=520.0,
+        )
+        q3 = Quote(
+            symbol="AAPL",
+            timestamp=t3,
+            bid=150.0,
+            ask=150.1,
+            bid_size=100.0,
+            ask_size=120.0,
+        )
+        f3 = engine.match_quote(q3, [snap3], market_event_id="pf-3")
+        assert f3[0].fill_record.fee == Decimal("1.00")
+        assert f3[0].fill_record.commission_currency == "USD"
+
+        # Partial Fill 4: 250 shares (cumulative raw: 450 * 0.01 = 4.50 > max 4.00 -> target 4.00. Incremental: 4.00 - 2.00 = 2.00)
+        t4 = base_time + timedelta(seconds=3)
+        snap4 = make_order_snapshot(
+            order_id=order_id,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=600.0,
+            leaves_quantity=400.0,
+        )
+        q4 = Quote(
+            symbol="AAPL",
+            timestamp=t4,
+            bid=150.0,
+            ask=150.1,
+            bid_size=100.0,
+            ask_size=250.0,
+        )
+        f4 = engine.match_quote(q4, [snap4], market_event_id="pf-4")
+        assert f4[0].fill_record.fee == Decimal("2.00")
+        assert f4[0].fill_record.commission_currency == "USD"
+
+        # Partial Fill 5: 150 shares (cumulative raw: 600 * 0.01 = 6.00 > max 4.00 -> incremental fee: 0.00)
+        t5 = base_time + timedelta(seconds=4)
+        snap5 = make_order_snapshot(
+            order_id=order_id,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=600.0,
+            leaves_quantity=150.0,
+        )
+        q5 = Quote(
+            symbol="AAPL",
+            timestamp=t5,
+            bid=150.0,
+            ask=150.1,
+            bid_size=100.0,
+            ask_size=150.0,
+        )
+        f5 = engine.match_quote(q5, [snap5], market_event_id="pf-5")
+        assert f5[0].fill_record.fee == Decimal(0)
+        assert f5[0].fill_record.commission_currency is None
+
+        # Cumulative fee check across all 5 fills:
+        total_fee = (
+            f1[0].fill_record.fee
+            + f2[0].fill_record.fee
+            + f3[0].fill_record.fee
+            + f4[0].fill_record.fee
+            + f5[0].fill_record.fee
+        )
+        assert total_fee == Decimal("4.00")  # Strictly capped at max_per_order!
+
+    def test_commission_repeated_fill_commit_is_idempotent(self, base_time: datetime) -> None:
+        """Committing the same fill_id multiple times does not charge the fee twice."""
+        model = PerShareCommissionModel(per_share_rate="0.05", currency="USD")
+        snap = make_order_snapshot(
+            order_id="idemp-fill", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=100.0
+        )
+        fee1, curr1 = model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(20), fill_id="fill-idemp-1"
+        )
+        assert fee1 == Decimal("1.00")
+        assert curr1 == "USD"
+
+        # Re-commit with identical fill_id
+        fee2, curr2 = model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(20), fill_id="fill-idemp-1"
+        )
+        assert fee2 == Decimal("1.00")
+        assert curr2 == "USD"
+        assert model._order_cumulative_charged["idemp-fill"] == Decimal("1.00")
+
+    # --------------------------------------------------------------------------
+    # 4. Preserve Commission Currency in Portfolio Integration
+    # --------------------------------------------------------------------------
+
+    def test_portfolio_application_preserves_non_base_commission_currency(
+        self, spec: InstrumentSpecification, base_time: datetime
+    ) -> None:
+        """Non-base commission currency is preserved and accepted by Portfolio.apply_fill()."""
+        # Commission currency is EUR while symbol AAPL is denominated in USD
+        model = PerShareCommissionModel(per_share_rate="0.10", currency="EUR")
+        engine = FillEngine(commission_model=model, instrument_specs={"AAPL": spec})
+        quote = Quote(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=100.0,
+            ask_size=100.0,
+        )
+        snap = make_order_snapshot(
+            order_id="port-eur-comm",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=50.0,
+        )
+        fills = engine.match_quote(quote, [snap], market_event_id="q-port-eur")
+        assert len(fills) == 1
+        cand = fills[0]
+        assert cand.fill_record.commission_currency == "EUR"
+        assert cand.commission_currency == "EUR"
+
+        # Obtain PortfolioFillApplication helper
+        app = cand.to_portfolio_application()
+        assert isinstance(app, PortfolioFillApplication)
+        assert app.commission_currency == "EUR"
+        assert app.event.fee == 5.0  # 50 * 0.10 EUR
+
+        # Initialize Portfolio with USD and EUR cash balances
+        converter = TimestampedCurrencyConverter()
+        converter.add_rate(
+            FXRateObservation(
+                base_currency="EUR",
+                quote_currency="USD",
+                rate=Decimal("1.08"),
+                timestamp=base_time,
+            )
+        )
+        portfolio = Portfolio(
+            account_currency="USD",
+            currency_converter=converter,
+        )
+        portfolio.initialize_cash("USD", Decimal("100000.0"), base_time)
+        portfolio.initialize_cash("EUR", Decimal("5000.0"), base_time)
+
+        # Apply fill using the preserved application structure
+        pos_event = portfolio.apply_fill(
+            event=app.event,
+            spec=spec,
+            accounting_type=AccountingClassification.CASH_EQUITY,
+            commission_currency=app.commission_currency,
+        )
+        assert pos_event.position.symbol == "AAPL"
+        assert pos_event.position.quantity == 50.0
+
+        # Confirm EUR commission was debited from EUR cash balance
+        eur_balance = portfolio.cashbook.get_balance("EUR")
+        assert eur_balance == Decimal("4995.0")  # 5000 - 5 EUR
+
+    # --------------------------------------------------------------------------
+    # 5. Decimal and Non-Finite Numeric Validation
+    # --------------------------------------------------------------------------
+
+    def test_cost_models_reject_non_finite_inputs(self) -> None:
+        """Cost and spread models strictly reject NaN and infinite configuration values."""
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite number"):
+            PerShareCommissionModel(per_share_rate=float("nan"), currency="USD")
+
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite Decimal"):
+            PercentageCommissionModel(percentage_rate=Decimal("Infinity"), currency="USD")
+
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite Decimal"):
+            FixedPerOrderCommissionModel(fixed_fee=Decimal("-Infinity"), currency="USD")
+
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite number"):
+            FixedSlippageModel(fixed_slippage=float("inf"))
+
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite Decimal"):
+            VolumeShareSlippageModel(price_impact_percentage=Decimal("NaN"))
+
+        with pytest.raises(InvalidModelConfigurationError, match="must be a finite number"):
+            SyntheticBarSpreadModel(fixed_spread=float("nan"))
+
+        with pytest.raises(InvalidModelConfigurationError, match="price must be a finite Decimal"):
+            round_to_tick(Decimal("NaN"), Decimal("0.01"), OrderSide.BUY)
+
+        with pytest.raises(
+            InvalidModelConfigurationError, match="tick_size must be strictly positive"
+        ):
+            round_to_tick(Decimal("150.00"), Decimal("Infinity"), OrderSide.BUY)
+
+    def test_fill_engine_rejects_non_finite_quote_and_bar_inputs(
+        self, fill_engine: FillEngine, base_time: datetime
+    ) -> None:
+        """FillEngine rejects non-finite quote and bar numerical fields."""
+        snap = make_order_snapshot(
+            order_id="finite-test", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=10.0
+        )
+        # Quote with NaN ask
+        q_nan = Quote.model_construct(
+            symbol="AAPL",
+            timestamp=base_time,
+            bid=150.00,
+            ask=150.10,
+            bid_size=float("nan"),
+            ask_size=100.0,
+        )
+        with pytest.raises(ValueError, match="Quote bid_size must be a finite number"):
+            fill_engine.match_quote(q_nan, [snap], market_event_id="nan-q")
+
+        # Bar with Inf high
+        bar_inf = Bar.model_construct(
+            symbol="AAPL",
+            start_time=base_time,
+            end_time=base_time + timedelta(minutes=5),
+            open=150.00,
+            high=float("inf"),
+            low=149.00,
+            close=150.50,
+            volume=1000.0,
+        )
+        with pytest.raises(ValueError, match="Bar high must be a finite number"):
+            fill_engine.match_bar(bar_inf, [snap], market_event_id="inf-bar")
+
+    # --------------------------------------------------------------------------
+    # 6. Bar Execution Timestamp Convention
+    # --------------------------------------------------------------------------
+
+    def test_bar_execution_timestamp_conventions_locked_down(
+        self, spec: InstrumentSpecification, base_time: datetime
+    ) -> None:
+        """Bar-level execution timestamps adhere to the documented availability convention."""
+        engine = FillEngine(
+            spread_model=SyntheticBarSpreadModel(fixed_spread="0.02"),
+            instrument_specs={"AAPL": spec},
+        )
+        t_start = base_time
+        t_end = base_time + timedelta(minutes=5)
+        bar = Bar(
+            symbol="AAPL",
+            start_time=t_start,
+            end_time=t_end,
+            open=150.00,
+            high=155.00,
+            low=145.00,
+            close=152.00,
+            volume=10000.0,
+        )
+
+        # 1. Market order: executes at bar.start_time
+        snap_mkt = make_order_snapshot(
+            order_id="mkt-ts",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=10.0,
+            submission_time=t_start,
+        )
+        f_mkt = engine.match_bar(bar, [snap_mkt], market_event_id="bar-ts-1")
+        assert f_mkt[0].fill_record.timestamp == t_start
+
+        # 2. Limit order with favorable opening gap: executes at bar.start_time
+        engine.reset()
+        snap_gap_lmt = make_order_snapshot(
+            order_id="gap-lmt-ts",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=10.0,
+            limit_price=152.00,  # Open + 0.01 = 150.01 <= 152.00
+            submission_time=t_start,
+        )
+        f_gap_lmt = engine.match_bar(bar, [snap_gap_lmt], market_event_id="bar-ts-2")
+        assert f_gap_lmt[0].fill_record.timestamp == t_start
+
+        # 3. Limit order triggered intrabar: executes at bar.end_time
+        engine.reset()
+        snap_intra_lmt = make_order_snapshot(
+            order_id="intra-lmt-ts",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=10.0,
+            limit_price=147.00,  # Open 150.01 > 147.00, but Low 145.01 <= 147.00
+            submission_time=t_start,
+        )
+        f_intra_lmt = engine.match_bar(bar, [snap_intra_lmt], market_event_id="bar-ts-3")
+        assert f_intra_lmt[0].fill_record.timestamp == t_end
+
+        # 4. Stop order with adverse opening gap: executes at bar.start_time
+        engine.reset()
+        snap_gap_stp = make_order_snapshot(
+            order_id="gap-stp-ts",
+            side=OrderSide.BUY,
+            order_type=OrderType.STOP_LOSS,
+            quantity=10.0,
+            stop_loss_price=148.00,  # Bar opens above stop (150.01 > 148.00)
+            submission_time=t_start,
+        )
+        f_gap_stp = engine.match_bar(bar, [snap_gap_stp], market_event_id="bar-ts-4")
+        assert f_gap_stp[0].fill_record.timestamp == t_start
+
+        # 5. Stop order triggered intrabar: executes at bar.end_time
+        engine.reset()
+        snap_intra_stp = make_order_snapshot(
+            order_id="intra-stp-ts",
+            side=OrderSide.BUY,
+            order_type=OrderType.STOP_LOSS,
+            quantity=10.0,
+            stop_loss_price=153.00,  # Open 150.01 < 153.00, but High 155.01 >= 153.00
+            submission_time=t_start,
+        )
+        f_intra_stp = engine.match_bar(bar, [snap_intra_stp], market_event_id="bar-ts-5")
+        assert f_intra_stp[0].fill_record.timestamp == t_end
+
+    # --------------------------------------------------------------------------
+    # 7. Missing-Volume Policies and Visible Diagnostics
+    # --------------------------------------------------------------------------
+
+    def test_missing_bar_volume_policies_and_diagnostics(
+        self, spec: InstrumentSpecification, base_time: datetime
+    ) -> None:
+        """Missing REAL_TRADED volume triggers explicit configurable policies with visible diagnostics."""
+        bar_synthetic = Bar(
+            symbol="AAPL",
+            start_time=base_time,
+            end_time=base_time + timedelta(minutes=5),
+            open=150.00,
+            high=152.00,
+            low=148.00,
+            close=151.00,
+            volume=5000.0,
+            volume_type=VolumeType.TICK_COUNT,  # Not REAL_TRADED
+        )
+        snap = make_order_snapshot(
+            order_id="vol-policy-test",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=200.0,
+            submission_time=base_time,
+        )
+
+        # Policy 1: FAIL_CLOSED -> produces 0 fills
+        liq_fail_closed = DefaultLiquidityModel(
+            missing_bar_volume_policy=MissingBarVolumePolicy.FAIL_CLOSED
+        )
+        eng_fc = FillEngine(liquidity_model=liq_fail_closed, instrument_specs={"AAPL": spec})
+        fills_fc = eng_fc.match_bar(bar_synthetic, [snap], market_event_id="vol-fc")
+        assert len(fills_fc) == 0
+
+        # Policy 2: FIXED_DEFAULT_CAP -> capped at default_bar_volume_cap (e.g. 50 shares)
+        liq_default_cap = DefaultLiquidityModel(
+            missing_bar_volume_policy=MissingBarVolumePolicy.FIXED_DEFAULT_CAP,
+            default_bar_volume_cap=50,
+        )
+        eng_cap = FillEngine(liquidity_model=liq_default_cap, instrument_specs={"AAPL": spec})
+        fills_cap = eng_cap.match_bar(bar_synthetic, [snap], market_event_id="vol-cap")
+        assert len(fills_cap) == 1
+        assert fills_cap[0].fill_quantity == Decimal(50)
+        assert any("applied fixed default cap 50" in d for d in fills_cap[0].diagnostics)
+
+        # Policy 3: UNLIMITED_WITH_DIAGNOSTIC -> fills requested quantity and produces diagnostic
+        liq_unlimited = DefaultLiquidityModel(
+            missing_bar_volume_policy=MissingBarVolumePolicy.UNLIMITED_WITH_DIAGNOSTIC
+        )
+        eng_unlimited = FillEngine(liquidity_model=liq_unlimited, instrument_specs={"AAPL": spec})
+        fills_unlimited = eng_unlimited.match_bar(
+            bar_synthetic, [snap], market_event_id="vol-unlimited"
+        )
+        assert len(fills_unlimited) == 1
+        assert fills_unlimited[0].fill_quantity == Decimal(200)
+        assert any("participation cap disabled" in d for d in fills_unlimited[0].diagnostics)
+        # Verify unconsumed liquidity ceiling is finite
+        remaining, _ = liq_unlimited.get_available_bar_liquidity(bar_synthetic, "vol-unlimited")
+        assert remaining.is_finite()

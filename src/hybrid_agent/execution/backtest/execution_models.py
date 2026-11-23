@@ -105,6 +105,11 @@ class FillCandidate:
             object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     @property
+    def fill_id(self) -> str:
+        """Convenience property accessing the fill record's unique ID."""
+        return self.fill_record.fill_id
+
+    @property
     def order_id(self) -> str:
         """Convenience property accessing the filled order's unique ID."""
         return self.order_snapshot.id
@@ -128,6 +133,16 @@ class FillCandidate:
     def fill_quantity(self) -> Decimal:
         """Authoritative executed quantity."""
         return self.fill_record.fill_quantity
+
+    @property
+    def fee(self) -> Decimal:
+        """Authoritative execution commission fee."""
+        return self.fill_record.fee
+
+    @property
+    def commission_currency(self) -> str | None:
+        """Explicit commission currency of the fill record, if any."""
+        return self.fill_record.commission_currency
 
     def to_domain_order(self) -> Order:
         """Constructs a domain Order instance from the immutable order snapshot."""
@@ -175,6 +190,31 @@ class FillCandidate:
             slippage=slippage_float,
             timestamp=ts,
         )
+
+    def to_portfolio_application(self) -> "PortfolioFillApplication":
+        """Returns PortfolioFillApplication combining the fill event with its exact commission currency."""
+        return PortfolioFillApplication(
+            event=self.to_portfolio_event(),
+            commission_currency=self.fill_record.commission_currency,
+        )
+
+    def to_portfolio_event_and_currency(
+        self,
+    ) -> tuple[OrderFilledEvent | OrderPartiallyFilledEvent, str | None]:
+        """Returns a tuple of (fill_event, commission_currency) for direct Portfolio.apply_fill() integration."""
+        return self.to_portfolio_event(), self.fill_record.commission_currency
+
+
+@dataclass(frozen=True)
+class PortfolioFillApplication:
+    """Pairing of a portfolio-compatible fill event and its authoritative commission currency.
+
+    Ensures zero recalculation or inference of commission currency when transferring
+    execution candidates to Portfolio.apply_fill().
+    """
+
+    event: OrderFilledEvent | OrderPartiallyFilledEvent
+    commission_currency: str | None
 
 
 @runtime_checkable
@@ -231,11 +271,25 @@ class CommissionModel(Protocol):
         fill_quantity: Decimal,
         spec: InstrumentSpecification | None = None,
     ) -> tuple[Decimal, str | None]:
-        """Calculates execution commission and explicit currency.
+        """Calculates tentative execution commission and explicit currency without committing state.
 
         Returns:
             Tuple of (commission_amount, commission_currency).
             If commission_amount > 0, commission_currency must be a non-empty string.
+        """
+        ...
+
+    def commit_commission(
+        self,
+        order: OrderSnapshot,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        spec: InstrumentSpecification | None = None,
+        fill_id: str | None = None,
+    ) -> tuple[Decimal, str | None]:
+        """Commits commission state for an accepted fill and returns (commission_amount, commission_currency).
+
+        Idempotent across identical fill_id.
         """
         ...
 

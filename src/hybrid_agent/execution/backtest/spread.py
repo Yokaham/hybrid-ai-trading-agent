@@ -5,6 +5,7 @@ Provides:
 - SyntheticBarSpreadModel: Explicit deterministic synthetic spread model for bar-only execution.
 """
 
+import math
 from decimal import Decimal
 
 from hybrid_agent.core.models import InstrumentSpecification
@@ -15,12 +16,19 @@ from hybrid_agent.execution.backtest.execution_models import (
 
 
 def _to_decimal(val: Decimal | float | str, name: str) -> Decimal:
+    if val is None:
+        raise InvalidModelConfigurationError(f"{name} cannot be None")
     if isinstance(val, Decimal):
         dec = val
     elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            raise InvalidModelConfigurationError(f"{name} must be a finite number, got {val}")
         dec = Decimal(str(val))
     elif isinstance(val, (int, str)):
-        dec = Decimal(val)
+        try:
+            dec = Decimal(val)
+        except Exception as e:
+            raise InvalidModelConfigurationError(f"Invalid decimal value for {name}: {val}") from e
     else:
         raise TypeError(f"{name} must be Decimal, float, int, or str, got {type(val).__name__}")
     if not dec.is_finite():

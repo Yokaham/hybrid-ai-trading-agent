@@ -8,6 +8,7 @@ Provides:
 - Conservative tick-size rounding helpers guaranteeing adverse price rounding.
 """
 
+import math
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from hybrid_agent.core.constants import OrderSide
@@ -26,12 +27,19 @@ from hybrid_agent.execution.backtest.state import OrderSnapshot
 
 
 def _to_decimal(val: Decimal | float | str, name: str) -> Decimal:
+    if val is None:
+        raise InvalidModelConfigurationError(f"{name} cannot be None")
     if isinstance(val, Decimal):
         dec = val
     elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            raise InvalidModelConfigurationError(f"{name} must be a finite number, got {val}")
         dec = Decimal(str(val))
     elif isinstance(val, (int, str)):
-        dec = Decimal(val)
+        try:
+            dec = Decimal(val)
+        except Exception as e:
+            raise InvalidModelConfigurationError(f"Invalid decimal value for {name}: {val}") from e
     else:
         raise TypeError(f"{name} must be Decimal, float, int, or str, got {type(val).__name__}")
     if not dec.is_finite():
@@ -45,9 +53,11 @@ def round_to_tick(price: Decimal, tick_size: Decimal, side: OrderSide) -> Decima
     - BUY: Rounds UP (CEILING) to the next tick, ensuring the buyer never receives an unearned discount.
     - SELL: Rounds DOWN (FLOOR) to the next tick, ensuring the seller never receives unearned revenue.
     """
-    if tick_size <= Decimal(0):
+    if not isinstance(price, Decimal) or not price.is_finite():
+        raise InvalidModelConfigurationError(f"price must be a finite Decimal, got {price}")
+    if not isinstance(tick_size, Decimal) or not tick_size.is_finite() or tick_size <= Decimal(0):
         raise InvalidModelConfigurationError(
-            f"tick_size must be strictly positive, got {tick_size}"
+            f"tick_size must be strictly positive and finite, got {tick_size}"
         )
 
     ticks = price / tick_size

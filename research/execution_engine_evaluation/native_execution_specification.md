@@ -167,6 +167,30 @@ When an entry order receives a partial fill:
 | **Bar-Only Stop BUY** | OHLCV Bar | $\text{SyntheticHighAsk} \ge \text{TriggerPrice}$ | $\max(\text{TriggerPrice}, \text{OpenAsk}) + \text{Slippage}$ | TAKER |
 | **Bar-Only Stop SELL** | OHLCV Bar | $\text{SyntheticLowBid} \le \text{TriggerPrice}$ | $\min(\text{TriggerPrice}, \text{OpenBid}) - \text{Slippage}$ | TAKER |
 
+### 4.3 Review Corrections & Invariant Hardening (Milestone 3B.4.4)
+1. **Market-Event Identity and Cache Safety Contract**:
+   - Canonical fingerprinting of market data events (`_create_event_fingerprint`) across symbol, timestamp, bid, ask, sizes, and provider sequence attributes.
+   - Distinct events must carry distinct IDs; reusing an existing ID with a different observation raises `DuplicateMarketEventError`.
+   - Presenting the same observation under multiple or renamed IDs raises `DuplicateMarketEventError` to prevent duplicate liquidity consumption.
+   - Idempotent replay: Presenting the same observation under the same ID returns cached fills without re-consuming liquidity.
+2. **Transactional Candidate Creation**:
+   - All fallible validation, calculations (price, volume, slippage, commission), and `FillRecord`/`FillCandidate` construction are completed BEFORE committing liquidity or mutating commission state.
+   - If validation or creation fails, no state mutation occurs (zero leakage).
+3. **Two-Phase Commission Commit & Multi-Fill Order-Level Min/Max**:
+   - Decouples `calculate_commission` (read-only prospective fee estimation) from `commit_commission` (stateful tracking of order-level cumulative raw fees and fees charged).
+   - Order-level min/max caps (`min_per_order`, `max_per_order`) are enforced incrementally across multiple partial fills, guaranteeing that total commissions charged across all fills of an order stay within $[min, max]$.
+   - Idempotent commission commitment per `fill_id`.
+4. **Preserve Explicit Commission Currency in Portfolio Integration**:
+   - Introduces `PortfolioFillApplication` and `FillCandidate.to_portfolio_application()` / `to_portfolio_event_and_currency()`.
+   - Packages fill events with exact, un-inferred `commission_currency` from canonical `FillRecord` for direct input to `Portfolio.apply_fill()`.
+5. **Strict Non-Finite Numeric Validation & Strictly Positive Prices**:
+   - Rejects non-finite values (`NaN`, `Infinity`, `-Infinity`) across all models and inputs.
+   - Enforces strictly positive execution prices ($P_{\text{exec}} > 0$).
+6. **Bar Execution Timestamp Availability Convention**:
+   - Clarifies that `bar.end_time` for intrabar touches is an availability-time and confirmation convention, preventing forward-looking bias while avoiding false microsecond precision claims.
+7. **Explicit Missing-Volume Policies**:
+   - Defines `FAIL_CLOSED`, `FIXED_DEFAULT_CAP`, and `UNLIMITED_WITH_DIAGNOSTIC` (capped at finite $1,000,000,000$) with observable diagnostics.
+
 ---
 
 ## 5. Important Execution Constraints & Rules
@@ -364,6 +388,37 @@ class FillEngine:
     def reset(self) -> None:
         """Resets all transient simulation state to start a clean backtest."""
         ...
+```
+
+### 6.4 Execution Models & Portfolio Integration Structures
+```python
+@dataclass(frozen=True)
+class PortfolioFillApplication:
+    """Explicit container coupling fill event and commission currency for Portfolio integration."""
+
+    event: OrderFilledEvent | OrderPartiallyFilledEvent
+    commission_currency: str | None
+
+
+class CommissionModel(Protocol):
+    """Protocol for execution commission calculation and stateful order tracking."""
+
+    def calculate_commission(
+        self,
+        order: OrderSnapshot | Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        spec: InstrumentSpecification | None = None,
+    ) -> CommissionResult: ...
+
+    def commit_commission(
+        self,
+        order: OrderSnapshot | Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        spec: InstrumentSpecification | None = None,
+        fill_id: str | None = None,
+    ) -> CommissionResult: ...
 ```
 
 ---

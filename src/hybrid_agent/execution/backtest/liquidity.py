@@ -7,6 +7,7 @@ Provides:
   and bar volume participation caps shared across all competing orders.
 """
 
+import math
 from decimal import Decimal
 from enum import Enum
 
@@ -17,14 +18,23 @@ from hybrid_agent.execution.backtest.execution_models import (
     LiquidityModel,
 )
 
+UNBOUNDED_LIQUIDITY_CEILING = Decimal(1000000000)
+
 
 def _to_decimal(val: Decimal | float | str, name: str) -> Decimal:
+    if val is None:
+        raise InvalidModelConfigurationError(f"{name} cannot be None")
     if isinstance(val, Decimal):
         dec = val
     elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            raise InvalidModelConfigurationError(f"{name} must be a finite number, got {val}")
         dec = Decimal(str(val))
     elif isinstance(val, (int, str)):
-        dec = Decimal(val)
+        try:
+            dec = Decimal(val)
+        except Exception as e:
+            raise InvalidModelConfigurationError(f"Invalid decimal value for {name}: {val}") from e
     else:
         raise TypeError(f"{name} must be Decimal, float, int, or str, got {type(val).__name__}")
     if not dec.is_finite():
@@ -162,9 +172,9 @@ class DefaultLiquidityModel(LiquidityModel):
                     )
                 else:  # UNLIMITED_WITH_DIAGNOSTIC
                     diagnostics.append(
-                        f"Unverified Tick volume for {symbol}: assumed unbounded liquidity"
+                        f"Unverified Tick volume for {symbol}: assumed unbounded liquidity (diagnostic applied)"
                     )
-                    return Decimal("Infinity"), tuple(diagnostics)
+                    return UNBOUNDED_LIQUIDITY_CEILING, tuple(diagnostics)
             else:
                 depth_val = quote.ask_volume if side == OrderSide.BUY else quote.bid_volume
                 total_depth = (
@@ -218,9 +228,9 @@ class DefaultLiquidityModel(LiquidityModel):
                 )
             else:  # UNLIMITED_WITH_DIAGNOSTIC
                 diagnostics.append(
-                    f"Missing REAL_TRADED volume for {symbol}: participation cap disabled"
+                    f"Missing REAL_TRADED volume for {symbol}: participation cap disabled (unconstrained liquidity applied with diagnostic)"
                 )
-                return Decimal("Infinity"), tuple(diagnostics)
+                return UNBOUNDED_LIQUIDITY_CEILING, tuple(diagnostics)
         else:
             bar_vol = Decimal(str(bar.volume))
             total_cap = bar_vol * self._max_volume_participation

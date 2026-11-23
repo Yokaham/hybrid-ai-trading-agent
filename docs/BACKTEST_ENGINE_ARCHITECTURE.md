@@ -461,6 +461,20 @@ Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular ex
   - `register_instrument(symbol, spec)`: Registers instrument specifications (tick size, lot size, currencies) for price rounding and lot alignment.
   - `reset()`: Resets all transient simulation state (liquidity trackers, per-order fee trackers, duplicate event caches) to start a clean backtest.
 - **Strict Decoupling**: Maintains zero cash balances and zero position inventory. Emits canonical `FillCandidate` objects convertible to `OrderFilledEvent` / `OrderPartiallyFilledEvent` for `Portfolio.apply_fill()` and `FillRecord` for `OrderManager.record_fill()`.
+- **Portfolio Integration**: `FillCandidate.to_portfolio_application()` and `FillCandidate.to_portfolio_event_and_currency()` package the fill event together with the exact, un-inferred `commission_currency` from the canonical `FillRecord` for direct consumption by `Portfolio.apply_fill()`.
+
+#### 1.1 Market-Event Identity and Cache Safety Contract
+- **One ID per Observation**: A `market_event_id` must uniquely identify one specific market observation.
+- **Observation Fingerprinting**: Observations are fingerprinted across instrument, event type (`Quote`, `Tick`, `Bar`), UTC timestamp, prices, and volumes/sizes, incorporating provider sequence and ingestion metadata where exposed by data models.
+- **Identity Conflict Detection**:
+  - Reusing an existing `market_event_id` with a different observation payload raises `DuplicateMarketEventError`.
+  - Replaying the same logical observation under multiple or renamed event IDs raises `DuplicateMarketEventError`, strictly preventing accidental liquidity re-use.
+  - Successive legitimate market updates are distinguished by their differing timestamps, ticks, or provider sequence IDs.
+  - Reprocessing the exact same observation under the same ID is idempotent: it returns previously cached fills without creating additional fills or re-consuming liquidity.
+
+#### 1.2 Transactional Candidate Creation Contract
+- **Order of Operations**: All fallible price calculations, finite numeric checks, limit checks, tentative commission calculations, and `FillRecord` / `FillCandidate` constructions occur strictly BEFORE any state mutation.
+- **Zero Partial Mutation**: If candidate validation or construction fails at any point, liquidity consumption is not committed, commission state is not altered, and fill counts remain unchanged.
 
 #### 2. Quote vs. Bar Execution Semantics
 - **L1 Quote / Tick Execution**:
@@ -468,10 +482,13 @@ Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular ex
   - Marketable limit orders execute immediately if `LimitPrice >= Ask` (BUY) or `LimitPrice <= Bid` (SELL).
   - Resting limit orders execute on subsequent quotes crossing their limit price.
   - Stop orders trigger when `Ask >= TriggerPrice` (BUY) or `Bid <= TriggerPrice` (SELL).
-- **OHLCV Bar Execution**:
-  - Market orders submitted prior to bar start execute at the bar `Open` price (adjusted by half-spread and adverse slippage).
-  - Limit orders execute if the bar's synthetic price range crosses the limit. If `Open` gaps favorably through the limit price, the order receives opening price improvement ($\min(P_{\text{limit}}, P_{\text{open}})$ for BUY; $\max(P_{\text{limit}}, P_{\text{open}})$ for SELL).
-  - Stop orders trigger if the bar's price extremes reach the trigger price. If `Open` gaps adversely past the trigger price, the order executes at `Open` (plus adverse spread and slippage), accurately simulating gap risk.
+- **OHLCV Bar Execution & Timestamp Conventions**:
+  - Market orders submitted prior to bar start execute at the bar `Open` price (adjusted by half-spread and adverse slippage) with `timestamp = bar.start_time`.
+  - Limit orders execute if the bar's synthetic price range crosses the limit. If `Open` gaps favorably through the limit price, the order receives opening price improvement ($\min(P_{\text{limit}}, P_{\text{open}})$ for BUY; $\max(P_{\text{limit}}, P_{\text{open}})$ for SELL) with `timestamp = bar.start_time`.
+  - Intrabar limit order touches are timestamped at `bar.end_time`.
+  - Stop orders trigger if the bar's price extremes reach the trigger price. If `Open` gaps adversely past the trigger price, the order executes at `Open` (plus adverse spread and slippage) with `timestamp = bar.start_time`.
+  - Intrabar stop triggers are timestamped at `bar.end_time`.
+  - **Simulation Timestamp Convention Notice**: The `bar.end_time` timestamp for inferred intrabar fills is an availability-time and confirmation convention, NOT an observed microsecond exchange execution timestamp. Because intra-bar microstructure trajectories are unobservable from OHLCV aggregates alone, timestamping at `bar.end_time` strictly enforces causal confirmation without forward-looking bias.
   - Causality Enforcement: Orders submitted at or after `bar.start_time` are rejected with `TemporalOrderViolationError` from executing on that bar.
 
 #### 3. Spread Treatment & Double-Spread Prevention
