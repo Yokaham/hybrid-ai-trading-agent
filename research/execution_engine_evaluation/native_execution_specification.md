@@ -183,9 +183,9 @@ When an entry order receives a partial fill:
    - Rollback on Failure: If any error occurs in Phase 1 or Phase 2, `_restore_state()`, `liquidity_model.restore()`, and `commission_model.restore()` revert all state to the pre-call snapshot ($S_0$).
    - Models must implement the `snapshot() -> Any` and `restore(snapshot: Any) -> None` contract.
 3. **Commission Fill-ID Consistency and Conflict Safety**:
-   - `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across all commission models.
-   - Replaying identical fill IDs with matching details is idempotent.
-   - Reusing an existing `fill_id` with conflicting order, price, quantity, or fee details raises explicit `CommissionConflictError(ValueError)`.
+   - `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across commission models, and incorporates effective `contract_size` in `PercentageCommissionModel`.
+   - Replaying identical fill IDs with matching details (including contract size) is idempotent.
+   - Reusing an existing `fill_id` with conflicting order, price, quantity, contract size, or fee details raises explicit `CommissionConflictError(ValueError)`.
    - Distinct fills with different IDs are never deduplicated.
 4. **Finite Unbounded Liquidity Ceiling**:
    - Replaced all non-finite `Decimal("Infinity")` in `DefaultLiquidityModel` with finite `UNBOUNDED_LIQUIDITY_CEILING = Decimal(1_000_000_000)`.

@@ -390,8 +390,10 @@ class PercentageCommissionModel(CommissionModel):
         self._order_cumulative_raw: dict[str, Decimal] = {}
         # Order tracking: order_id -> cumulative fee charged
         self._order_cumulative_charged: dict[str, Decimal] = {}
-        # Fill tracking: fill_id -> (order_id, fill_price, fill_quantity, fee, currency)
-        self._committed_fills: dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]] = {}
+        # Fill tracking: fill_id -> (order_id, fill_price, fill_quantity, contract_size, fee, currency)
+        self._committed_fills: dict[
+            str, tuple[str, Decimal, Decimal, Decimal, Decimal, str | None]
+        ] = {}
 
     @property
     def percentage_rate(self) -> Decimal:
@@ -409,6 +411,15 @@ class PercentageCommissionModel(CommissionModel):
     def max_per_order(self) -> Decimal | None:
         return self._max_per_order
 
+    @staticmethod
+    def _resolve_contract_size(spec: InstrumentSpecification | None) -> Decimal:
+        """Resolves the effective contract size for notional calculation."""
+        return (
+            Decimal(str(spec.contract_size))
+            if (spec is not None and spec.contract_size > 0)
+            else Decimal(1)
+        )
+
     def _calc_incremental(
         self,
         order_id: str,
@@ -418,11 +429,7 @@ class PercentageCommissionModel(CommissionModel):
         staged_prev_raw: Decimal | None = None,
         staged_prev_charged: Decimal | None = None,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-        contract_size = (
-            Decimal(str(spec.contract_size))
-            if (spec is not None and spec.contract_size > 0)
-            else Decimal(1)
-        )
+        contract_size = self._resolve_contract_size(spec)
         notional = fill_price * fill_quantity * contract_size
         raw_fill_fee = notional * self._percentage_rate
 
@@ -465,15 +472,27 @@ class PercentageCommissionModel(CommissionModel):
         if px <= Decimal(0) or qty <= Decimal(0):
             raise ValueError("fill_price and fill_quantity must be strictly positive")
 
+        contract_size = self._resolve_contract_size(spec)
+
         if fill_id is not None and fill_id in self._committed_fills:
-            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
-                fill_id
-            ]
-            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+            (
+                cached_order_id,
+                cached_px,
+                cached_qty,
+                cached_contract_size,
+                cached_fee,
+                cached_curr,
+            ) = self._committed_fills[fill_id]
+            if (
+                cached_order_id != order.id
+                or cached_px != px
+                or cached_qty != qty
+                or cached_contract_size != contract_size
+            ):
                 raise CommissionConflictError(
                     f"Conflicting fill details for committed fill_id '{fill_id}': "
-                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
-                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}, contract_size={cached_contract_size}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty}, contract_size={contract_size})"
                 )
             return cached_fee, cached_curr
 
@@ -498,15 +517,27 @@ class PercentageCommissionModel(CommissionModel):
         if px <= Decimal(0) or qty <= Decimal(0):
             raise ValueError("fill_price and fill_quantity must be strictly positive")
 
+        contract_size = self._resolve_contract_size(spec)
+
         if fill_id is not None and fill_id in self._committed_fills:
-            cached_order_id, cached_px, cached_qty, cached_fee, cached_curr = self._committed_fills[
-                fill_id
-            ]
-            if cached_order_id != order.id or cached_px != px or cached_qty != qty:
+            (
+                cached_order_id,
+                cached_px,
+                cached_qty,
+                cached_contract_size,
+                cached_fee,
+                cached_curr,
+            ) = self._committed_fills[fill_id]
+            if (
+                cached_order_id != order.id
+                or cached_px != px
+                or cached_qty != qty
+                or cached_contract_size != contract_size
+            ):
                 raise CommissionConflictError(
                     f"Conflicting fill details for committed fill_id '{fill_id}': "
-                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}) vs "
-                    f"incoming=(order={order.id}, px={px}, qty={qty})"
+                    f"existing=(order={cached_order_id}, px={cached_px}, qty={cached_qty}, contract_size={cached_contract_size}) vs "
+                    f"incoming=(order={order.id}, px={px}, qty={qty}, contract_size={contract_size})"
                 )
             return cached_fee, cached_curr
 
@@ -516,7 +547,14 @@ class PercentageCommissionModel(CommissionModel):
 
         result_curr = self._currency if incremental_fee > Decimal(0) else None
         if fill_id is not None:
-            self._committed_fills[fill_id] = (order.id, px, qty, incremental_fee, result_curr)
+            self._committed_fills[fill_id] = (
+                order.id,
+                px,
+                qty,
+                contract_size,
+                incremental_fee,
+                result_curr,
+            )
         return incremental_fee, result_curr
 
     def snapshot(
@@ -524,7 +562,7 @@ class PercentageCommissionModel(CommissionModel):
     ) -> tuple[
         dict[str, Decimal],
         dict[str, Decimal],
-        dict[str, tuple[str, Decimal, Decimal, Decimal, str | None]],
+        dict[str, tuple[str, Decimal, Decimal, Decimal, Decimal, str | None]],
     ]:
         """Returns an opaque snapshot of internal state for transactional rollback."""
         return (

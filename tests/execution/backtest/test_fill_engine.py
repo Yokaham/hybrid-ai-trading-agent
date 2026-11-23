@@ -3060,3 +3060,140 @@ class TestFillEngineFinalCorrectionPass:
         assert curr2 == "USD"
         assert model._order_cumulative_charged["order-distinct"] == Decimal("1.00")
         assert len(model._committed_fills) == 2
+
+    def test_percentage_commission_fill_id_identical_contract_size_is_idempotent(
+        self, spec: InstrumentSpecification
+    ) -> None:
+        """Recommitting identical fill ID with identical details including contract size is idempotent."""
+        snap = make_order_snapshot(
+            order_id="pct-idemp", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        model = PercentageCommissionModel(percentage_rate="0.001", currency="USD")
+
+        fee1, curr1 = model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(50), spec=spec, fill_id="f-pct-replay"
+        )
+        # Notional = 150 * 50 * 1 = 7500. Fee = 7500 * 0.001 = 7.50
+        assert fee1 == Decimal("7.50")
+        assert curr1 == "USD"
+
+        # Replay identical details with same spec
+        fee2, curr2 = model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(50), spec=spec, fill_id="f-pct-replay"
+        )
+        assert fee2 == Decimal("7.50")
+        assert curr2 == "USD"
+        assert model._order_cumulative_charged["pct-idemp"] == Decimal("7.50")
+
+    def test_percentage_commission_fill_id_conflicting_contract_size_raises_in_commit_and_calculate(
+        self, spec: InstrumentSpecification
+    ) -> None:
+        """Reusing committed fill ID with different contract size raises CommissionConflictError in calculate and commit."""
+        snap = make_order_snapshot(
+            order_id="pct-conflict", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        model = PercentageCommissionModel(percentage_rate="0.001", currency="USD")
+        spec_size_1 = spec  # contract_size = 1.0
+
+        spec_size_10 = InstrumentSpecification(
+            symbol="AAPL",
+            tick_size=0.01,
+            contract_size=10.0,
+            min_volume=1.0,
+            volume_step=1.0,
+            price_precision=2,
+            quote_currency="USD",
+            profit_currency="USD",
+            base_currency="USD",
+        )
+
+        model.commit_commission(
+            snap.order, Decimal("150.00"), Decimal(50), spec=spec_size_1, fill_id="f-pct-conf"
+        )
+
+        # Conflict in commit_commission
+        with pytest.raises(
+            CommissionConflictError,
+            match="Conflicting fill details for committed fill_id 'f-pct-conf'",
+        ):
+            model.commit_commission(
+                snap.order, Decimal("150.00"), Decimal(50), spec=spec_size_10, fill_id="f-pct-conf"
+            )
+
+        # Conflict in calculate_commission
+        with pytest.raises(
+            CommissionConflictError,
+            match="Conflicting fill details for committed fill_id 'f-pct-conf'",
+        ):
+            model.calculate_commission(
+                snap.order, Decimal("150.00"), Decimal(50), spec=spec_size_10, fill_id="f-pct-conf"
+            )
+
+    def test_percentage_commission_missing_spec_and_explicit_spec_equiv_contract_size_consistent(
+        self, spec: InstrumentSpecification
+    ) -> None:
+        """Missing specification and explicit specification with equivalent contract_size=1.0 resolve identically."""
+        snap = make_order_snapshot(
+            order_id="pct-equiv", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        model = PercentageCommissionModel(percentage_rate="0.001", currency="USD")
+        spec_size_1 = spec  # contract_size = 1.0
+
+        # Commit with spec=None (resolves to contract_size=1)
+        fee1, curr1 = model.commit_commission(
+            snap.order, Decimal("100.00"), Decimal(10), spec=None, fill_id="f-pct-none"
+        )
+        assert fee1 == Decimal("1.00")
+        assert curr1 == "USD"
+
+        # Replay with explicit spec where contract_size=1.0 -> same effective contract size -> idempotent
+        fee2, curr2 = model.calculate_commission(
+            snap.order, Decimal("100.00"), Decimal(10), spec=spec_size_1, fill_id="f-pct-none"
+        )
+        assert fee2 == Decimal("1.00")
+        assert curr2 == "USD"
+
+        fee3, curr3 = model.commit_commission(
+            snap.order, Decimal("100.00"), Decimal(10), spec=spec_size_1, fill_id="f-pct-none"
+        )
+        assert fee3 == Decimal("1.00")
+        assert curr3 == "USD"
+
+    def test_percentage_commission_distinct_fill_ids_different_contract_sizes_independent(
+        self, spec: InstrumentSpecification
+    ) -> None:
+        """Distinct fill IDs with different contract sizes remain independently processable."""
+        snap = make_order_snapshot(
+            order_id="pct-distinct", side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=50.0
+        )
+        model = PercentageCommissionModel(percentage_rate="0.001", currency="USD")
+        spec_size_1 = spec  # contract_size = 1.0
+
+        spec_size_5 = InstrumentSpecification(
+            symbol="AAPL",
+            tick_size=0.01,
+            contract_size=5.0,
+            min_volume=1.0,
+            volume_step=1.0,
+            price_precision=2,
+            quote_currency="USD",
+            profit_currency="USD",
+            base_currency="USD",
+        )
+
+        fee1, curr1 = model.commit_commission(
+            snap.order, Decimal("100.00"), Decimal(10), spec=spec_size_1, fill_id="f-dist-1"
+        )
+        # 100 * 10 * 1 * 0.001 = 1.00
+        assert fee1 == Decimal("1.00")
+        assert curr1 == "USD"
+
+        fee2, curr2 = model.commit_commission(
+            snap.order, Decimal("100.00"), Decimal(10), spec=spec_size_5, fill_id="f-dist-2"
+        )
+        # 100 * 10 * 5 * 0.001 = 5.00
+        assert fee2 == Decimal("5.00")
+        assert curr2 == "USD"
+
+        assert model._order_cumulative_charged["pct-distinct"] == Decimal("6.00")
+        assert len(model._committed_fills) == 2

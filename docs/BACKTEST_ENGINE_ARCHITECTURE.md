@@ -517,7 +517,7 @@ Milestone 3B.4.4 implements the native deterministic `FillEngine` and modular ex
 - **`PercentageCommissionModel`**: Fee as a percentage of gross notional ($F = Q \times P \times \text{pct}$).
 - **`FixedPerOrderCommissionModel`**: Flat fee assessed on the initial fill of an order; subsequent partial fills incur $0.0$ fee.
 - **Mandatory Currency Invariant**: Any positive commission fee ($> 0.0$) must specify a non-empty `commission_currency`, matching the portfolio accounting requirements of Milestone 3B.3.
-- **Fill-ID Consistency & Conflict Safety**: `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across all commission models. Replay of an identical fill ID with matching details is idempotent. Reusing an existing `fill_id` with conflicting order ID, price, quantity, or fee raises explicit `CommissionConflictError(ValueError)`. Distinct fills with different IDs are never deduplicated.
+- **Fill-ID Consistency & Conflict Safety**: `_committed_fills` tracks `(order_id, fill_price, fill_quantity, fee, currency)` across commission models, and incorporates effective `contract_size` in `PercentageCommissionModel`. Replay of an identical fill ID with matching details is idempotent. Reusing an existing `fill_id` with conflicting order ID, price, quantity, contract size, or fee raises explicit `CommissionConflictError(ValueError)`. Distinct fills with different IDs are never deduplicated.
 - **Transactional Snapshot/Restore**: All commission models implement `snapshot()` and `restore()` to participate in atomic transaction rollbacks.
 
 #### 6. Liquidity Consumption & Volume Participation
